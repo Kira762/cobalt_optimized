@@ -7,9 +7,19 @@ local ArgumentList = require("@src/Window/Modals/Info/Components/ArgumentList")
 local CodeGen = require("@src/Utils/CodeGen/Generator")
 local InstanceSerializer = require("@src/Utils/CodeGen/Serializer/Instance")
 local Ratelimiter = require("@src/Utils/Ratelimiter")
+local Animations = require("@src/Window/Utils/Animations")
 
 local MaxArgumentPreviewLength = 500
 local PreviewCacheByCallInfo = setmetatable({}, { __mode = "k" })
+
+-- Row entrance motion.  Staggered so a freshly rendered page flows in instead of
+-- popping, but capped so the last row never waits more than a fifth of a second.
+local RowFadeDuration = 0.16
+local RowStaggerStep = 0.018
+local RowStaggerMax = 0.18
+
+-- How much work one call frame may do before yielding the frame back.
+local ArgumentBuildSliceSeconds = 0.004
 
 
 return function(props: {
@@ -317,6 +327,9 @@ return function(props: {
 	end
 
 	function Calls:ReleaseCallFrame(CallFrame)
+		-- A row can be recycled while its entrance fade is still running; drop
+		-- the animation state so the pooled frame is never reused invisible.
+		Animations.Cancel(CallFrame, true)
 		CallFrame.Parent = nil
 		table.insert(self.CallFramePool, CallFrame)
 	end
@@ -324,7 +337,16 @@ return function(props: {
 	function Calls:AcquireCallFrame()
 		local CallFrame = table.remove(self.CallFramePool)
 		if CallFrame then
+			local Data = self.CallFrameData[CallFrame]
+			local ArgumentsFrame = Data and Data.ArgumentsFrame
+			if ArgumentsFrame then
+				Data.ArgumentsFrame = nil
+				ArgumentList.Clear(ArgumentsFrame)
+			end
+
 			ClearCallFrameContent(CallFrame)
+			CallFrame.BackgroundTransparency = 0
+			Animations.Cancel(CallFrame, true)
 			return CallFrame
 		end
 
@@ -365,11 +387,9 @@ return function(props: {
 				return
 			end
 
-			wax.shared.TweenService
-				:Create(Data.HighlightStroke, Constants.DefaultTweenInfo, {
-					Transparency = 0,
-				})
-				:Play()
+			Animations.Play(Data.HighlightStroke, {
+				Transparency = 0,
+			}, Constants.DefaultTweenInfo)
 		end)
 
 		CallFrame.MouseLeave:Connect(function()
@@ -378,11 +398,51 @@ return function(props: {
 				return
 			end
 
-			wax.shared.TweenService
-				:Create(Data.HighlightStroke, Constants.DefaultTweenInfo, {
-					Transparency = if Data.IsBlockedCall then 0.5 elseif Data.IsHighlightedCall then 0.35 else 1,
-				})
-				:Play()
+			Animations.Play(Data.HighlightStroke, {
+				Transparency = if Data.IsBlockedCall then 0.5 elseif Data.IsHighlightedCall then 0.35 else 1,
+			}, Constants.DefaultTweenInfo)
+		end)
+
+		-- Touch devices rarely hover, so pressing a row highlights it too.
+		CallFrame.InputBegan:Connect(function(Input: InputObject)
+			if
+				Input.UserInputState ~= Enum.UserInputState.Begin
+				or (
+					Input.UserInputType ~= Enum.UserInputType.MouseButton1
+					and Input.UserInputType ~= Enum.UserInputType.Touch
+				)
+			then
+				return
+			end
+
+			local Data = self.CallFrameData[CallFrame]
+			if not Data then
+				return
+			end
+
+			Data.WasPressed = true
+			Animations.Play(Data.HighlightStroke, {
+				Transparency = 0,
+			}, Constants.DefaultTweenInfo)
+		end)
+
+		CallFrame.InputEnded:Connect(function(Input: InputObject)
+			if
+				Input.UserInputType ~= Enum.UserInputType.MouseButton1
+				and Input.UserInputType ~= Enum.UserInputType.Touch
+			then
+				return
+			end
+
+			local Data = self.CallFrameData[CallFrame]
+			if not (Data and Data.WasPressed) then
+				return
+			end
+
+			Data.WasPressed = nil
+			Animations.Play(Data.HighlightStroke, {
+				Transparency = if Data.IsBlockedCall then 0.5 elseif Data.IsHighlightedCall then 0.35 else 1,
+			}, Constants.DefaultTweenInfo)
 		end)
 
 		local CallContextMenu = GetSharedCallContextMenu()
@@ -483,6 +543,10 @@ return function(props: {
 
 			Parent = CallFrame,
 		})
+		-- Keeping the container around lets the next render of this pooled row
+		-- hand its argument holders back to the pool instead of destroying and
+		-- rebuilding hundreds of instances.
+		Data.ArgumentsFrame = ArgumentsFrame
 		do
 			if HasError then
 				ArgumentList.CreateHolder(0, CallInfo.Error, ArgumentsFrame, {
@@ -493,16 +557,24 @@ return function(props: {
 				})
 			end
 
+			-- Rendering used to yield a whole frame every five arguments, which
+			-- turned a long argument list into seconds of stuttering.  The loop
+			-- now only yields once it has spent a frame's worth of work
+			-- (measured while it runs, so idle frames are never used up).
+			local SliceStart = os.clock()
+
 			for Index = 1, CallInfoValueCount do
 				if ReleaseIfStale() then
 					return
 				end
 
-				if Index % 5 == 0 then
+				if os.clock() - SliceStart >= ArgumentBuildSliceSeconds then
 					task.wait()
 					if ReleaseIfStale() then
 						return
 					end
+
+					SliceStart = os.clock()
 				end
 
 				ArgumentList.CreateHolder(Index, CallInfoValues[Index], ArgumentsFrame, {
@@ -586,6 +658,14 @@ return function(props: {
 		end
 
 		CallFrame.Parent = LogsList
+
+		if CallInfo.Animate then
+			Animations.FadeInPlace(CallFrame, {
+				Duration = RowFadeDuration,
+				Delay = math.min(CallInfo.EntranceDelay or 0, RowStaggerMax),
+			})
+		end
+
 		return CallFrame
 	end
 
@@ -634,6 +714,9 @@ return function(props: {
 				Order = VisibleIndex,
 				RenderGeneration = RenderGeneration,
 				PreviewCache = GetPreviewCache(Call),
+				Animate = true,
+				-- Rows flow in one after another instead of all at once.
+				EntranceDelay = (VisibleIndex - Start) * RowStaggerStep,
 			}, {
 				__index = Call,
 			})
@@ -837,12 +920,23 @@ return function(props: {
 			PaginationManager:SetPage(Page)
 		end
 
-		LogsList.CanvasPosition = Vector2.zero
+		-- Glide back to the top rather than snapping (still instant when the list
+		-- is already at the top, which is the common case).
+		if LogsList.CanvasPosition.Y ~= 0 then
+			Animations.Play(
+				LogsList,
+				{ CanvasPosition = Vector2.zero },
+				TweenInfo.new(0.16, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+			)
+		else
+			LogsList.CanvasPosition = Vector2.zero
+		end
+
 		self:ShowPagination(Log)
 		self:ShowCalls(Log, Page)
 	end
 
-	function Calls:HandleCallAdded(Log, CallIndex: number)
+	function Calls:HandleCallAdded(Log, CallIndex: number, CallRef)
 		if LogsPage.State.CurrentLog ~= Log then
 			return
 		end
@@ -862,7 +956,9 @@ return function(props: {
 			return
 		end
 
-		local Call = Log.Calls[CallIndex]
+		-- The notification carries the call itself (indices shift when a log
+		-- trims), with the index lookup kept as a fallback.
+		local Call = CallRef or Log.Calls[CallIndex]
 		if not Call then
 			return
 		end
@@ -873,6 +969,7 @@ return function(props: {
 			Order = VisibleIndex,
 			RenderGeneration = self.CurrentCallFrameRenderGeneration,
 			PreviewCache = GetPreviewCache(Call),
+			Animate = true,
 		}, {
 			__index = Call,
 		})

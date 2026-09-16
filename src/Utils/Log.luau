@@ -3,6 +3,106 @@ Log.__index = Log
 
 local PendingCallDecisions = setmetatable({}, { __mode = "k" })
 
+-- `tostring(table)` is used as the pending-decision key and is needed twice per
+-- call (ShouldBlock + Call).  Remembering the key per info table halves that
+-- work and keeps both lookups on the same interned string.
+local CallDecisionKeys = setmetatable({}, { __mode = "k" })
+
+-- clonefunction() allocates a brand new closure every time it runs, and the
+-- same calling scripts are cloned over and over.  Clones are cached against the
+-- original closure (weak keys: once the game drops the original, the clone goes
+-- with it).
+local FunctionClones = setmetatable({}, { __mode = "k" })
+
+local function GetDecisionKey(RawInfo): string
+	local Key = CallDecisionKeys[RawInfo]
+	if not Key then
+		Key = tostring(RawInfo)
+		CallDecisionKeys[RawInfo] = Key
+	end
+
+	return Key
+end
+
+local function CloneFunction(Function)
+	local Cached = FunctionClones[Function]
+	if Cached then
+		return Cached
+	end
+
+	if not clonefunction then
+		return Function
+	end
+
+	local Clone = clonefunction(Function)
+	FunctionClones[Function] = Clone
+	return Clone
+end
+
+--[[
+	Call retention limit.
+
+	Every captured call keeps a deep-cloned copy of its arguments alive for the
+	rest of the session.  On a chatty game (and especially on a phone, where the
+	OS is quick to kill apps that grow) that is unbounded memory growth, so each
+	remote keeps at most `MaxCallsPerRemote` calls and drops the oldest ones.
+	The limit is configurable in Settings (Capture -> Calls Kept Per Remote).
+
+	`MaxCallsPerRemote` is cached: reading it through SaveManager validates the
+	whole schema, which must not happen once per intercepted call.
+]]
+local DefaultMaxCallsPerRemote = 500
+local CallCapSlack = 32
+local CachedCallCap = nil
+
+local function GetSettingBoolean(Key: string, Default: boolean): boolean
+	local Controls = wax.shared.Settings
+	local Control = Controls and Controls[Key]
+	if Control and Control.Value ~= nil then
+		return Control.Value == true
+	end
+
+	local SaveManager = wax.shared.SaveManager
+	local Success, Value = pcall(function()
+		return SaveManager:GetState(Key, Default)
+	end)
+
+	return if Success and Value ~= nil then Value == true else Default
+end
+
+local function GetMaxCallsPerRemote(): number
+	local Controls = wax.shared.Settings
+	local Control = Controls and Controls["MaxCallsPerRemote"]
+
+	if Control and Control.Value ~= nil then
+		local Value = tonumber(Control.Value)
+		if Value and Value >= 1 then
+			CachedCallCap = math.floor(Value)
+			return CachedCallCap
+		end
+	end
+
+	if CachedCallCap then
+		return CachedCallCap
+	end
+
+	local SaveManager = wax.shared.SaveManager
+	local Success, Value = pcall(function()
+		return SaveManager:GetState("MaxCallsPerRemote", DefaultMaxCallsPerRemote)
+	end)
+
+	CachedCallCap = math.floor(tonumber(Success and Value or DefaultMaxCallsPerRemote) or DefaultMaxCallsPerRemote)
+	if CachedCallCap < 1 then
+		CachedCallCap = DefaultMaxCallsPerRemote
+	end
+
+	return CachedCallCap
+end
+
+local function CheckSpamThreshold(Target)
+	return Target:IsOverSpamThreshold()
+end
+
 
 wax.shared.LogNotificationQueue = {
 	Items = {},
@@ -10,7 +110,7 @@ wax.shared.LogNotificationQueue = {
 	Tail = 0,
 }
 
-local function QueueNotification(LogObject, CallIndex: number)
+local function QueueNotification(LogObject, CallIndex: number, Call)
 	local Queue = wax.shared.LogNotificationQueue
 	Queue.Tail += 1
 	Queue.Items[Queue.Tail] = {
@@ -18,6 +118,11 @@ local function QueueNotification(LogObject, CallIndex: number)
 		Type = LogObject.Type,
 		LogIndex = LogObject.Index,
 		CallIndex = CallIndex,
+		-- Direct references: indices can shift when a log trims old calls, and
+		-- consumers would otherwise have to re-derive the log from the instance
+		-- (a DebugId lookup) for every single notification.
+		Log = LogObject,
+		Call = Call or LogObject.Calls[CallIndex],
 	}
 end
 
@@ -217,11 +322,7 @@ function DeepClone(OriginalValue, ValueCopies)
 			end
 
 		elseif RobloxType == "function" then
-			if clonefunction then
-				return clonefunction(OriginalValue)
-			else
-				return OriginalValue
-			end
+			return CloneFunction(OriginalValue)
 		end
 
 		return OriginalValue
@@ -265,11 +366,7 @@ function DeepClone(OriginalValue, ValueCopies)
 			end
 
 		elseif ValueType == "function" then
-			if clonefunction then
-				ShallowCopy[Key] = clonefunction(Value)
-			else
-				ShallowCopy[Key] = Value
-			end
+			ShallowCopy[Key] = CloneFunction(Value)
 	
 		else
 			ShallowCopy[Key] = Value
@@ -341,7 +438,7 @@ local function RunInterceptors(Interceptors: { (...any) -> ...any }, Info: any, 
 end
 
 function Log:ShouldBlock(RawInfo, PendingCallDecisionsKey): boolean
-	PendingCallDecisionsKey = PendingCallDecisionsKey or tostring(RawInfo)
+	PendingCallDecisionsKey = PendingCallDecisionsKey or GetDecisionKey(RawInfo)
 
 	local Decision = PendingCallDecisions[PendingCallDecisionsKey]
 	if Decision then
@@ -368,8 +465,46 @@ function Log:ShouldBlock(RawInfo, PendingCallDecisionsKey): boolean
 	return ShouldBlock
 end
 
+--[[
+	Keeps at most `MaxCalls` entries by dropping the oldest ones.
+
+	Call indices are the log's public currency (call lists, notifications, the
+	file logger), so both the call array and the executor-call index list are
+	rebuilt together and stay consistent.
+]]
+function Log:TrimCalls(MaxCalls: number)
+	local Calls = self.Calls
+	local Total = #Calls
+	local RemoveCount = Total - MaxCalls
+	if RemoveCount <= 0 then
+		return 0
+	end
+
+	local Trimmed = table.create(Total - RemoveCount)
+	for Index = RemoveCount + 1, Total do
+		Trimmed[Index - RemoveCount] = Calls[Index]
+	end
+	self.Calls = Trimmed
+
+	local GameCalls = self.GameCalls
+	local WriteIndex = 1
+	for ReadIndex = 1, #GameCalls do
+		local Shifted = GameCalls[ReadIndex] - RemoveCount
+		if Shifted >= 1 then
+			GameCalls[WriteIndex] = Shifted
+			WriteIndex += 1
+		end
+	end
+
+	for Index = WriteIndex, #GameCalls do
+		GameCalls[Index] = nil
+	end
+
+	return RemoveCount
+end
+
 function Log:Call(RawInfo): number?
-	local PendingCallDecisionsKey = tostring(RawInfo)
+	local PendingCallDecisionsKey = GetDecisionKey(RawInfo)
 
 	local ShouldBlock = self:ShouldBlock(RawInfo, PendingCallDecisionsKey)
 	local Decision = PendingCallDecisions[PendingCallDecisionsKey]
@@ -378,7 +513,7 @@ function Log:Call(RawInfo): number?
 	local ShouldCapture = not self.Ignored and Decision.FilterAction ~= "Ignore"
 	do
 		if ShouldBlock then
-			ShouldCapture = wax.shared.SaveManager:GetState("LogBlockedRemotes", false)
+			ShouldCapture = GetSettingBoolean("LogBlockedRemotes", false)
 		end
 
 		if RawInfo.Omit then
@@ -392,7 +527,7 @@ function Log:Call(RawInfo): number?
 
 	
 	if not wax.shared.IS_ACTOR then
-		local Success, SpamData = pcall(function() return self.IsOverSpamThreshold(self) end)
+		local Success, SpamData = pcall(CheckSpamThreshold, self)
 		if Success and SpamData then
 			return nil
 		end
@@ -476,7 +611,15 @@ function Log:Call(RawInfo): number?
 		table.insert(self.GameCalls, Index)
 	end
 
-	QueueNotification(self, Index)
+	-- Trim with a little slack so the rebuild cost is amortised over many calls
+	-- instead of running on every single one at the cap.
+	local CallCap = GetMaxCallsPerRemote()
+	if Index > CallCap + CallCapSlack then
+		self:TrimCalls(CallCap)
+		Index = #self.Calls
+	end
+
+	QueueNotification(self, Index, Info)
 	return Index
 end
 

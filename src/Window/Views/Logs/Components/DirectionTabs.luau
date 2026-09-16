@@ -2,6 +2,7 @@
 local Interface = require("@src/Utils/UI/Interface")
 local Constants = require("@src/Window/Constants")
 local Types = require("@src/Window/Types")
+local Animations = require("@src/Window/Utils/Animations")
 
 
 return function(props: {
@@ -19,19 +20,15 @@ return function(props: {
 		end
 
 		if self.CurrentTab then
-			wax.shared.TweenService
-				:Create(self.CurrentTab.Instance, Constants.DefaultTweenInfo, {
-					BackgroundTransparency = 1,
-				})
-				:Play()
+			Animations.Play(self.CurrentTab.Instance, {
+				BackgroundTransparency = 1,
+			}, Constants.DefaultTweenInfo)
 		end
 
 		self.CurrentTab = Tab
-		wax.shared.TweenService
-			:Create(Tab.Instance, Constants.DefaultTweenInfo, {
-				BackgroundTransparency = 0,
-			})
-			:Play()
+		Animations.Play(Tab.Instance, {
+			BackgroundTransparency = 0,
+		}, Constants.DefaultTweenInfo)
 
 		props.OnSelected(Tab)
 	end
@@ -60,6 +57,14 @@ return function(props: {
 		Button.MouseButton1Click:Connect(function()
 			self:Select(Tab)
 		end)
+
+		-- Text-only feedback: the background colour is owned by the active-tab
+		-- state above, so the two never fight over the same property.
+		Animations.BindPress(Button, {
+			Press = { TextTransparency = 0.45 },
+			Release = { TextTransparency = 0 },
+			TweenInfo = Constants.DefaultTweenInfo,
+		})
 
 		if Active then
 			self.CurrentTab = Tab

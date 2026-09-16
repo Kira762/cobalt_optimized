@@ -2,6 +2,7 @@
 local Interface = require("@src/Utils/UI/Interface")
 local Icons = require("@src/Utils/UI/Assets/Icons")
 local Constants = require("@src/Window/Constants")
+local Animations = require("@src/Window/Utils/Animations")
 local Types = require("@src/Window/Types")
 
 
@@ -515,6 +516,24 @@ return function(ComponentProps: {
 		self.IsOpen = false
 		self.Container.Interactable = false
 
+		-- Animations can be turned off in Settings; the dialog then closes in
+		-- exactly the same state, just without the fade.
+		if not Animations.IsEnabled() then
+			self.Overlay.BackgroundTransparency = 1
+			self.Container.GroupTransparency = 1
+			self.Scale.Scale = ClosedDialogScale
+			self.DismissTween = nil
+
+			if Behavior == "Destroy" then
+				self:Destroy()
+			else
+				self.Root.Visible = false
+				self.Overlay.Active = false
+			end
+
+			return nil
+		end
+
 		local BackdropTween = wax.shared.TweenService:Create(self.Overlay, BackdropTweenInfo, {
 			BackgroundTransparency = 1,
 		})
@@ -571,6 +590,13 @@ return function(ComponentProps: {
 		self.Root.Visible = true
 		self.Overlay.Active = true
 		self.Container.Interactable = true
+
+		if not Animations.IsEnabled() then
+			self.Overlay.BackgroundTransparency = BackdropTransparency
+			self.Container.GroupTransparency = 0
+			self.Scale.Scale = 1
+			return
+		end
 
 		local BackdropTween = wax.shared.TweenService:Create(self.Overlay, BackdropTweenInfo, {
 			BackgroundTransparency = BackdropTransparency,

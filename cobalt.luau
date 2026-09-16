@@ -153,8 +153,24 @@ wax.shared.getrawmetatable = wax.shared.ExecutorSupport["getrawmetatable"].IsWor
 	end
 
 local RawGetDebugId = clonefunction and clonefunction(game.GetDebugId) or game.GetDebugId
+
+--[[
+	DebugId lookup.
+
+	This runs for every intercepted remote call, so the identity switch is only
+	performed when the thread is not already elevated - the result is identical,
+	but the common case costs one call instead of four.
+]]
 wax.shared.GetDebugId = function(Instance)
+	if not setthreadidentity or not getthreadidentity then
+		return RawGetDebugId(Instance)
+	end
+
 	local identity = getthreadidentity()
+	if identity == 8 then
+		return RawGetDebugId(Instance)
+	end
+
 	setthreadidentity(8)
 	local id = RawGetDebugId(Instance)
 	setthreadidentity(identity)
@@ -337,6 +353,7 @@ wax.shared.SetupLoggingConnection = function()
 	local LogQueue = {}
 	local LogQueueHead = 1
 	local LogQueueTail = 0
+	local MaxQueuedLogEntries = 256
 	wax.shared.LogThread = task.defer(function()
 		while not wax.shared.Unloaded do
 			while LogQueueHead <= LogQueueTail do
@@ -456,12 +473,14 @@ wax.shared.SetupLoggingConnection = function()
 			local Type = Notification.Type
 			local CallOrderInLog = Notification.CallIndex
 
-			local LogEntry = wax.shared.Logs[Type][wax.shared.GetDebugId(RemoteInstance)]
+			local LogEntry = Notification.Log or wax.shared.Logs[Type][wax.shared.GetDebugId(RemoteInstance)]
 			if not LogEntry then
 				continue
 			end
 
-			local CallDataFromHook = LogEntry.Calls[CallOrderInLog]
+			-- The notification carries the call itself (indices shift when a log
+			-- trims), with the index lookup kept as a fallback.
+			local CallDataFromHook = Notification.Call or LogEntry.Calls[CallOrderInLog]
 			if not CallDataFromHook then
 				continue
 			end
@@ -473,6 +492,14 @@ wax.shared.SetupLoggingConnection = function()
 				CallIndex = CallOrderInLog,
 				CallData = CallDataFromHook,
 			}
+
+			-- File writes are orders of magnitude slower than the hooks that
+			-- feed them, so the backlog is bounded: the newest entries win and
+			-- the oldest are dropped instead of growing without limit.
+			if LogQueueTail - LogQueueHead >= MaxQueuedLogEntries then
+				LogQueue[LogQueueHead] = nil
+				LogQueueHead += 1
+			end
 		end
 	end
 end
@@ -3420,6 +3447,43 @@ do
 
 	local PendingCallDecisions = setmetatable({}, { __mode = "k" })
 
+	-- `tostring(table)` is needed twice per call (ShouldBlock + Call); memoising
+	-- it per info table halves that work and keeps both lookups identical.
+	local CallDecisionKeys = setmetatable({}, { __mode = "k" })
+
+	-- clonefunction() allocates a fresh closure every call; the same scripts are
+	-- cloned over and over, so clones are cached against the original (weak keys).
+	local FunctionClones = setmetatable({}, { __mode = "k" })
+
+	local function GetDecisionKey(RawInfo): string
+		local Key = CallDecisionKeys[RawInfo]
+		if not Key then
+			Key = tostring(RawInfo)
+			CallDecisionKeys[RawInfo] = Key
+		end
+
+		return Key
+	end
+
+	local function CloneFunction(Function)
+		local Cached = FunctionClones[Function]
+		if Cached then
+			return Cached
+		end
+
+		if not clonefunction then
+			return Function
+		end
+
+		local Clone = clonefunction(Function)
+		FunctionClones[Function] = Clone
+		return Clone
+	end
+
+	local function CheckSpamThreshold(Target)
+		return Target:IsOverSpamThreshold()
+	end
+
 	
 	wax.shared.LogNotificationQueue = {
 		Items = {},
@@ -3634,11 +3698,7 @@ do
 				end
 
 			elseif RobloxType == "function" then
-				if clonefunction then
-					return clonefunction(OriginalValue)
-				else
-					return OriginalValue
-				end
+				return CloneFunction(OriginalValue)
 			end
 
 			return OriginalValue
@@ -3682,11 +3742,7 @@ do
 				end
 
 			elseif ValueType == "function" then
-				if clonefunction then
-					ShallowCopy[Key] = clonefunction(Value)
-				else
-					ShallowCopy[Key] = Value
-				end
+				ShallowCopy[Key] = CloneFunction(Value)
 		
 			else
 				ShallowCopy[Key] = Value
@@ -3758,7 +3814,7 @@ do
 	end
 
 	function Log:ShouldBlock(RawInfo, PendingCallDecisionsKey): boolean
-		PendingCallDecisionsKey = PendingCallDecisionsKey or tostring(RawInfo)
+		PendingCallDecisionsKey = PendingCallDecisionsKey or GetDecisionKey(RawInfo)
 
 		local Decision = PendingCallDecisions[PendingCallDecisionsKey]
 		if Decision then
@@ -3786,7 +3842,7 @@ do
 	end
 
 	function Log:Call(RawInfo): number?
-		local PendingCallDecisionsKey = tostring(RawInfo)
+		local PendingCallDecisionsKey = GetDecisionKey(RawInfo)
 
 		local ShouldBlock = self:ShouldBlock(RawInfo, PendingCallDecisionsKey)
 		local Decision = PendingCallDecisions[PendingCallDecisionsKey]
@@ -3809,7 +3865,7 @@ do
 
 		
 		if not wax.shared.IS_ACTOR then
-			local Success, SpamData = pcall(function() return self.IsOverSpamThreshold(self) end)
+			local Success, SpamData = pcall(CheckSpamThreshold, self)
 			if Success and SpamData then
 				return nil
 			end
@@ -4987,10 +5043,22 @@ export type Options = {
 }
 
 
-local function GetLog(Instance: InstancesToHook, Function: (...any) -> ...any)
-	local DebugId = wax.shared.GetDebugId(Instance)
+--[[
+	`DebugId` and `Origin` can be passed in when the caller already resolved
+	them: both cost an executor call (DebugId also switches thread identity) and
+	the incoming path resolves them once per invocation instead of once per
+	connection entry.
+]]
+local function GetLog(
+	Instance: InstancesToHook,
+	Function: (...any) -> ...any,
+	DebugId: number?,
+	Origin: Instance?
+)
+	DebugId = DebugId or wax.shared.GetDebugId(Instance)
+	Origin = Origin or getcallingscript()
 
-	if wax.shared.ShouldIgnore(Instance, getcallingscript()) or LogConnectionFunctions[Function] then
+	if wax.shared.ShouldIgnore(Instance, Origin) or LogConnectionFunctions[Function] then
 		return nil
 	end
 
@@ -5001,7 +5069,7 @@ local function GetLog(Instance: InstancesToHook, Function: (...any) -> ...any)
 
 	local Log = IncomingLogs[DebugId]
 	if not Log then
-		Log = wax.shared.NewLog(Instance, "Incoming", getcallingscript(), DebugId)
+		Log = wax.shared.NewLog(Instance, "Incoming", Origin, DebugId)
 	end
 
 	return Log
@@ -5026,6 +5094,8 @@ local function LogRemote(
 	Instance: InstancesToHook,
 	Function: (...any) -> ...any,
 	Info: {
+		DebugId: number?,
+		IgnoreOrigin: Instance?,
 		Arguments: { [number]: any, n: number },
 		Origin: Instance,
 		Function: (...any) -> ...any,
@@ -5034,7 +5104,7 @@ local function LogRemote(
 		Blocked: boolean?,
 	}
 )
-	local Log = GetLog(Instance, Function)
+	local Log = GetLog(Instance, Function, Info.DebugId, Info.IgnoreOrigin)
 	if not Log then
 		return false, nil
 	end
@@ -5161,6 +5231,9 @@ local function CreateConnectionFunction(Instance: InstancesToHook, Method: Metho
 		local Arguments = wax.shared.SafePack.Pack(...)
 		local TargetLog, TargetCallIndex
 
+		-- Resolved once for the whole invocation (used to be one per entry).
+		local CallingScript = getcallingscript()
+
 		
 		if CachedConnectionInfo.HasValidConnections then
 			for _, Entry in CachedConnectionInfo.Entries do
@@ -5170,6 +5243,8 @@ local function CreateConnectionFunction(Instance: InstancesToHook, Method: Metho
 					Function = Entry.Function,
 					Line = nil,
 					IsExecutor = Entry.IsExecutor,
+					DebugId = DebugId,
+					IgnoreOrigin = CallingScript,
 				}))
 			end
 
@@ -5180,6 +5255,8 @@ local function CreateConnectionFunction(Instance: InstancesToHook, Method: Metho
 				Function = nil,
 				Line = nil,
 				IsExecutor = false,
+				DebugId = DebugId,
+				IgnoreOrigin = CallingScript,
 			}))
 		end
 
@@ -5569,11 +5646,18 @@ local AllowedClassNames =
 	CreateLookupTable({ "RemoteEvent", "RemoteFunction", "UnreliableRemoteEvent", "BindableEvent", "BindableFunction" })
 
 
-local function getcallingfunction()
+--[[
+	Caller resolution.
+
+	Function, source and line used to be resolved by three separate loops that
+	walked the same stack levels (up to eighteen debug.info calls per remote).
+	One pass returns all three, which is the single biggest win on this hot path.
+]]
+local function GetCallerInfo()
 	local BaseLevel = if wax.shared.IsUsingOthHooks then 3 else 5
 
 	for i = BaseLevel, 10 do
-		local Function, Source = debug.info(i, "fs")
+		local Function, Source, Line = debug.info(i, "fsl")
 		if not Function or not Source then
 			break
 		end
@@ -5582,55 +5666,33 @@ local function getcallingfunction()
 			continue
 		end
 
-		return Function
+		return Function, Source, Line
 	end
 
-	return debug.info(BaseLevel, "f")
+	return debug.info(BaseLevel, "f"), debug.info(BaseLevel, "s"), debug.info(BaseLevel, "l")
+end
+
+
+local function getcallingfunction()
+	local Function = GetCallerInfo()
+	return Function
 end
 
 
 local function getcallingline()
-	local BaseLevel = if wax.shared.IsUsingOthHooks then 3 else 5
-
-	for i = BaseLevel, 10 do
-		local Source, Line = debug.info(i, "sl")
-		if not Source then
-			break
-		end
-
-		if Source == "[C]" then
-			continue
-		end
-
-		return Line
-	end
-
-	return debug.info(BaseLevel, "l")
+	local _, _, Line = GetCallerInfo()
+	return Line
 end
 
 
 local function getcallingsource()
-	local BaseLevel = if wax.shared.IsUsingOthHooks then 3 else 5
-
-	for i = BaseLevel, 10 do
-		local Source = debug.info(i, "s")
-		if not Source then
-			break
-		end
-
-		if Source == "[C]" then
-			continue
-		end
-
-		return Source
-	end
-
-	return debug.info(BaseLevel, "s")
+	local _, Source = GetCallerInfo()
+	return Source
 end
 
 
-local function GetLog(Instance: Instance, Direction: "Outgoing" | "Incoming")
-	local DebugId = wax.shared.GetDebugId(Instance)
+local function GetLog(Instance: Instance, Direction: "Outgoing" | "Incoming", DebugId: number?)
+	DebugId = DebugId or wax.shared.GetDebugId(Instance)
 
 	local LogsInDirection = wax.shared.Logs[Direction]
 	if not LogsInDirection then
@@ -5656,19 +5718,25 @@ end
 
 
 local function HandleLogging(TargetInstance: Instance, Method: string, OldFunction: (...any) -> ...any, ...)
-	local Log = GetLog(TargetInstance, "Outgoing")
+	-- Resolve everything the log entry needs exactly once.
+	local DebugId = wax.shared.GetDebugId(TargetInstance)
+	local Log = GetLog(TargetInstance, "Outgoing", DebugId)
 	if not Log then
 		return OldFunction(...)
 	end
 	local Arguments = wax.shared.SafePack.Pack(select(2, ...))
 
+	local CallingScript = getcallingscript()
+	local CallingFunction, CallingSource, CallingLine = GetCallerInfo()
+	local IsExecutor = checkcaller()
+
 	local Info = {
 		Arguments = Arguments,
-		Origin = getcallingscript(),
-		Function = getcallingfunction(),
-		Line = getcallingline(),
-		Source = getcallingsource(),
-		IsExecutor = checkcaller(),
+		Origin = CallingScript,
+		Function = CallingFunction,
+		Line = CallingLine,
+		Source = CallingSource,
+		IsExecutor = IsExecutor,
 	}
 	local ShouldBlock = Log:ShouldBlock(Info)
 	Log:Call(Info)
@@ -5686,15 +5754,15 @@ local function HandleLogging(TargetInstance: Instance, Method: string, OldFuncti
 
 	if IsRemoteFunctionInvoke or IsBindableFunctionInvoke then
 		
-		Log = GetLog(TargetInstance, "Incoming")
+		Log = GetLog(TargetInstance, "Incoming", DebugId)
 		local RFResultInfo = {
 			Arguments = Arguments,
 			InvokeResult = nil,
-			Origin = getcallingscript(),
-			Function = getcallingfunction(),
-			Line = getcallingline(),
-			Source = getcallingsource(),
-			IsExecutor = checkcaller(),
+			Origin = CallingScript,
+			Function = CallingFunction,
+			Line = CallingLine,
+			Source = CallingSource,
+			IsExecutor = IsExecutor,
 			InvokeKind = "Request",
 		}
 
@@ -6110,6 +6178,16 @@ end
     [16] = function(...) local wax,script,require=ImportGlobals(16) local ImportGlobals return (function(...)
 local DEFAULT_TIMEOUT_SECONDS = 1500
 
+--[[
+	Upper bound on pending invocations tracked per remote.
+
+	Entries keep their captured arguments alive until the timeout expires (25
+	minutes by default), so an extremely chatty remote could hold on to a lot of
+	memory in the meantime.  This is a safety valve, not a queue: it is only ever
+	reached under heavy load.
+]]
+local MAX_ENTRIES_PER_INSTANCE = 256
+
 local InvocationTracker = {}
 InvocationTracker.__index = InvocationTracker
 
@@ -6146,6 +6224,9 @@ function InvocationTracker.Prune(self: Tracker, now: number?)
 
 		if next(entries) == nil then
 			self.Entries[instance] = nil
+			if self.Counts then
+				self.Counts[instance] = nil
+			end
 		end
 	end
 end
@@ -6158,6 +6239,20 @@ function InvocationTracker.Add(self: Tracker, instance: Instance, invokeId: numb
 	if not entries then
 		entries = {}
 		self.Entries[key] = entries
+		self.Counts = self.Counts or {}
+		self.Counts[key] = 0
+	end
+
+	local counts = self.Counts
+	local count = (counts and counts[key] or 0) + 1
+	if count > MAX_ENTRIES_PER_INSTANCE then
+		-- Bounded: start the window over instead of holding everything forever.
+		table.clear(entries)
+		count = 1
+	end
+
+	if counts then
+		counts[key] = count
 	end
 
 	entries[invokeId] = {
@@ -6191,6 +6286,9 @@ function InvocationTracker.Consume(self: Tracker, instance: Instance, invokeId: 
 	entries[invokeId] = nil
 	if next(entries) == nil then
 		self.Entries[key] = nil
+		if self.Counts then
+			self.Counts[key] = nil
+		end
 	end
 
 	if not entry or os.clock() - entry.CreatedAt >= self.TimeoutSeconds then
@@ -6202,6 +6300,9 @@ end
 
 function InvocationTracker.Clear(self: Tracker)
 	table.clear(self.Entries)
+	if self.Counts then
+		table.clear(self.Counts)
+	end
 end
 
 return InvocationTracker
@@ -13080,6 +13181,106 @@ Log.__index = Log
 
 local PendingCallDecisions = setmetatable({}, { __mode = "k" })
 
+-- `tostring(table)` is used as the pending-decision key and is needed twice per
+-- call (ShouldBlock + Call).  Remembering the key per info table halves that
+-- work and keeps both lookups on the same interned string.
+local CallDecisionKeys = setmetatable({}, { __mode = "k" })
+
+-- clonefunction() allocates a brand new closure every time it runs, and the
+-- same calling scripts are cloned over and over.  Clones are cached against the
+-- original closure (weak keys: once the game drops the original, the clone goes
+-- with it).
+local FunctionClones = setmetatable({}, { __mode = "k" })
+
+local function GetDecisionKey(RawInfo): string
+	local Key = CallDecisionKeys[RawInfo]
+	if not Key then
+		Key = tostring(RawInfo)
+		CallDecisionKeys[RawInfo] = Key
+	end
+
+	return Key
+end
+
+local function CloneFunction(Function)
+	local Cached = FunctionClones[Function]
+	if Cached then
+		return Cached
+	end
+
+	if not clonefunction then
+		return Function
+	end
+
+	local Clone = clonefunction(Function)
+	FunctionClones[Function] = Clone
+	return Clone
+end
+
+--[[
+	Call retention limit.
+
+	Every captured call keeps a deep-cloned copy of its arguments alive for the
+	rest of the session.  On a chatty game (and especially on a phone, where the
+	OS is quick to kill apps that grow) that is unbounded memory growth, so each
+	remote keeps at most `MaxCallsPerRemote` calls and drops the oldest ones.
+	The limit is configurable in Settings (Capture -> Calls Kept Per Remote).
+
+	`MaxCallsPerRemote` is cached: reading it through SaveManager validates the
+	whole schema, which must not happen once per intercepted call.
+]]
+local DefaultMaxCallsPerRemote = 500
+local CallCapSlack = 32
+local CachedCallCap = nil
+
+local function GetSettingBoolean(Key: string, Default: boolean): boolean
+	local Controls = wax.shared.Settings
+	local Control = Controls and Controls[Key]
+	if Control and Control.Value ~= nil then
+		return Control.Value == true
+	end
+
+	local SaveManager = wax.shared.SaveManager
+	local Success, Value = pcall(function()
+		return SaveManager:GetState(Key, Default)
+	end)
+
+	return if Success and Value ~= nil then Value == true else Default
+end
+
+local function GetMaxCallsPerRemote(): number
+	local Controls = wax.shared.Settings
+	local Control = Controls and Controls["MaxCallsPerRemote"]
+
+	if Control and Control.Value ~= nil then
+		local Value = tonumber(Control.Value)
+		if Value and Value >= 1 then
+			CachedCallCap = math.floor(Value)
+			return CachedCallCap
+		end
+	end
+
+	if CachedCallCap then
+		return CachedCallCap
+	end
+
+	local SaveManager = wax.shared.SaveManager
+	local Success, Value = pcall(function()
+		return SaveManager:GetState("MaxCallsPerRemote", DefaultMaxCallsPerRemote)
+	end)
+
+	CachedCallCap = math.floor(tonumber(Success and Value or DefaultMaxCallsPerRemote) or DefaultMaxCallsPerRemote)
+	if CachedCallCap < 1 then
+		CachedCallCap = DefaultMaxCallsPerRemote
+	end
+
+	return CachedCallCap
+end
+
+local function CheckSpamThreshold(Target)
+	return Target:IsOverSpamThreshold()
+end
+
 
 wax.shared.LogNotificationQueue = {
 	Items = {},
@@ -13087,7 +13288,7 @@ wax.shared.LogNotificationQueue = {
 	Tail = 0,
 }
 
-local function QueueNotification(LogObject, CallIndex: number)
+local function QueueNotification(LogObject, CallIndex: number, Call)
 	local Queue = wax.shared.LogNotificationQueue
 	Queue.Tail += 1
 	Queue.Items[Queue.Tail] = {
@@ -13095,6 +13296,11 @@ local function QueueNotification(LogObject, CallIndex: number)
 		Type = LogObject.Type,
 		LogIndex = LogObject.Index,
 		CallIndex = CallIndex,
+		-- Direct references: indices can shift when a log trims old calls, and
+		-- consumers would otherwise have to re-derive the log from the instance
+		-- (a DebugId lookup) for every single notification.
+		Log = LogObject,
+		Call = Call or LogObject.Calls[CallIndex],
 	}
 end
 
@@ -13294,11 +13500,7 @@ function DeepClone(OriginalValue, ValueCopies)
 			end
 
 		elseif RobloxType == "function" then
-			if clonefunction then
-				return clonefunction(OriginalValue)
-			else
-				return OriginalValue
-			end
+			return CloneFunction(OriginalValue)
 		end
 
 		return OriginalValue
@@ -13342,11 +13544,7 @@ function DeepClone(OriginalValue, ValueCopies)
 			end
 
 		elseif ValueType == "function" then
-			if clonefunction then
-				ShallowCopy[Key] = clonefunction(Value)
-			else
-				ShallowCopy[Key] = Value
-			end
+			ShallowCopy[Key] = CloneFunction(Value)
 	
 		else
 			ShallowCopy[Key] = Value
@@ -13418,7 +13616,7 @@ local function RunInterceptors(Interceptors: { (...any) -> ...any }, Info: any, 
 end
 
 function Log:ShouldBlock(RawInfo, PendingCallDecisionsKey): boolean
-	PendingCallDecisionsKey = PendingCallDecisionsKey or tostring(RawInfo)
+	PendingCallDecisionsKey = PendingCallDecisionsKey or GetDecisionKey(RawInfo)
 
 	local Decision = PendingCallDecisions[PendingCallDecisionsKey]
 	if Decision then
@@ -13445,8 +13643,46 @@ function Log:ShouldBlock(RawInfo, PendingCallDecisionsKey): boolean
 	return ShouldBlock
 end
 
+--[[
+	Keeps at most `MaxCalls` entries by dropping the oldest ones.
+
+	Call indices are the log's public currency (call lists, notifications, the
+	file logger), so both the call array and the executor-call index list are
+	rebuilt together and stay consistent.
+]]
+function Log:TrimCalls(MaxCalls: number)
+	local Calls = self.Calls
+	local Total = #Calls
+	local RemoveCount = Total - MaxCalls
+	if RemoveCount <= 0 then
+		return 0
+	end
+
+	local Trimmed = table.create(Total - RemoveCount)
+	for Index = RemoveCount + 1, Total do
+		Trimmed[Index - RemoveCount] = Calls[Index]
+	end
+	self.Calls = Trimmed
+
+	local GameCalls = self.GameCalls
+	local WriteIndex = 1
+	for ReadIndex = 1, #GameCalls do
+		local Shifted = GameCalls[ReadIndex] - RemoveCount
+		if Shifted >= 1 then
+			GameCalls[WriteIndex] = Shifted
+			WriteIndex += 1
+		end
+	end
+
+	for Index = WriteIndex, #GameCalls do
+		GameCalls[Index] = nil
+	end
+
+	return RemoveCount
+end
+
 function Log:Call(RawInfo): number?
-	local PendingCallDecisionsKey = tostring(RawInfo)
+	local PendingCallDecisionsKey = GetDecisionKey(RawInfo)
 
 	local ShouldBlock = self:ShouldBlock(RawInfo, PendingCallDecisionsKey)
 	local Decision = PendingCallDecisions[PendingCallDecisionsKey]
@@ -13455,7 +13691,7 @@ function Log:Call(RawInfo): number?
 	local ShouldCapture = not self.Ignored and Decision.FilterAction ~= "Ignore"
 	do
 		if ShouldBlock then
-			ShouldCapture = wax.shared.SaveManager:GetState("LogBlockedRemotes", false)
+			ShouldCapture = GetSettingBoolean("LogBlockedRemotes", false)
 		end
 
 		if RawInfo.Omit then
@@ -13469,7 +13705,7 @@ function Log:Call(RawInfo): number?
 
 	
 	if not wax.shared.IS_ACTOR then
-		local Success, SpamData = pcall(function() return self.IsOverSpamThreshold(self) end)
+		local Success, SpamData = pcall(CheckSpamThreshold, self)
 		if Success and SpamData then
 			return nil
 		end
@@ -13553,7 +13789,15 @@ function Log:Call(RawInfo): number?
 		table.insert(self.GameCalls, Index)
 	end
 
-	QueueNotification(self, Index)
+	-- Trim with a little slack so the rebuild cost is amortised over many calls
+	-- instead of running on every single one at the cap.
+	local CallCap = GetMaxCallsPerRemote()
+	if Index > CallCap + CallCapSlack then
+		self:TrimCalls(CallCap)
+		Index = #self.Calls
+	end
+
+	QueueNotification(self, Index, Info)
 	return Index
 end
 
@@ -14760,6 +15004,7 @@ function Ratelimiter:SetupManagerThread()
 	self.ManagerThread = task.spawn(function()
 		while not wax.shared.Unloaded and not self.IsDestroyed do
 			local CurrentTime = tick()
+			local DidWork = false
 
 			if #self.Bucket > 0 then
 				local NewBucket = {}
@@ -14789,6 +15034,7 @@ function Ratelimiter:SetupManagerThread()
 
 				if TaskData then
 					table.insert(self.Bucket, tick())
+					DidWork = true
 
 					task.defer(function()
 						if self.IsDestroyed then
@@ -14800,7 +15046,15 @@ function Ratelimiter:SetupManagerThread()
 				end
 			end
 
-			task.wait()
+			-- Stay frame-accurate while there is traffic, but back off when idle:
+			-- an unattended limiter no longer wakes the scheduler every frame
+			-- (which matters a lot on a phone), while still picking up new work
+			-- within a few frames.
+			if DidWork or self.QueueHead <= self.QueueTail then
+				task.wait()
+			else
+				task.wait(math.min(self.Burst.Time, 0.05))
+			end
 		end
 
 		if wax.shared.Unloaded and not self.IsDestroyed and self.OnUnload then
@@ -15058,6 +15312,38 @@ return {
 		UI = {
 			Type = "TextBox",
 			Text = "Calls Per Page",
+			NumericOnly = true,
+		},
+	}),
+
+	--[[
+		Interface motion.  Turning this off makes every transition instant; the
+		end state of the interface is identical either way, so it is purely a
+		comfort / low-end-device switch.
+	]]
+	AnimationsEnabled = Setting.new({
+		Key = "AnimationsEnabled",
+		Default = true,
+		Schema = Schema.boolean(),
+		UI = {
+			Type = "Checkbox",
+			Text = "Interface Animations",
+		},
+	}),
+
+	--[[
+		Retention limit per remote.  Captured calls hold a deep copy of their
+		arguments for the whole session, so without a limit a busy game grows
+		memory until the device kills Roblox.  Old calls are dropped once a remote
+		exceeds this many.
+	]]
+	MaxCallsPerRemote = Setting.new({
+		Key = "MaxCallsPerRemote",
+		Default = 500,
+		Schema = PositiveInteger,
+		UI = {
+			Type = "TextBox",
+			Text = "Calls Kept Per Remote",
 			NumericOnly = true,
 		},
 	}),
@@ -15432,16 +15718,33 @@ local Success, IconsModule = pcall(function()
 	return (loadstring(IconModuleSource.Body) :: () -> { Icons: { string }, GetAsset: (Name: string) -> Icon? })()
 end)
 
+--[[
+	Icon lookups are memoised.
+
+	SetIcon runs for every icon in the interface (every call row, every menu
+	option, every toast) and each miss used to pay for a pcall plus a lookup
+	inside the loaded icon module.  Negative results are cached too, so an icon
+	that does not exist is not searched for again.
+]]
+local IconCache = {}
+
 function Icons.GetIcon(iconName: string): Icon?
-	if not Success then
-		return
+	local Cached = IconCache[iconName]
+	if Cached ~= nil then
+		return Cached or nil
 	end
 
-	local Success, Icon = pcall(IconsModule.GetAsset, iconName)
 	if not Success then
-		return
+		return nil
 	end
 
+	local Ok, Icon = pcall(IconsModule.GetAsset, iconName)
+	if not Ok or not Icon then
+		IconCache[iconName] = false
+		return nil
+	end
+
+	IconCache[iconName] = Icon
 	return Icon
 end
 
@@ -15451,9 +15754,18 @@ function Icons.SetIcon(imageInstance: ImageLabel, iconName: string)
 		return
 	end
 
-	imageInstance.Image = Icon.Url
-	imageInstance.ImageRectOffset = Icon.ImageRectOffset
-	imageInstance.ImageRectSize = Icon.ImageRectSize
+	-- Skip redundant property writes: they still dirty the instance.
+	if imageInstance.Image ~= Icon.Url then
+		imageInstance.Image = Icon.Url
+	end
+
+	if imageInstance.ImageRectOffset ~= Icon.ImageRectOffset then
+		imageInstance.ImageRectOffset = Icon.ImageRectOffset
+	end
+
+	if imageInstance.ImageRectSize ~= Icon.ImageRectSize then
+		imageInstance.ImageRectSize = Icon.ImageRectSize
+	end
 end
 
 return Icons
@@ -16424,6 +16736,7 @@ return Schema
 local Interface = require("@src/Utils/UI/Interface")
 local Constants = require("@src/Window/Constants")
 
+local Animations = require("@src/Window/Utils/Animations")
 local DPI = require("@src/Window/Utils/DPI")
 local Resize = require("@src/Window/Utils/Input/Resize")
 
@@ -16508,6 +16821,14 @@ do
 	ShowButton.MouseButton1Click:Connect(function()
 		ShowButton.Visible = false
 		MainFrame.Visible = true
+
+		-- Grow the window back out of the launcher button.
+		Animations.Pop(MainFrame, {
+			From = 0.96,
+			To = 1,
+			Duration = 0.18,
+			TweenInfo = TweenInfo.new(0.18, Enum.EasingStyle.Exponential, Enum.EasingDirection.Out),
+		})
 	end)
 end
 
@@ -16636,6 +16957,7 @@ return Window
 local Interface = require("@src/Utils/UI/Interface")
 local Icons = require("@src/Utils/UI/Assets/Icons")
 local Input = require("@src/Window/Utils/Input/Input")
+local Animations = require("@src/Window/Utils/Animations")
 
 local ContextMenu = {}
 export type ContextMenu = {
@@ -16815,21 +17137,11 @@ function ContextMenu:Create(
 				end
 			end
 
-			TextButton.MouseEnter:Connect(function()
-				wax.shared.TweenService
-					:Create(TextButton, self.TweenInfo, {
-						BackgroundTransparency = 0,
-					})
-					:Play()
-			end)
-
-			TextButton.MouseLeave:Connect(function()
-				wax.shared.TweenService
-					:Create(TextButton, self.TweenInfo, {
-						BackgroundTransparency = 1,
-					})
-					:Play()
-			end)
+			Animations.BindHover(TextButton, {
+				BackgroundTransparency = 1,
+			}, {
+				BackgroundTransparency = 0,
+			}, self.TweenInfo)
 
 			TextButton.MouseButton1Click:Connect(function()
 				TextButton.BackgroundTransparency = 1
@@ -16921,6 +17233,14 @@ function ContextMenu:Create(
 		end
 
 		Owner.Frame.Visible = true
+
+		-- Grow in from the anchor instead of appearing fully formed.
+		Animations.Pop(Owner.Frame, {
+			From = 0.94,
+			To = 1,
+			Duration = 0.14,
+			TweenInfo = TweenInfo.new(0.14, Enum.EasingStyle.Exponential, Enum.EasingDirection.Out),
+		})
 	end
 
 	function ContextData.Toggle()
@@ -16971,6 +17291,7 @@ function ContextMenu:Create(
 		end
 
 		ContextData.Owner.Frame.Visible = false
+		Animations.Cancel(ContextData.Owner.Frame, true)
 		for Object, _ in pairs(ContextData.Options) do
 			Object.Parent = nil
 		end
@@ -16996,6 +17317,7 @@ return ContextMenu
 local Interface = require("@src/Utils/UI/Interface")
 local Icons = require("@src/Utils/UI/Assets/Icons")
 local Constants = require("@src/Window/Constants")
+local Animations = require("@src/Window/Utils/Animations")
 local Types = require("@src/Window/Types")
 
 
@@ -17509,6 +17831,24 @@ return function(ComponentProps: {
 		self.IsOpen = false
 		self.Container.Interactable = false
 
+		-- Animations can be turned off in Settings; the dialog then closes in
+		-- exactly the same state, just without the fade.
+		if not Animations.IsEnabled() then
+			self.Overlay.BackgroundTransparency = 1
+			self.Container.GroupTransparency = 1
+			self.Scale.Scale = ClosedDialogScale
+			self.DismissTween = nil
+
+			if Behavior == "Destroy" then
+				self:Destroy()
+			else
+				self.Root.Visible = false
+				self.Overlay.Active = false
+			end
+
+			return nil
+		end
+
 		local BackdropTween = wax.shared.TweenService:Create(self.Overlay, BackdropTweenInfo, {
 			BackgroundTransparency = 1,
 		})
@@ -17565,6 +17905,13 @@ return function(ComponentProps: {
 		self.Root.Visible = true
 		self.Overlay.Active = true
 		self.Container.Interactable = true
+
+		if not Animations.IsEnabled() then
+			self.Overlay.BackgroundTransparency = BackdropTransparency
+			self.Container.GroupTransparency = 0
+			self.Scale.Scale = 1
+			return
+		end
 
 		local BackdropTween = wax.shared.TweenService:Create(self.Overlay, BackdropTweenInfo, {
 			BackgroundTransparency = BackdropTransparency,
@@ -17971,6 +18318,7 @@ return RakNet
     end)(...) end,
     [136] = function(...) local wax,script,require=ImportGlobals(136) local ImportGlobals return (function(...)
 local Interface = require("@src/Utils/UI/Interface")
+local Animations = require("@src/Window/Utils/Animations")
 
 local Modal = {}
 Modal.__index = Modal
@@ -17983,6 +18331,13 @@ export type Modal = {
 
 local DefaultTweenInfo = TweenInfo.new(0.2, Enum.EasingStyle.Exponential)
 
+-- Open/close motion for modal frames.  Scale only (never a full fade): the
+-- modal's children keep their own transparencies, so the interface looks exactly
+-- the same once the animation settles.
+local OpenScale = 0.97
+local CloseScale = 0.98
+local CloseDuration = 0.13
+
 function Modal.new(
 	Parent: GuiObject,
 	Options: {
@@ -17993,6 +18348,8 @@ function Modal.new(
 		OpenedModal = nil,
 		Background = nil,
 		TweenInfo = Options and Options.TweenInfo or DefaultTweenInfo,
+		BackdropTransparency = 0.5,
+		Generation = 0,
 	}, Modal)
 
 	self.Background = Interface.New("TextButton", {
@@ -18010,6 +18367,8 @@ function Modal.new(
 		Parent = Parent,
 	})
 
+	self.BackdropTransparency = self.Background.BackgroundTransparency
+
 	self.Background.MouseButton1Click:Connect(function()
 		self:Close()
 	end)
@@ -18017,38 +18376,91 @@ function Modal.new(
 	return self
 end
 
+--[[
+	Hides a modal frame instantly.  Pooled/parent-changing modals that get
+	re-opened while a close animation is still running must not be hidden by the
+	stale animation, which is what `Generation` guards against.
+]]
+local function HideAfter(Parent, Delay, IsCurrent: () -> boolean)
+	if not Animations.IsEnabled() then
+		if IsCurrent() then
+			Parent.Visible = false
+		end
+
+		return
+	end
+
+	task.delay(Delay, function()
+		if not IsCurrent() then
+			return
+		end
+
+		Parent.Visible = false
+	end)
+end
+
 function Modal:Open(Parent)
+	if self.OpenedModal == Parent and Parent.Visible then
+		self.Background.Visible = true
+		self.Background.BackgroundTransparency = self.BackdropTransparency
+		return
+	end
+
+	self.Generation += 1
+
 	self.OpenedModal = Parent
 
-	self.OpenedModal.Visible = true
+	Parent.Visible = true
 	self.Background.Visible = true
+
+	-- Backdrop fades in from transparent instead of popping in.
+	self.Background.BackgroundTransparency = 1
+	Animations.Play(self.Background, {
+		BackgroundTransparency = self.BackdropTransparency,
+	}, self.TweenInfo)
+
+	Animations.Pop(Parent, {
+		From = OpenScale,
+		To = 1,
+		Duration = self.TweenInfo.Time,
+		TweenInfo = self.TweenInfo,
+	})
 end
 
 function Modal:Close()
-	if self.OpenedModal then
-		self.OpenedModal.Visible = false
-		self.OpenedModal = nil
+	local Opened = self.OpenedModal
+	self.OpenedModal = nil
+	self.Generation += 1
+	local Generation = self.Generation
+
+	local function IsCurrent(): boolean
+		return self.Generation == Generation
 	end
 
-	self.Background.Visible = false
+	if Opened then
+		Animations.Pop(Opened, {
+			From = 1,
+			To = CloseScale,
+			Duration = CloseDuration,
+			TweenInfo = TweenInfo.new(CloseDuration, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+		})
+
+		HideAfter(Opened, CloseDuration, IsCurrent)
+	end
+
+	Animations.Play(self.Background, {
+		BackgroundTransparency = 1,
+	}, TweenInfo.new(self.TweenInfo.Time, Enum.EasingStyle.Exponential, Enum.EasingDirection.In))
+
+	HideAfter(self.Background, self.TweenInfo.Time, IsCurrent)
 end
 
 function Modal:ConnectCloseButton(Button, Image)
-	Button.MouseEnter:Connect(function()
-		wax.shared.TweenService
-			:Create(Image, self.TweenInfo, {
-				ImageTransparency = 0.25,
-			})
-			:Play()
-	end)
-
-	Button.MouseLeave:Connect(function()
-		wax.shared.TweenService
-			:Create(Image, self.TweenInfo, {
-				ImageTransparency = 0.5,
-			})
-			:Play()
-	end)
+	Animations.BindHover(Button, {
+		ImageTransparency = 0.5,
+	}, {
+		ImageTransparency = 0.25,
+	}, self.TweenInfo)
 
 	Button.MouseButton1Click:Connect(function()
 		self:Close()
@@ -18423,6 +18835,7 @@ end
     [140] = function(...) local wax,script,require=ImportGlobals(140) local ImportGlobals return (function(...)
 local Interface = require("@src/Utils/UI/Interface")
 local Constants = require("@src/Window/Constants")
+local Animations = require("@src/Window/Utils/Animations")
 
 local SettingSync = require(script.Parent.SettingSync)
 
@@ -18504,18 +18917,16 @@ return function(props: {
 			return
 		end
 
-		wax.shared.TweenService
-			:Create(ToggleTrack, Constants.DefaultTweenInfo, {
-				BackgroundColor3 = TargetTrackColor,
-			})
-			:Play()
+		-- Animations.Play cancels the previous toggle tween first, so rapid
+		-- toggling (and reset buttons) can never stack tweens up.
+		Animations.Play(ToggleTrack, {
+			BackgroundColor3 = TargetTrackColor,
+		}, Constants.DefaultTweenInfo)
 
-		wax.shared.TweenService
-			:Create(ToggleKnob, Constants.DefaultTweenInfo, {
-				Position = TargetKnobPosition,
-				Size = TargetKnobSize,
-			})
-			:Play()
+		Animations.Play(ToggleKnob, {
+			Position = TargetKnobPosition,
+			Size = TargetKnobSize,
+		}, Constants.DefaultTweenInfo)
 	end
 
 	function Checkbox:Reset()
@@ -20720,7 +21131,14 @@ local Sonner = {
 	TweenInfo = TweenInfo.new(0.5, Enum.EasingStyle.Exponential),
 	Wrapper = nil,
 	PendingQueue = {},
+	PendingHead = 1,
+	PendingTail = 0,
 	Processing = false,
+
+	-- Toasts are cheap to queue but expensive to render, so the backlog is
+	-- bounded: a game spamming events can never grow this without limit.
+	MaxPendingToasts = 32,
+	MaxVisibleToasts = 4,
 }
 
 local Icons = require("@src/Utils/UI/Assets/Icons")
@@ -20730,6 +21148,67 @@ local Animations = require("@src/Window/Utils/Animations")
 local NOTIFICATION_WIDTH = 250
 local NOTIFICATION_MIN_HEIGHT = 50
 local NOTIFICATION_VERTICAL_PADDING = 20
+
+--[[
+	Spinning icons.
+
+	`Sonner.promise` used to spawn a thread per promise that waited on
+	RenderStepped forever, and re-resolved the icon with FindFirstChild on every
+	frame.  All spinners now share one connection, which is only alive while at
+	least one promise is running.
+]]
+local SpinningIcons = setmetatable({}, { __mode = "k" })
+local SpinnerConnection = nil
+
+local function StopSpinnerDriver()
+	if SpinnerConnection then
+		SpinnerConnection:Disconnect()
+		SpinnerConnection = nil
+	end
+end
+
+local function DriveSpinners()
+	local AnyAlive = false
+
+	for Icon in SpinningIcons do
+		if Icon.Parent == nil then
+			SpinningIcons[Icon] = nil
+			continue
+		end
+
+		AnyAlive = true
+		Icon.Rotation = (Icon.Rotation + 1) % 360
+	end
+
+	if not AnyAlive then
+		StopSpinnerDriver()
+	end
+end
+
+local function StartSpinner(Icon)
+	if not Icon then
+		return nil
+	end
+
+	SpinningIcons[Icon] = true
+
+	if not SpinnerConnection then
+		SpinnerConnection = wax.shared.RunService.RenderStepped:Connect(DriveSpinners)
+	end
+
+	return Icon
+end
+
+local function StopSpinner(Icon)
+	if not Icon then
+		return
+	end
+
+	SpinningIcons[Icon] = nil
+	if next(SpinningIcons) == nil then
+		StopSpinnerDriver()
+	end
+end
 
 local function GetHiddenPosition(Notification: GuiObject): UDim2
 	return UDim2.new(0.5, 0, 1, math.max(NOTIFICATION_MIN_HEIGHT, Notification.AbsoluteSize.Y + 2))
@@ -20863,20 +21342,15 @@ local function InternalToast(image, text, internalTime, removeCallback)
 
 		object.ZIndex = 500 - (#Sonner.Queue - index)
 
-		
-		wax.shared.TweenService
-			:Create(object.UIScale, Sonner.TweenInfo, {
-				Scale = object.UIScale.Scale * ScaleMultiplier,
-			})
-			:Play()
+		Animations.Play(object.UIScale, {
+			Scale = object.UIScale.Scale * ScaleMultiplier,
+		}, Sonner.TweenInfo)
 
-		wax.shared.TweenService
-			:Create(object, Sonner.TweenInfo, {
-				Position = object.Position - UDim2.fromOffset(0, object.AbsoluteSize.Y * 0.35),
-			})
-			:Play()
+		Animations.Play(object, {
+			Position = object.Position - UDim2.fromOffset(0, object.AbsoluteSize.Y * 0.35),
+		}, Sonner.TweenInfo)
 
-		if ((#Sonner.Queue - index) + 1) >= 4 then
+		if ((#Sonner.Queue - index) + 1) >= Sonner.MaxVisibleToasts then
 			Animations.FadeOut(object)
 			task.delay(0.5, function()
 				object:Destroy()
@@ -20889,11 +21363,9 @@ local function InternalToast(image, text, internalTime, removeCallback)
 		table.remove(Sonner.Queue, table.find(Sonner.Queue, obj))
 	end
 
-	wax.shared.TweenService
-		:Create(Notif, Sonner.TweenInfo, {
-			Position = UDim2.new(0.5, 0, 1, -20),
-		})
-		:Play()
+	Animations.Play(Notif, {
+		Position = UDim2.new(0.5, 0, 1, -20),
+	}, Sonner.TweenInfo)
 	Animations.FadeIn(Notif)
 
 	if removeCallback then
@@ -20906,11 +21378,9 @@ local function InternalToast(image, text, internalTime, removeCallback)
 			table.remove(Sonner.Queue, table.find(Sonner.Queue, Notif))
 
 			Animations.FadeOut(Notif, 0.35)
-			wax.shared.TweenService
-				:Create(Notif, Sonner.TweenInfo, {
-					Position = GetHiddenPosition(Notif),
-				})
-				:Play()
+			Animations.Play(Notif, {
+				Position = GetHiddenPosition(Notif),
+			}, Sonner.TweenInfo)
 			task.wait(0.5)
 			Notif:Destroy()
 		end)
@@ -20926,22 +21396,39 @@ local function ProcessQueue()
 	end
 	Sonner.Processing = true
 
-	while #Sonner.PendingQueue > 0 do
-		local Request = table.remove(Sonner.PendingQueue, 1)
-		InternalToast(Request.image, Request.text, Request.internalTime, Request.removeCallback)
-		task.wait(0.5)
+	while Sonner.PendingHead <= Sonner.PendingTail do
+		local Request = Sonner.PendingQueue[Sonner.PendingHead]
+		Sonner.PendingQueue[Sonner.PendingHead] = nil
+		Sonner.PendingHead += 1
+
+		if Request then
+			InternalToast(Request.image, Request.text, Request.internalTime, Request.removeCallback)
+			task.wait(0.5)
+		end
 	end
 
+	table.clear(Sonner.PendingQueue)
+	Sonner.PendingHead = 1
+	Sonner.PendingTail = 0
 	Sonner.Processing = false
 end
 
 local function toast(image, text, internalTime, removeCallback)
-	table.insert(Sonner.PendingQueue, {
+	local Pending = Sonner.PendingQueue
+	local Queued = Sonner.PendingTail - Sonner.PendingHead + 1
+
+	if Queued >= Sonner.MaxPendingToasts then
+		-- Backlog is full: drop the request rather than growing forever.
+		return
+	end
+
+	Sonner.PendingTail += 1
+	Pending[Sonner.PendingTail] = {
 		image = image,
 		text = text,
 		internalTime = internalTime,
 		removeCallback = removeCallback,
-	})
+	}
 
 	task.spawn(ProcessQueue)
 end
@@ -20974,22 +21461,16 @@ function Sonner.promise(func, options)
 
 	toast("loader-circle", loadingText, internalTime, function(notif, time)
 		local success, resultOrError = nil, nil
+		local icon = notif:FindFirstChild("ImageLabel")
 
-		local spinnerThread = task.spawn(function()
-			repeat
-				wax.shared.RunService.RenderStepped:Wait()
-
-				local icon = notif:FindFirstChild("ImageLabel")
-				if not icon then
-					continue
-				end
-				icon.Rotation = (icon.Rotation + 1) % 360
-			until success == false or resultOrError ~= nil
-		end)
+		-- One shared spinner driver for every pending promise (see SpinningIcons).
+		StartSpinner(icon)
 
 		success, resultOrError = pcall(func, function(text)
 			notif.Frame.TextLabel.Text = text
 		end)
+
+		StopSpinner(icon)
 
 		task.spawn(function()
 			setthreadidentity(8)
@@ -20998,16 +21479,12 @@ function Sonner.promise(func, options)
 			
 
 			Animations.FadeOut(notif.ImageLabel, 0.15)
-			wax.shared.TweenService
-				:Create(notif.ImageLabel, TweenInfo.new(0.25, Enum.EasingStyle.Exponential), {
-					Size = UDim2.new(0, 0, 0, 0),
-				})
-				:Play()
+			Animations.Play(notif.ImageLabel, {
+				Size = UDim2.new(0, 0, 0, 0),
+			}, TweenInfo.new(0.25, Enum.EasingStyle.Exponential))
 			task.wait(0.15)
 
-			if coroutine.status(spinnerThread) ~= "dead" then
-				coroutine.close(spinnerThread)
-			end
+			StopSpinner(icon)
 			notif.ImageLabel.Rotation = 0
 
 			if success then
@@ -21033,11 +21510,9 @@ function Sonner.promise(func, options)
 			end
 
 			Animations.FadeIn(notif.ImageLabel)
-			wax.shared.TweenService
-				:Create(notif.ImageLabel, TweenInfo.new(0.25, Enum.EasingStyle.Exponential), {
-					Size = UDim2.new(0, 20, 0, 20),
-				})
-				:Play()
+			Animations.Play(notif.ImageLabel, {
+				Size = UDim2.new(0, 20, 0, 20),
+			}, TweenInfo.new(0.25, Enum.EasingStyle.Exponential))
 
 			task.delay(time, function()
 				if not table.find(Sonner.Queue, notif) then
@@ -21046,11 +21521,9 @@ function Sonner.promise(func, options)
 				table.remove(Sonner.Queue, table.find(Sonner.Queue, notif))
 
 				Animations.FadeOut(notif, 0.35)
-				wax.shared.TweenService
-					:Create(notif, Sonner.TweenInfo, {
-						Position = GetHiddenPosition(notif),
-					})
-					:Play()
+				Animations.Play(notif, {
+					Position = GetHiddenPosition(notif),
+				}, Sonner.TweenInfo)
 
 				task.wait(0.5)
 				notif:Destroy()
@@ -21079,6 +21552,7 @@ local Interface = require("@src/Utils/UI/Interface")
 local Constants = require("@src/Window/Constants")
 local Drag = require("@src/Window/Utils/Input/Drag")
 local ModalController = require("@src/Window/Components/Modal")
+local Animations = require("@src/Window/Utils/Animations")
 
 
 return function(props: {
@@ -21166,21 +21640,17 @@ return function(props: {
 			Parent = Button,
 		})
 
-		Button.MouseEnter:Connect(function()
-			wax.shared.TweenService
-				:Create(Image, Constants.DefaultTweenInfo, {
-					ImageTransparency = 0.25,
-				})
-				:Play()
-		end)
+		Animations.BindHover(Button, {
+			ImageTransparency = 0.5,
+		}, {
+			ImageTransparency = 0.25,
+		}, Constants.DefaultTweenInfo)
 
-		Button.MouseLeave:Connect(function()
-			wax.shared.TweenService
-				:Create(Image, Constants.DefaultTweenInfo, {
-					ImageTransparency = 0.5,
-				})
-				:Play()
-		end)
+		Animations.BindPress(Button, {
+			Press = { ImageTransparency = 0 },
+			Release = { ImageTransparency = 0.5 },
+			TweenInfo = Constants.DefaultTweenInfo,
+		})
 
 		if Callback then
 			Button.MouseButton1Click:Connect(Callback)
@@ -21248,8 +21718,33 @@ return function(props: {
 		Type = "Button",
 		Icon = "minus",
 		Callback = function()
-			MainFrame.Visible = false
-			ShowButton.Visible = true
+			local Duration = 0.14
+
+			if not Animations.IsEnabled() then
+				MainFrame.Visible = false
+				ShowButton.Visible = true
+				return
+			end
+
+			-- Collapse into the launcher button instead of vanishing.
+			Animations.Pop(MainFrame, {
+				From = 1,
+				To = 0.96,
+				Duration = Duration,
+				TweenInfo = TweenInfo.new(Duration, Enum.EasingStyle.Quad, Enum.EasingDirection.In),
+			})
+
+			task.delay(Duration, function()
+				MainFrame.Visible = false
+				ShowButton.Visible = true
+
+				Animations.Pop(ShowButton, {
+					From = 0.85,
+					To = 1,
+					Duration = 0.18,
+				})
+				Animations.FadeInPlace(ShowButton, { Duration = 0.18, MaxObjects = 4 })
+			end)
 		end,
 	})
 	table.insert(TopButtonData, {
@@ -21495,14 +21990,112 @@ local ArgumentList = {}
 
 local DefaultPreviewMaxLength = 500
 
-type HolderOptions = {
-	IsBlockedCall: boolean?,
-	IsError: boolean?,
-	IsPreview: boolean?,
-	Label: string?,
-	MaxPreviewLength: number?,
-	PreviewCache: { [number]: string }?,
-}
+-- How much work (in seconds of real work, not idle frames) one slice of
+-- argument rendering may do before handing the frame back.
+local PopulateSliceSeconds = 0.004
+
+--[[
+	Argument holders are built out of five instances each, and a single page of
+	logs can be hundreds of holders.  Destroying and rebuilding them every time
+	a row is recycled was the single biggest source of UI churn while the spy
+	runs, so holders are pooled instead: releasing reparents them out of view and
+	acquiring re-fills every property that varies.
+
+	The pool is bounded, so a long session can never turn the pool itself into a
+	memory problem.
+]]
+local HolderPool = {}
+local MaxPooledHolders = 512
+local PooledHolderCount = 0
+
+local function ResetHolder(Holder, IsBlockedCall: boolean?)
+	Holder.BackgroundColor3 = if IsBlockedCall then Color3.fromRGB(58, 24, 24) else Color3.fromRGB(25, 25, 25)
+	Holder.Size = UDim2.new(1, 0, 0, 27)
+end
+
+-- Instances cannot carry custom fields, so each holder's three labels are
+-- looked up through a weak side table instead.
+local HolderLabels = setmetatable({}, { __mode = "k" })
+
+local function BuildHolder()
+	local Holder = Interface.New("Frame", {
+		Size = UDim2.new(1, 0, 0, 27),
+
+		["UICorner"] = {
+			CornerRadius = UDim.new(0, 4),
+		},
+
+		["UIPadding"] = {
+			PaddingLeft = UDim.new(0, 6),
+			PaddingRight = UDim.new(0, 6),
+			PaddingTop = UDim.new(0, 6),
+			PaddingBottom = UDim.new(0, 6),
+		},
+	})
+
+	local IndexLabel = Interface.New("TextLabel", {
+		Size = UDim2.fromScale(1, 1),
+		TextSize = 15,
+		TextTransparency = 0.5,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextYAlignment = Enum.TextYAlignment.Top,
+
+		Parent = Holder,
+	})
+
+	local TypeLabel = Interface.New("TextLabel", {
+		Size = UDim2.fromScale(1, 1),
+		TextSize = 15,
+		TextTransparency = 0.5,
+		TextXAlignment = Enum.TextXAlignment.Right,
+		TextYAlignment = Enum.TextYAlignment.Top,
+
+		Parent = Holder,
+	})
+
+	local TextLabel = Interface.New("TextLabel", {
+		TextSize = 15,
+		TextXAlignment = Enum.TextXAlignment.Left,
+
+		Parent = Holder,
+	})
+
+	HolderLabels[Holder] = {
+		Index = IndexLabel,
+		Type = TypeLabel,
+		Text = TextLabel,
+	}
+
+	return Holder
+end
+
+local function AcquireHolder(): GuiObject
+	local Pooled = table.remove(HolderPool)
+
+	if Pooled then
+		PooledHolderCount -= 1
+		return Pooled
+	end
+
+	return BuildHolder()
+end
+
+--[[
+	Puts a holder back in the pool (or destroys it when the pool is full).
+	The holder is parented to nil first, so it can never flash in the interface
+	while it waits to be reused.
+]]
+function ArgumentList.ReleaseHolder(Holder: GuiObject)
+	Holder.Parent = nil
+
+	if PooledHolderCount >= MaxPooledHolders then
+		Holder:Destroy()
+		return
+	end
+
+	PooledHolderCount += 1
+	HolderPool[PooledHolderCount] = Holder
+end
 
 local function TruncatePreviewText(Text: string, MaxLength: number): string
 	local NormalizedText = Text:gsub("[\r\n\t]", " ")
@@ -21523,11 +22116,30 @@ function ArgumentList.CreatePreviewText(Value: any, MaxLength: number?): string
 	return TruncatePreviewText(tostring(LazySerializer.QuickSerializeArgument(Value)), MaxLength)
 end
 
+--[[
+	Empties a frame holding argument holders.
+
+	The holders themselves are recycled rather than destroyed; to the caller the
+	frame ends up just as empty as before.
+]]
 function ArgumentList.Clear(Frame: GuiObject)
-	for _, Object in Frame:QueryDescendants("Frame") do
-		Object:Destroy()
+	for _, Object in Frame:GetChildren() do
+		if not Object:IsA("Frame") then
+			continue
+		end
+
+		ArgumentList.ReleaseHolder(Object)
 	end
 end
+
+type HolderOptions = {
+	IsBlockedCall: boolean?,
+	IsError: boolean?,
+	IsPreview: boolean?,
+	Label: string?,
+	MaxPreviewLength: number?,
+	PreviewCache: { [number]: string }?,
+}
 
 function ArgumentList.CreateHolder(Index: number, Value: any, Parent: GuiObject, Options: HolderOptions | boolean?)
 	if typeof(Options) ~= "table" then
@@ -21542,52 +22154,26 @@ function ArgumentList.CreateHolder(Index: number, Value: any, Parent: GuiObject,
 	local PreviewCache = Options.PreviewCache
 	local IsPreview = Options.IsPreview == true
 
-	
-	local Holder = Interface.New("Frame", {
-		BackgroundColor3 = if IsBlockedCall
-			then Color3.fromRGB(58, 24, 24)
-			else Color3.fromRGB(25, 25, 25),
-		LayoutOrder = Index,
-		Size = UDim2.new(1, 0, 0, 27),
+	local Holder = AcquireHolder()
+	ResetHolder(Holder, IsBlockedCall)
 
-		["UICorner"] = {
-			CornerRadius = UDim.new(0, 4),
-		},
+	Holder.LayoutOrder = Index
+	Holder.Parent = Parent
 
-		["UIPadding"] = {
-			PaddingLeft = UDim.new(0, 6),
-			PaddingRight = UDim.new(0, 6),
-			PaddingTop = UDim.new(0, 6),
-			PaddingBottom = UDim.new(0, 6),
-		},
+	local Labels = HolderLabels[Holder]
+	local IndexLabel = Labels.Index
+	local TypeLabel = Labels.Type
+	local TextLabel = Labels.Text
 
-		Parent = Parent,
-	})
+	local TextColor = if IsBlockedCall or IsError then Color3.fromRGB(255, 190, 190) else Color3.new(1, 1, 1)
 
-	local IndexLabel = Interface.New("TextLabel", {
-		Size = UDim2.fromScale(1, 1),
-		Text = Options.Label or Index,
-		TextColor3 = if IsBlockedCall or IsError then Color3.fromRGB(255, 190, 190) else Color3.new(1, 1, 1),
-		TextSize = 15,
-		TextTransparency = 0.5,
-		TextXAlignment = Enum.TextXAlignment.Left,
-		TextYAlignment = Enum.TextYAlignment.Top,
+	IndexLabel.Text = Options.Label or Index
+	IndexLabel.TextColor3 = TextColor
 
-		Parent = Holder,
-	})
+	TypeLabel.Text = typeof(Value)
+	TypeLabel.TextColor3 = TextColor
+
 	local IndexX = TextBounds.GetCachedWidth(IndexLabel.Text, IndexLabel.FontFace, IndexLabel.TextSize)
-
-	local TypeLabel = Interface.New("TextLabel", {
-		Size = UDim2.fromScale(1, 1),
-		Text = typeof(Value),
-		TextColor3 = if IsBlockedCall or IsError then Color3.fromRGB(255, 190, 190) else Color3.new(1, 1, 1),
-		TextSize = 15,
-		TextTransparency = 0.5,
-		TextXAlignment = Enum.TextXAlignment.Right,
-		TextYAlignment = Enum.TextYAlignment.Top,
-
-		Parent = Holder,
-	})
 	local TypeX = TextBounds.GetCachedWidth(TypeLabel.Text, TypeLabel.FontFace, TypeLabel.TextSize)
 
 	local Text
@@ -21605,23 +22191,21 @@ function ArgumentList.CreateHolder(Index: number, Value: any, Parent: GuiObject,
 		Text = tostring(LazySerializer.QuickSerializeArgument(Value)):gsub("<", "&lt;"):gsub(">", "&gt;")
 	end
 
-	local TextLabel = Interface.New("TextLabel", {
-		Position = UDim2.fromOffset(IndexX + 6, 0),
-		Size = UDim2.new(1, -(IndexX + TypeX + 10), 1, 0),
-		TextColor3 = if IsBlockedCall or IsError
-			then Color3.fromRGB(255, 190, 190)
-			else Color3.fromHex(SyntaxHighlighter.GetArgumentColor(Value)),
-		Text = Text,
-		RichText = not IsPreview,
-		TextSize = 15,
-		TextTruncate = if IsPreview then Enum.TextTruncate.AtEnd else Enum.TextTruncate.None,
-		TextWrapped = not IsPreview,
-		TextXAlignment = Enum.TextXAlignment.Left,
+	TextLabel.Position = UDim2.fromOffset(IndexX + 6, 0)
+	TextLabel.Size = UDim2.new(1, -(IndexX + TypeX + 10), 1, 0)
+	TextLabel.TextColor3 = if IsBlockedCall or IsError
+		then Color3.fromRGB(255, 190, 190)
+		else Color3.fromHex(SyntaxHighlighter.GetArgumentColor(Value))
+	TextLabel.Text = Text
+	TextLabel.RichText = not IsPreview
+	TextLabel.TextTruncate = if IsPreview then Enum.TextTruncate.AtEnd else Enum.TextTruncate.None
+	TextLabel.TextWrapped = not IsPreview
 
-		Parent = Holder,
-	})
-
-	if not IsPreview then
+	if IsPreview then
+		-- Preview holders keep the fixed row height; a recycled holder may have
+		-- been stretched by the full-size view before.
+		Holder.Size = UDim2.new(1, 0, 0, 27)
+	else
 		local _, TextY = TextBounds.Get(TextLabel.Text, TextLabel.FontFace, TextLabel.TextSize, TextLabel.AbsoluteSize.X)
 		Holder.Size = UDim2.new(1, 0, 0, TextY + 12)
 	end
@@ -21629,18 +22213,26 @@ function ArgumentList.CreateHolder(Index: number, Value: any, Parent: GuiObject,
 	return Holder
 end
 
-function ArgumentList.Populate(Frame: GuiObject, Values: { [any]: any }?)
+function ArgumentList.Populate(Frame: GuiObject, Values: { [any]: any }?): number
 	if not Values then
-		return
+		return 0
 	end
 
-	for Index = 1, wax.shared.GetTableLength(Values) do
-		if Index % 25 == 0 then
+	local Count = wax.shared.GetTableLength(Values)
+	local SliceStart = os.clock()
+
+	for Index = 1, Count do
+		-- Yield only once a frame's worth of work has been done; short argument
+		-- lists (the common case) then render without costing any frames.
+		if os.clock() - SliceStart >= PopulateSliceSeconds then
 			task.wait()
+			SliceStart = os.clock()
 		end
 
 		ArgumentList.CreateHolder(Index, Values[Index], Frame)
 	end
+
+	return Count
 end
 
 return ArgumentList
@@ -23256,8 +23848,26 @@ return function(props: {
 		table.insert(SearchFilterButtons, ClassNameFilterButton)
 	end
 
+	--[[
+		One Text change fires per keystroke, and each used to re-scan every
+		captured remote in both directions.  Typing is now coalesced into a
+		single refresh shortly after the user pauses; every other caller
+		(opening the search, filter buttons) still updates immediately.
+	]]
+	local SearchUpdateToken = 0
+	local SearchTypingDebounce = 0.1
+
 	SearchBox:GetPropertyChangedSignal("Text"):Connect(function()
-		Search:Update()
+		SearchUpdateToken += 1
+		local Token = SearchUpdateToken
+
+		task.delay(SearchTypingDebounce, function()
+			if Token ~= SearchUpdateToken then
+				return
+			end
+
+			Search:Update()
+		end)
 	end)
 
 	wax.shared.Connect(wax.shared.UserInputService.InputBegan:Connect(function(Input: InputObject)
@@ -23299,6 +23909,7 @@ local SettingsBuilder = require("@src/Window/Components/Modal/Builder/Settings")
 
 local Resize = require("@src/Window/Utils/Input/Resize")
 local DPI = require("@src/Window/Utils/DPI")
+local Animations = require("@src/Window/Utils/Animations")
 
 
 local AnticheatData = require("@src/Utils/Anticheats/Main")
@@ -23478,6 +24089,14 @@ return function(props: {
 			Refresh = LogsPage.RefreshCurrentLog,
 		})
 
+		Settings.AnimationsEnabled:SetupOption(GeneralSection, {
+			Callback = function(Value)
+				-- Keep the animation layer in sync immediately (it reads the
+				-- setting live, this just makes the change instant).
+				Animations.SetEnabled(Value)
+			end,
+		})
+
 		Settings.ExecuteOnTeleport:SetupOption(GeneralSection)
 
 		GeneralSection:AddSpacer()
@@ -23504,6 +24123,7 @@ return function(props: {
 		Settings.LogRobloxInternalEvents:SetupOption(CaptureSection)
 		Settings.LogActors:SetupOption(CaptureSection)
 		Settings.LogBlockedRemotes:SetupOption(CaptureSection)
+		Settings.MaxCallsPerRemote:SetupOption(CaptureSection)
 	end
 
 	
@@ -24003,11 +24623,71 @@ export type LogDirectionTab = {
 return {}
     end)(...) end,
     [165] = function(...) local wax,script,require=ImportGlobals(165) local ImportGlobals return (function(...)
+--[[
+	Animations
+
+	Shared animation layer for the whole interface.
+
+	Everything here is intentionally cheap: tweens are created through a single
+	de-duplicating entry point (`Animations.Play`) so hovering the same button
+	500 times a second never stacks 500 tweens, and every helper degrades to
+	"set the final value instantly" when animations are disabled in Settings
+	(Appearance -> Interface Animations) or when there is nothing to animate.
+
+	The original public API (TweenInfo, FadeIn, FadeOut, AddFadeExclusion,
+	AddFadeExclusions, SetFadeExpectation, Exclusions, Expectations) is
+	unchanged - existing callers keep working exactly as before.
+]]
+
 local Animations = {
 	TweenInfo = TweenInfo.new(0.25, Enum.EasingStyle.Exponential),
+	FastTweenInfo = TweenInfo.new(0.14, Enum.EasingStyle.Quad),
+	MediumTweenInfo = TweenInfo.new(0.2, Enum.EasingStyle.Exponential),
+	SlowTweenInfo = TweenInfo.new(0.35, Enum.EasingStyle.Exponential),
+
+	-- How many objects a single group fade may touch.  Big groups (a full log
+	-- page, a large modal) are clamped so a fade can never turn into hundreds of
+	-- simultaneous tweens on a phone.
+	MaxGroupFadeObjects = 64,
+
 	Exclusions = {},
 	Expectations = { In = {}, Out = {} },
 }
+
+-- object -> { [propertyName] = Tween }
+local ActiveTweens = setmetatable({}, { __mode = "k" })
+-- object -> UIScale used by Animations.Scale / Animations.Pop
+local ScaleObjects = setmetatable({}, { __mode = "k" })
+-- object -> { In = properties, Out = properties } (avoids rebuilding tables)
+local PropertyTableCache = setmetatable({}, { __mode = "k" })
+-- settings that need a SaveManager read before the Settings UI exists
+local SettingFallbackCache = {}
+
+local function GetBooleanSetting(Key: string, Default: boolean): boolean
+	local Controls = wax.shared.Settings
+	local Control = Controls and Controls[Key]
+	if Control then
+		local Value = Control.Value
+		if Value ~= nil then
+			SettingFallbackCache[Key] = Value
+			return Value
+		end
+	end
+
+	local Cached = SettingFallbackCache[Key]
+	if Cached ~= nil then
+		return Cached
+	end
+
+	local SaveManager = wax.shared.SaveManager
+	local Success, Value = pcall(function()
+		return SaveManager:GetState(Key, Default)
+	end)
+
+	Cached = if Success and Value ~= nil then Value else Default
+	SettingFallbackCache[Key] = Cached
+	return Cached
+end
 
 local function GetTransparencyProperty(object)
 	if table.find(Animations.Exclusions, object) then
@@ -24036,58 +24716,454 @@ local function BuildPropertyTable(properties, type, object)
 		return Animations.Expectations[type][object]
 	end
 
+	local Cached = PropertyTableCache[object]
+	local CachedForType = Cached and Cached[type]
+	if CachedForType and CachedForType.Properties == properties then
+		return CachedForType.Table
+	end
+
 	local propTable = {}
 	for _, prop in properties do
 		propTable[prop] = type == "In" and 0 or 1
 	end
+
+	if not Cached then
+		Cached = {}
+		PropertyTableCache[object] = Cached
+	end
+
+	Cached[type] = {
+		Properties = properties,
+		Table = propTable,
+	}
+
 	return propTable
 end
 
-function Animations.FadeOut(object, time)
-	local tweenInfo = time and TweenInfo.new(time, Enum.EasingStyle.Exponential) or Animations.TweenInfo
-	local properties = GetTransparencyProperty(object)
+-------------------------------------------------------------------------------
+-- Core tween helpers
+-------------------------------------------------------------------------------
 
+local function GetTrackedTweens(object)
+	local Tracked = ActiveTweens[object]
+	if not Tracked then
+		Tracked = {}
+		ActiveTweens[object] = Tracked
+	end
+
+	return Tracked
+end
+
+--[[
+	Cancels the tweens this module tracks for the given properties.
+]]
+local function CancelTracked(object, Properties)
+	local Tracked = ActiveTweens[object]
+	if not Tracked then
+		return
+	end
+
+	for Property in Properties do
+		local Existing = Tracked[Property]
+		if Existing then
+			pcall(Existing.Cancel, Existing)
+			Tracked[Property] = nil
+		end
+	end
+end
+
+--[[
+	Creates and plays a tween, cancelling any previous tween this module started
+	for the same properties on the same object.
+
+	Returns the Tween, or nil when nothing had to move (or animations are
+	disabled - the properties are then applied instantly, so the end state is
+	identical either way).
+
+	The hot paths matter here: this is called from hover/press handlers, so it
+	avoids allocating anything when a value is already where it should be.
+]]
+function Animations.Play(object, Properties, TweenInfo_): Tween?
+	if not object then
+		return nil
+	end
+
+	local Tracked = ActiveTweens[object]
+	local NeedsCancel = false
+	local HasWork = false
+
+	for Property, Value in Properties do
+		if not HasWork and object[Property] ~= Value then
+			HasWork = true
+		end
+
+		if Tracked and Tracked[Property] then
+			NeedsCancel = true
+		end
+	end
+
+	if not (HasWork and Animations.IsEnabled()) then
+		if NeedsCancel then
+			CancelTracked(object, Properties)
+		end
+
+		if HasWork then
+			for Property, Value in Properties do
+				object[Property] = Value
+			end
+		end
+
+		return nil
+	end
+
+	if NeedsCancel then
+		CancelTracked(object, Properties)
+	end
+
+	local Tween = wax.shared.TweenService:Create(object, TweenInfo_ or Animations.TweenInfo, Properties)
+	if not Tracked then
+		Tracked = GetTrackedTweens(object)
+	end
+
+	for Property in Properties do
+		Tracked[Property] = Tween
+	end
+
+	Tween:Play()
+	return Tween
+end
+
+--[[
+	Cancels every tween this module started on `object`.
+
+	`ResetScale` also snaps an animation-owned UIScale back to 1 - used when a
+	pooled element is recycled while a press/pop animation was still running.
+]]
+function Animations.Cancel(object, ResetScale: boolean?)
+	local Tracked = ActiveTweens[object]
+	if Tracked then
+		for Property, Tween in Tracked do
+			pcall(Tween.Cancel, Tween)
+			Tracked[Property] = nil
+		end
+	end
+
+	if ResetScale then
+		local Scale = ScaleObjects[object]
+		if Scale and Scale.Parent == object then
+			Scale.Scale = 1
+		end
+	end
+end
+
+function Animations.IsEnabled(): boolean
+	return GetBooleanSetting("AnimationsEnabled", true) ~= false
+end
+
+function Animations.SetEnabled(Enabled: boolean)
+	SettingFallbackCache["AnimationsEnabled"] = Enabled == true
+end
+
+--[[
+	Returns (and caches) the UIScale owned by this module for `object`.
+
+	UIScale is only used on objects that are *not* laid out by a UIListLayout,
+	so scaling never triggers a reflow.
+]]
+local function GetScaleObject(object)
+	local Scale = ScaleObjects[object]
+	if Scale and Scale.Parent == object then
+		return Scale
+	end
+
+	Scale = object:FindFirstChild("CobaltAnimationScale")
+	if not Scale then
+		Scale = Instance.new("UIScale")
+		Scale.Name = "CobaltAnimationScale"
+		Scale.Parent = object
+	end
+
+	ScaleObjects[object] = Scale
+	return Scale
+end
+
+--[[
+	Pops an element into view (scale + optional fade).
+
+	Options: { From = 0.96, To = 1, Duration = 0.2, Delay = 0, Fade = false,
+	           TweenInfo = TweenInfo? }
+]]
+function Animations.Pop(object, Options)
+	if not object then
+		return
+	end
+
+	Options = Options or {}
+	local From = Options.From or 0.96
+	local To = Options.To or 1
+	local Duration = Options.Duration or 0.2
+	local TweenInfo_ = Options.TweenInfo or TweenInfo.new(Duration, Enum.EasingStyle.Exponential, Enum.EasingDirection.Out)
+	local Delay = Options.Delay or 0
+
+	local Scale = GetScaleObject(object)
+	Scale.Scale = From
+
+	local function Start()
+		Animations.Play(Scale, { Scale = To }, TweenInfo_)
+
+		if Options.Fade then
+			Animations.FadeInPlace(object, { Duration = Duration, SkipSelf = true })
+		end
+	end
+
+	if Delay > 0 and Animations.IsEnabled() then
+		task.delay(Delay, Start)
+	else
+		Start()
+	end
+end
+
+--[[
+	Convenience wrapper: animate a single property to a target value.
+]]
+function Animations.Tween(object, TweenInfo_, Properties)
+	return Animations.Play(object, Properties, TweenInfo_)
+end
+
+--[[
+	Binds enter/leave feedback (hover on desktop, highlight on touch layouts)
+	with de-duplication, so repeated enters never pile tweens up.
+]]
+function Animations.BindHover(object, IdleProperties, HoverProperties, TweenInfo_)
+	if not object then
+		return
+	end
+
+	object.MouseEnter:Connect(function()
+		Animations.Play(object, HoverProperties, TweenInfo_ or Animations.MediumTweenInfo)
+	end)
+
+	object.MouseLeave:Connect(function()
+		Animations.Play(object, IdleProperties, TweenInfo_ or Animations.MediumTweenInfo)
+	end)
+end
+
+--[[
+	Binds press feedback.  `PressProperties` are applied while held, then the
+	element returns to whatever `ReleaseProperties` describes.
+
+	Options: { Press = table?, Release = table?, TweenInfo = TweenInfo? }
+]]
+function Animations.BindPress(object, Options)
+	if not object then
+		return
+	end
+
+	Options = Options or {}
+	local Press = Options.Press
+	if not Press then
+		return
+	end
+
+	local Release = Options.Release
+	local Original = nil
+
+	local function IsPressInput(Input: InputObject): boolean
+		return (
+			Input.UserInputType == Enum.UserInputType.MouseButton1
+			or Input.UserInputType == Enum.UserInputType.Touch
+		)
+	end
+
+	object.InputBegan:Connect(function(Input: InputObject)
+		if Input.UserInputState ~= Enum.UserInputState.Begin or not IsPressInput(Input) then
+			return
+		end
+
+		if not Original then
+			Original = {}
+			for Property in Press do
+				Original[Property] = object[Property]
+			end
+		end
+
+		Animations.Play(object, Press, Options.TweenInfo or Animations.FastTweenInfo)
+	end)
+
+	object.InputEnded:Connect(function(Input: InputObject)
+		if not IsPressInput(Input) then
+			return
+		end
+
+		if Input.UserInputState ~= Enum.UserInputState.End and Input.UserInputState ~= Enum.UserInputState.Cancel then
+			return
+		end
+
+		if Release then
+			Animations.Play(object, Release, Options.TweenInfo or Animations.MediumTweenInfo)
+		elseif Original then
+			Animations.Play(object, Original, Options.TweenInfo or Animations.MediumTweenInfo)
+		end
+	end)
+end
+
+-------------------------------------------------------------------------------
+-- Fades
+-------------------------------------------------------------------------------
+
+local function PlayFade(object, tweenInfo, type)
+	local properties = GetTransparencyProperty(object)
 	if not properties then
 		return
 	end
 
-	wax.shared.TweenService:Create(object, tweenInfo, BuildPropertyTable(properties, "Out", object)):Play()
+	Animations.Play(object, BuildPropertyTable(properties, type, object), tweenInfo)
+end
+
+function Animations.FadeOut(object, time)
+	local tweenInfo = time and TweenInfo.new(time, Enum.EasingStyle.Exponential) or Animations.TweenInfo
+	PlayFade(object, tweenInfo, "Out")
 
 	if object:IsA("CanvasGroup") then
 		return
 	end
 
 	for _, child in object:GetDescendants() do
-		local prop = GetTransparencyProperty(child)
-		if not prop then
-			continue
-		end
-
-		wax.shared.TweenService:Create(child, tweenInfo, BuildPropertyTable(prop, "Out", child)):Play()
+		PlayFade(child, tweenInfo, "Out")
 	end
 end
 
 function Animations.FadeIn(object, time)
 	local tweenInfo = time and TweenInfo.new(time, Enum.EasingStyle.Exponential) or Animations.TweenInfo
-	local property = GetTransparencyProperty(object)
-
-	if property then
-		wax.shared.TweenService:Create(object, tweenInfo, BuildPropertyTable(property, "In", object)):Play()
-	end
+	PlayFade(object, tweenInfo, "In")
 
 	if object:IsA("CanvasGroup") then
 		return
 	end
 
 	for _, child in object:GetDescendants() do
-		local prop = GetTransparencyProperty(child)
-		if not prop then
-			continue
-		end
-
-		wax.shared.TweenService:Create(child, tweenInfo, BuildPropertyTable(prop, "In", child)):Play()
+		PlayFade(child, tweenInfo, "In")
 	end
 end
+
+--[[
+	Fades a group of elements in *from where they already are*.
+
+	Unlike FadeIn (which forces every transparency to 0), this captures each
+	element's current transparency as the target, hides the group and tween it
+	back.  Elements that are intentionally semi-transparent (dimmed labels,
+	invisible strokes) therefore keep their exact final look.
+
+	Options: { Duration = 0.18, Delay = 0, MaxObjects = Animations.MaxGroupFadeObjects,
+	           SkipSelf = false, Hidden = 1 }
+]]
+function Animations.FadeInPlace(object, Options)
+	if not object then
+		return
+	end
+
+	Options = Options or {}
+	local Duration = Options.Duration or 0.18
+	local Delay = Options.Delay or 0
+	local Hidden = Options.Hidden or 1
+	local MaxObjects = Options.MaxObjects or Animations.MaxGroupFadeObjects
+
+	if not Animations.IsEnabled() then
+		return
+	end
+
+	local Targets = {}
+	local Count = 0
+
+	local function Collect(Target)
+		if Count >= MaxObjects then
+			return
+		end
+
+		local Properties = GetTransparencyProperty(Target)
+		if not Properties then
+			return
+		end
+
+		Targets[Count + 1] = {
+			Target = Target,
+			Properties = Properties,
+		}
+		Count += 1
+	end
+
+	if not Options.SkipSelf then
+		Collect(object)
+	end
+
+	if not object:IsA("CanvasGroup") then
+		for _, child in object:GetDescendants() do
+			if Count >= MaxObjects then
+				break
+			end
+
+			Collect(child)
+		end
+	end
+
+	if Count == 0 then
+		return
+	end
+
+	-- Capture the real targets, then hide.  Anything already invisible is left
+	-- alone so we never spawn a tween that cannot be seen.
+	local Active = {}
+	local ActiveCount = 0
+	for _, Entry in Targets do
+		local Target = Entry.Target
+		local WasHidden = true
+		local To = {}
+
+		for _, Property in Entry.Properties do
+			local Current = Target[Property]
+			To[Property] = Current
+
+			if Current < Hidden then
+				WasHidden = false
+			end
+
+			Target[Property] = Hidden
+		end
+
+		if not WasHidden then
+			ActiveCount += 1
+			Active[ActiveCount] = {
+				Target = Target,
+				To = To,
+			}
+		end
+	end
+
+	if ActiveCount == 0 then
+		return
+	end
+
+	local TweenInfo_ = TweenInfo.new(Duration, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+	local function Reveal()
+		for _, Entry in Active do
+			if Entry.Target.Parent == nil and Entry.Target ~= object then
+				continue
+			end
+
+			Animations.Play(Entry.Target, Entry.To, TweenInfo_)
+		end
+	end
+
+	if Delay > 0 then
+		task.delay(Delay, Reveal)
+	else
+		Reveal()
+	end
+end
+
+-------------------------------------------------------------------------------
+-- Fade exclusions / expectations
+-------------------------------------------------------------------------------
 
 function Animations.AddFadeExclusion(object)
 	local prop = GetTransparencyProperty(object)
@@ -24115,6 +25191,18 @@ function Animations.SetFadeExpectation(type: "In" | "Out", object: GuiBase2d, pr
 	end
 
 	Animations.Expectations[type][object] = properties
+
+	local Cached = PropertyTableCache[object]
+	if Cached then
+		Cached[type] = nil
+	end
+end
+
+function Animations.RemoveFadeExclusion(object)
+	local Index = table.find(Animations.Exclusions, object)
+	if Index then
+		table.remove(Animations.Exclusions, Index)
+	end
 end
 
 return Animations
@@ -25154,6 +26242,24 @@ return function(props: {
 	LogsPage.LogList = LogList
 	LogsPage.LogCalls = LogCalls
 
+	--[[
+		DebugIds are stable for the lifetime of an Instance, but re-deriving one
+		on the GUI thread is not free, so the last result is remembered per
+		Instance.  Weak keys: the cache never keeps an instance alive.
+	]]
+	local DebugIdCache = setmetatable({}, { __mode = "k" })
+
+	local function GetCachedDebugId(Instance)
+		local Cached = DebugIdCache[Instance]
+		if Cached ~= nil then
+			return Cached
+		end
+
+		local DebugId = wax.shared.GetDebugId(Instance)
+		DebugIdCache[Instance] = DebugId
+		return DebugId
+	end
+
 	wax.shared.Connect(wax.shared.Communicator.Event:Connect(function(Batch)
 		if typeof(Batch) ~= "table" then
 			return
@@ -25161,6 +26267,13 @@ return function(props: {
 
 		local CurrentTab = LogList.CurrentTab
 		if not CurrentTab then
+			return
+		end
+
+		-- Hoisted out of the loop: wax.shared is a proxy table, and every
+		-- notification used to walk it three times.
+		local Logs = wax.shared.Logs
+		if not Logs then
 			return
 		end
 
@@ -25174,17 +26287,19 @@ return function(props: {
 			local CallIndex = Notification.CallIndex
 			local LogIndex = Notification.LogIndex
 
-			local InstanceDebugId = wax.shared.GetDebugId(Instance)
+			-- The producer's log is carried by the notification; the
+			-- instance-based lookup stays as the fallback path.
+			local Log = Notification.Log
+			if not Log then
+				local LogsByType = Logs[Type]
 
-			
-			
-			
-			local Log = wax.shared.Logs[Type][InstanceDebugId]
-			if not Log and LogIndex ~= nil then
-				for _, Candidate in wax.shared.Logs[Type] do
-					if Candidate.Index == LogIndex then
-						Log = Candidate
-						break
+				Log = LogsByType and LogsByType[GetCachedDebugId(Instance)]
+				if not Log and LogIndex ~= nil and LogsByType then
+					for _, Candidate in LogsByType do
+						if Candidate.Index == LogIndex then
+							Log = Candidate
+							break
+						end
 					end
 				end
 			end
@@ -25195,7 +26310,7 @@ return function(props: {
 
 			LogList:EnsureLogButton(Log)
 			LogList:QueueLogButtonUpdate(Log)
-			LogCalls:HandleCallAdded(Log, CallIndex)
+			LogCalls:HandleCallAdded(Log, CallIndex, Notification.Call)
 		end
 	end))
 
@@ -25211,9 +26326,19 @@ local ArgumentList = require("@src/Window/Modals/Info/Components/ArgumentList")
 local CodeGen = require("@src/Utils/CodeGen/Generator")
 local InstanceSerializer = require("@src/Utils/CodeGen/Serializer/Instance")
 local Ratelimiter = require("@src/Utils/Ratelimiter")
+local Animations = require("@src/Window/Utils/Animations")
 
 local MaxArgumentPreviewLength = 500
 local PreviewCacheByCallInfo = setmetatable({}, { __mode = "k" })
+
+-- Row entrance motion.  Staggered so a freshly rendered page flows in instead of
+-- popping, but capped so the last row never waits more than a fifth of a second.
+local RowFadeDuration = 0.16
+local RowStaggerStep = 0.018
+local RowStaggerMax = 0.18
+
+-- How much work one call frame may do before yielding the frame back.
+local ArgumentBuildSliceSeconds = 0.004
 
 
 return function(props: {
@@ -25521,6 +26646,9 @@ return function(props: {
 	end
 
 	function Calls:ReleaseCallFrame(CallFrame)
+		-- A row can be recycled while its entrance fade is still running; drop
+		-- the animation state so the pooled frame is never reused invisible.
+		Animations.Cancel(CallFrame, true)
 		CallFrame.Parent = nil
 		table.insert(self.CallFramePool, CallFrame)
 	end
@@ -25528,7 +26656,16 @@ return function(props: {
 	function Calls:AcquireCallFrame()
 		local CallFrame = table.remove(self.CallFramePool)
 		if CallFrame then
+			local Data = self.CallFrameData[CallFrame]
+			local ArgumentsFrame = Data and Data.ArgumentsFrame
+			if ArgumentsFrame then
+				Data.ArgumentsFrame = nil
+				ArgumentList.Clear(ArgumentsFrame)
+			end
+
 			ClearCallFrameContent(CallFrame)
+			CallFrame.BackgroundTransparency = 0
+			Animations.Cancel(CallFrame, true)
 			return CallFrame
 		end
 
@@ -25569,11 +26706,9 @@ return function(props: {
 				return
 			end
 
-			wax.shared.TweenService
-				:Create(Data.HighlightStroke, Constants.DefaultTweenInfo, {
-					Transparency = 0,
-				})
-				:Play()
+			Animations.Play(Data.HighlightStroke, {
+				Transparency = 0,
+			}, Constants.DefaultTweenInfo)
 		end)
 
 		CallFrame.MouseLeave:Connect(function()
@@ -25582,11 +26717,51 @@ return function(props: {
 				return
 			end
 
-			wax.shared.TweenService
-				:Create(Data.HighlightStroke, Constants.DefaultTweenInfo, {
-					Transparency = if Data.IsBlockedCall then 0.5 elseif Data.IsHighlightedCall then 0.35 else 1,
-				})
-				:Play()
+			Animations.Play(Data.HighlightStroke, {
+				Transparency = if Data.IsBlockedCall then 0.5 elseif Data.IsHighlightedCall then 0.35 else 1,
+			}, Constants.DefaultTweenInfo)
+		end)
+
+		-- Touch devices rarely hover, so pressing a row highlights it too.
+		CallFrame.InputBegan:Connect(function(Input: InputObject)
+			if
+				Input.UserInputState ~= Enum.UserInputState.Begin
+				or (
+					Input.UserInputType ~= Enum.UserInputType.MouseButton1
+					and Input.UserInputType ~= Enum.UserInputType.Touch
+				)
+			then
+				return
+			end
+
+			local Data = self.CallFrameData[CallFrame]
+			if not Data then
+				return
+			end
+
+			Data.WasPressed = true
+			Animations.Play(Data.HighlightStroke, {
+				Transparency = 0,
+			}, Constants.DefaultTweenInfo)
+		end)
+
+		CallFrame.InputEnded:Connect(function(Input: InputObject)
+			if
+				Input.UserInputType ~= Enum.UserInputType.MouseButton1
+				and Input.UserInputType ~= Enum.UserInputType.Touch
+			then
+				return
+			end
+
+			local Data = self.CallFrameData[CallFrame]
+			if not (Data and Data.WasPressed) then
+				return
+			end
+
+			Data.WasPressed = nil
+			Animations.Play(Data.HighlightStroke, {
+				Transparency = if Data.IsBlockedCall then 0.5 elseif Data.IsHighlightedCall then 0.35 else 1,
+			}, Constants.DefaultTweenInfo)
 		end)
 
 		local CallContextMenu = GetSharedCallContextMenu()
@@ -25687,6 +26862,10 @@ return function(props: {
 
 			Parent = CallFrame,
 		})
+		-- Keeping the container around lets the next render of this pooled row
+		-- hand its argument holders back to the pool instead of destroying and
+		-- rebuilding hundreds of instances.
+		Data.ArgumentsFrame = ArgumentsFrame
 		do
 			if HasError then
 				ArgumentList.CreateHolder(0, CallInfo.Error, ArgumentsFrame, {
@@ -25697,16 +26876,24 @@ return function(props: {
 				})
 			end
 
+			-- Rendering used to yield a whole frame every five arguments, which
+			-- turned a long argument list into seconds of stuttering.  The loop
+			-- now only yields once it has spent a frame's worth of work
+			-- (measured while it runs, so idle frames are never used up).
+			local SliceStart = os.clock()
+
 			for Index = 1, CallInfoValueCount do
 				if ReleaseIfStale() then
 					return
 				end
 
-				if Index % 5 == 0 then
+				if os.clock() - SliceStart >= ArgumentBuildSliceSeconds then
 					task.wait()
 					if ReleaseIfStale() then
 						return
 					end
+
+					SliceStart = os.clock()
 				end
 
 				ArgumentList.CreateHolder(Index, CallInfoValues[Index], ArgumentsFrame, {
@@ -25790,6 +26977,14 @@ return function(props: {
 		end
 
 		CallFrame.Parent = LogsList
+
+		if CallInfo.Animate then
+			Animations.FadeInPlace(CallFrame, {
+				Duration = RowFadeDuration,
+				Delay = math.min(CallInfo.EntranceDelay or 0, RowStaggerMax),
+			})
+		end
+
 		return CallFrame
 	end
 
@@ -25838,6 +27033,9 @@ return function(props: {
 				Order = VisibleIndex,
 				RenderGeneration = RenderGeneration,
 				PreviewCache = GetPreviewCache(Call),
+				Animate = true,
+				-- Rows flow in one after another instead of all at once.
+				EntranceDelay = (VisibleIndex - Start) * RowStaggerStep,
 			}, {
 				__index = Call,
 			})
@@ -26041,12 +27239,23 @@ return function(props: {
 			PaginationManager:SetPage(Page)
 		end
 
-		LogsList.CanvasPosition = Vector2.zero
+		-- Glide back to the top rather than snapping (still instant when the list
+		-- is already at the top, which is the common case).
+		if LogsList.CanvasPosition.Y ~= 0 then
+			Animations.Play(
+				LogsList,
+				{ CanvasPosition = Vector2.zero },
+				TweenInfo.new(0.16, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+			)
+		else
+			LogsList.CanvasPosition = Vector2.zero
+		end
+
 		self:ShowPagination(Log)
 		self:ShowCalls(Log, Page)
 	end
 
-	function Calls:HandleCallAdded(Log, CallIndex: number)
+	function Calls:HandleCallAdded(Log, CallIndex: number, CallRef)
 		if LogsPage.State.CurrentLog ~= Log then
 			return
 		end
@@ -26066,7 +27275,9 @@ return function(props: {
 			return
 		end
 
-		local Call = Log.Calls[CallIndex]
+		-- The notification carries the call itself (indices shift when a log
+		-- trims), with the index lookup kept as a fallback.
+		local Call = CallRef or Log.Calls[CallIndex]
 		if not Call then
 			return
 		end
@@ -26077,6 +27288,7 @@ return function(props: {
 			Order = VisibleIndex,
 			RenderGeneration = self.CurrentCallFrameRenderGeneration,
 			PreviewCache = GetPreviewCache(Call),
+			Animate = true,
 		}, {
 			__index = Call,
 		})
@@ -26091,6 +27303,7 @@ end
 local Interface = require("@src/Utils/UI/Interface")
 local Constants = require("@src/Window/Constants")
 local Types = require("@src/Window/Types")
+local Animations = require("@src/Window/Utils/Animations")
 
 
 return function(props: {
@@ -26108,19 +27321,15 @@ return function(props: {
 		end
 
 		if self.CurrentTab then
-			wax.shared.TweenService
-				:Create(self.CurrentTab.Instance, Constants.DefaultTweenInfo, {
-					BackgroundTransparency = 1,
-				})
-				:Play()
+			Animations.Play(self.CurrentTab.Instance, {
+				BackgroundTransparency = 1,
+			}, Constants.DefaultTweenInfo)
 		end
 
 		self.CurrentTab = Tab
-		wax.shared.TweenService
-			:Create(Tab.Instance, Constants.DefaultTweenInfo, {
-				BackgroundTransparency = 0,
-			})
-			:Play()
+		Animations.Play(Tab.Instance, {
+			BackgroundTransparency = 0,
+		}, Constants.DefaultTweenInfo)
 
 		props.OnSelected(Tab)
 	end
@@ -26150,6 +27359,14 @@ return function(props: {
 			self:Select(Tab)
 		end)
 
+		-- Text-only feedback: the background colour is owned by the active-tab
+		-- state above, so the two never fight over the same property.
+		Animations.BindPress(Button, {
+			Press = { TextTransparency = 0.45 },
+			Release = { TextTransparency = 0 },
+			TweenInfo = Constants.DefaultTweenInfo,
+		})
+
 		if Active then
 			self.CurrentTab = Tab
 		end
@@ -26167,6 +27384,7 @@ local Types = require("@src/Window/Types")
 
 local DirectionTabs = require(script.Parent.DirectionTabs)
 local Ratelimiter = require("@src/Utils/Ratelimiter")
+local Animations = require("@src/Window/Utils/Animations")
 
 
 return function(props: {
@@ -26412,16 +27630,44 @@ return function(props: {
 		Log.Button = nil
 	end
 
-	function List:RefreshLogButton(Log)
+	function List:RefreshLogButton(Log, Animate: boolean?)
 		if not (Log.Button and self.CurrentTab and self.CurrentTab.Name == Log.Type) then
 			return
 		end
 
-		Log.Button.Name.Text = Log.Instance.Name
-		Log.Button.Calls.Text = "x" .. #Log.Calls
-		UpdateLogNameSize(Log)
+		local AnimateAppearance = Animate ~= false
 
-		Log.Button.Instance.Parent = if #Log.Calls == 0 then nil else RemoteList
+		-- Writing Text always invalidates the label's text layout, so only touch
+		-- labels whose contents actually changed.
+		local InstanceName = Log.Instance.Name
+		if Log.Button.Name.Text ~= InstanceName then
+			Log.Button.Name.Text = InstanceName
+			UpdateLogNameSize(Log)
+		end
+
+		local CallCount = "x" .. #Log.Calls
+		if Log.Button.Calls.Text ~= CallCount then
+			Log.Button.Calls.Text = CallCount
+
+			-- Flash the counter so an increment is noticeable without a readable
+			-- number change going unnoticed.
+			Log.Button.Calls.TextTransparency = 0.45
+			Animations.Play(Log.Button.Calls, {
+				TextTransparency = 0,
+			}, Constants.DefaultTweenInfo)
+		end
+
+		local DesiredParent = if #Log.Calls == 0 then nil else RemoteList
+		if Log.Button.Instance.Parent ~= DesiredParent then
+			Log.Button.Instance.Parent = DesiredParent
+
+			if DesiredParent and AnimateAppearance then
+				Animations.FadeInPlace(Log.Button.Instance, {
+					Duration = 0.18,
+					MaxObjects = 8,
+				})
+			end
+		end
 	end
 
 	local function FlushLogButtonUpdates()
@@ -26467,7 +27713,9 @@ return function(props: {
 			end
 
 			self:EnsureLogButton(Log)
-			self:RefreshLogButton(Log)
+			-- A tab switch repopulates the whole list at once; animating every
+			-- row there would be dozens of simultaneous fades, so it is skipped.
+			self:RefreshLogButton(Log, false)
 		end
 	end
 
@@ -27847,156 +29095,156 @@ local ObjectTree = {
 
 local LineOffsets = {
     [1] = 12,
-    [2] = 538,
-    [3] = 1167,
-    [5] = 1195,
-    [7] = 1572,
-    [9] = 4938,
-    [10] = 5547,
-    [11] = 5832,
-    [12] = 5861,
-    [14] = 5884,
-    [15] = 6000,
-    [16] = 6111,
-    [17] = 6210,
-    [20] = 6480,
-    [22] = 6545,
-    [24] = 6624,
-    [25] = 6820,
-    [26] = 7262,
-    [27] = 7384,
-    [29] = 7481,
-    [30] = 7598,
-    [31] = 7673,
-    [32] = 7980,
-    [34] = 8279,
-    [35] = 8552,
-    [36] = 9534,
-    [38] = 9763,
-    [39] = 9785,
-    [40] = 9811,
-    [41] = 9954,
-    [43] = 10006,
-    [44] = 10056,
-    [45] = 10081,
-    [46] = 10276,
-    [48] = 10385,
-    [50] = 10471,
-    [51] = 10691,
-    [52] = 11338,
-    [55] = 11424,
-    [56] = 11495,
-    [57] = 11524,
-    [58] = 11540,
-    [59] = 11557,
-    [60] = 11582,
-    [61] = 11604,
-    [62] = 11643,
-    [63] = 11703,
-    [64] = 11805,
-    [65] = 11823,
-    [66] = 11870,
-    [67] = 11927,
-    [68] = 11959,
-    [69] = 12045,
-    [70] = 12078,
-    [71] = 12097,
-    [72] = 12158,
-    [73] = 12176,
-    [74] = 12234,
-    [75] = 12271,
-    [76] = 12293,
-    [77] = 12328,
-    [78] = 12378,
-    [79] = 12400,
-    [80] = 12420,
-    [81] = 12465,
-    [82] = 12524,
-    [83] = 12621,
-    [84] = 12637,
-    [85] = 12659,
-    [86] = 12698,
-    [87] = 12716,
-    [88] = 12736,
-    [89] = 12752,
-    [90] = 12771,
-    [91] = 12830,
-    [92] = 13010,
-    [93] = 13078,
-    [94] = 13634,
-    [95] = 13671,
-    [98] = 13837,
-    [99] = 13881,
-    [100] = 13982,
-    [101] = 14392,
-    [102] = 14416,
-    [103] = 14504,
-    [104] = 14548,
-    [105] = 14589,
-    [106] = 14613,
-    [107] = 14660,
-    [108] = 14690,
-    [109] = 14851,
-    [110] = 14882,
-    [111] = 15004,
-    [112] = 15013,
-    [113] = 15252,
-    [114] = 15320,
-    [117] = 15411,
-    [118] = 15462,
-    [119] = 15859,
-    [120] = 15956,
-    [121] = 16075,
-    [122] = 16103,
-    [123] = 16424,
-    [125] = 16636,
-    [126] = 16996,
-    [127] = 17610,
-    [128] = 17619,
-    [129] = 17740,
-    [130] = 17770,
-    [131] = 17796,
-    [132] = 17822,
-    [133] = 17855,
-    [134] = 17883,
-    [135] = 17930,
-    [136] = 17973,
-    [139] = 18136,
-    [140] = 18424,
-    [141] = 18552,
-    [142] = 18834,
-    [143] = 19067,
-    [144] = 19097,
-    [145] = 19265,
-    [146] = 19416,
-    [147] = 19474,
-    [148] = 19494,
-    [149] = 20718,
-    [150] = 21078,
-    [151] = 21285,
-    [153] = 21302,
-    [155] = 21488,
-    [156] = 21649,
-    [157] = 21729,
-    [158] = 22025,
-    [159] = 22066,
-    [160] = 22515,
-    [161] = 22831,
-    [162] = 23294,
-    [163] = 23746,
-    [165] = 24006,
-    [166] = 24123,
-    [168] = 24155,
-    [169] = 24241,
-    [170] = 24270,
-    [171] = 24586,
-    [173] = 24661,
-    [174] = 24909,
-    [175] = 24963,
-    [177] = 25014,
-    [179] = 25206,
-    [180] = 26091,
-    [181] = 26164,
+    [2] = 565,
+    [3] = 1194,
+    [5] = 1222,
+    [7] = 1599,
+    [9] = 4994,
+    [10] = 5624,
+    [11] = 5900,
+    [12] = 5929,
+    [14] = 5952,
+    [15] = 6068,
+    [16] = 6179,
+    [17] = 6311,
+    [20] = 6581,
+    [22] = 6646,
+    [24] = 6725,
+    [25] = 6921,
+    [26] = 7363,
+    [27] = 7485,
+    [29] = 7582,
+    [30] = 7699,
+    [31] = 7774,
+    [32] = 8081,
+    [34] = 8380,
+    [35] = 8653,
+    [36] = 9635,
+    [38] = 9864,
+    [39] = 9886,
+    [40] = 9912,
+    [41] = 10055,
+    [43] = 10107,
+    [44] = 10157,
+    [45] = 10182,
+    [46] = 10377,
+    [48] = 10486,
+    [50] = 10572,
+    [51] = 10792,
+    [52] = 11439,
+    [55] = 11525,
+    [56] = 11596,
+    [57] = 11625,
+    [58] = 11641,
+    [59] = 11658,
+    [60] = 11683,
+    [61] = 11705,
+    [62] = 11744,
+    [63] = 11804,
+    [64] = 11906,
+    [65] = 11924,
+    [66] = 11971,
+    [67] = 12028,
+    [68] = 12060,
+    [69] = 12146,
+    [70] = 12179,
+    [71] = 12198,
+    [72] = 12259,
+    [73] = 12277,
+    [74] = 12335,
+    [75] = 12372,
+    [76] = 12394,
+    [77] = 12429,
+    [78] = 12479,
+    [79] = 12501,
+    [80] = 12521,
+    [81] = 12566,
+    [82] = 12625,
+    [83] = 12722,
+    [84] = 12738,
+    [85] = 12760,
+    [86] = 12799,
+    [87] = 12817,
+    [88] = 12837,
+    [89] = 12853,
+    [90] = 12872,
+    [91] = 12931,
+    [92] = 13111,
+    [93] = 13179,
+    [94] = 13878,
+    [95] = 13915,
+    [98] = 14081,
+    [99] = 14125,
+    [100] = 14226,
+    [101] = 14636,
+    [102] = 14660,
+    [103] = 14748,
+    [104] = 14792,
+    [105] = 14833,
+    [106] = 14857,
+    [107] = 14904,
+    [108] = 14934,
+    [109] = 15105,
+    [110] = 15136,
+    [111] = 15258,
+    [112] = 15267,
+    [113] = 15538,
+    [114] = 15606,
+    [117] = 15697,
+    [118] = 15774,
+    [119] = 16171,
+    [120] = 16268,
+    [121] = 16387,
+    [122] = 16415,
+    [123] = 16736,
+    [125] = 16957,
+    [126] = 17317,
+    [127] = 17957,
+    [128] = 17966,
+    [129] = 18087,
+    [130] = 18117,
+    [131] = 18143,
+    [132] = 18169,
+    [133] = 18202,
+    [134] = 18230,
+    [135] = 18277,
+    [136] = 18320,
+    [139] = 18548,
+    [140] = 18836,
+    [141] = 18963,
+    [142] = 19245,
+    [143] = 19478,
+    [144] = 19508,
+    [145] = 19676,
+    [146] = 19827,
+    [147] = 19885,
+    [148] = 19905,
+    [149] = 21129,
+    [150] = 21551,
+    [151] = 21780,
+    [153] = 21797,
+    [155] = 21983,
+    [156] = 22241,
+    [157] = 22321,
+    [158] = 22617,
+    [159] = 22658,
+    [160] = 23107,
+    [161] = 23423,
+    [162] = 23904,
+    [163] = 24366,
+    [165] = 24626,
+    [166] = 25211,
+    [168] = 25243,
+    [169] = 25329,
+    [170] = 25358,
+    [171] = 25674,
+    [173] = 25749,
+    [174] = 25997,
+    [175] = 26051,
+    [177] = 26102,
+    [179] = 26321,
+    [180] = 27303,
+    [181] = 27381,
 }
 
 

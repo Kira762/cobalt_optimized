@@ -1,6 +1,7 @@
 local Interface = require("@src/Utils/UI/Interface")
 local Icons = require("@src/Utils/UI/Assets/Icons")
 local Input = require("@src/Window/Utils/Input/Input")
+local Animations = require("@src/Window/Utils/Animations")
 
 local ContextMenu = {}
 export type ContextMenu = {
@@ -180,21 +181,11 @@ function ContextMenu:Create(
 				end
 			end
 
-			TextButton.MouseEnter:Connect(function()
-				wax.shared.TweenService
-					:Create(TextButton, self.TweenInfo, {
-						BackgroundTransparency = 0,
-					})
-					:Play()
-			end)
-
-			TextButton.MouseLeave:Connect(function()
-				wax.shared.TweenService
-					:Create(TextButton, self.TweenInfo, {
-						BackgroundTransparency = 1,
-					})
-					:Play()
-			end)
+			Animations.BindHover(TextButton, {
+				BackgroundTransparency = 1,
+			}, {
+				BackgroundTransparency = 0,
+			}, self.TweenInfo)
 
 			TextButton.MouseButton1Click:Connect(function()
 				TextButton.BackgroundTransparency = 1
@@ -286,6 +277,14 @@ function ContextMenu:Create(
 		end
 
 		Owner.Frame.Visible = true
+
+		-- Grow in from the anchor instead of appearing fully formed.
+		Animations.Pop(Owner.Frame, {
+			From = 0.94,
+			To = 1,
+			Duration = 0.14,
+			TweenInfo = TweenInfo.new(0.14, Enum.EasingStyle.Exponential, Enum.EasingDirection.Out),
+		})
 	end
 
 	function ContextData.Toggle()
@@ -336,6 +335,7 @@ function ContextMenu:Create(
 		end
 
 		ContextData.Owner.Frame.Visible = false
+		Animations.Cancel(ContextData.Owner.Frame, true)
 		for Object, _ in pairs(ContextData.Options) do
 			Object.Parent = nil
 		end

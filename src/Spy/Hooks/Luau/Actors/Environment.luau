@@ -1851,6 +1851,43 @@ do
 
 	local PendingCallDecisions = setmetatable({}, { __mode = "k" })
 
+	-- `tostring(table)` is needed twice per call (ShouldBlock + Call); memoising
+	-- it per info table halves that work and keeps both lookups identical.
+	local CallDecisionKeys = setmetatable({}, { __mode = "k" })
+
+	-- clonefunction() allocates a fresh closure every call; the same scripts are
+	-- cloned over and over, so clones are cached against the original (weak keys).
+	local FunctionClones = setmetatable({}, { __mode = "k" })
+
+	local function GetDecisionKey(RawInfo): string
+		local Key = CallDecisionKeys[RawInfo]
+		if not Key then
+			Key = tostring(RawInfo)
+			CallDecisionKeys[RawInfo] = Key
+		end
+
+		return Key
+	end
+
+	local function CloneFunction(Function)
+		local Cached = FunctionClones[Function]
+		if Cached then
+			return Cached
+		end
+
+		if not clonefunction then
+			return Function
+		end
+
+		local Clone = clonefunction(Function)
+		FunctionClones[Function] = Clone
+		return Clone
+	end
+
+	local function CheckSpamThreshold(Target)
+		return Target:IsOverSpamThreshold()
+	end
+
 	
 	wax.shared.LogNotificationQueue = {
 		Items = {},
@@ -2065,11 +2102,7 @@ do
 				end
 
 			elseif RobloxType == "function" then
-				if clonefunction then
-					return clonefunction(OriginalValue)
-				else
-					return OriginalValue
-				end
+				return CloneFunction(OriginalValue)
 			end
 
 			return OriginalValue
@@ -2113,11 +2146,7 @@ do
 				end
 
 			elseif ValueType == "function" then
-				if clonefunction then
-					ShallowCopy[Key] = clonefunction(Value)
-				else
-					ShallowCopy[Key] = Value
-				end
+				ShallowCopy[Key] = CloneFunction(Value)
 		
 			else
 				ShallowCopy[Key] = Value
@@ -2189,7 +2218,7 @@ do
 	end
 
 	function Log:ShouldBlock(RawInfo, PendingCallDecisionsKey): boolean
-		PendingCallDecisionsKey = PendingCallDecisionsKey or tostring(RawInfo)
+		PendingCallDecisionsKey = PendingCallDecisionsKey or GetDecisionKey(RawInfo)
 
 		local Decision = PendingCallDecisions[PendingCallDecisionsKey]
 		if Decision then
@@ -2217,7 +2246,7 @@ do
 	end
 
 	function Log:Call(RawInfo): number?
-		local PendingCallDecisionsKey = tostring(RawInfo)
+		local PendingCallDecisionsKey = GetDecisionKey(RawInfo)
 
 		local ShouldBlock = self:ShouldBlock(RawInfo, PendingCallDecisionsKey)
 		local Decision = PendingCallDecisions[PendingCallDecisionsKey]
@@ -2240,7 +2269,7 @@ do
 
 		
 		if not wax.shared.IS_ACTOR then
-			local Success, SpamData = pcall(function() return self.IsOverSpamThreshold(self) end)
+			local Success, SpamData = pcall(CheckSpamThreshold, self)
 			if Success and SpamData then
 				return nil
 			end

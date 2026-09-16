@@ -142,6 +142,24 @@ return function(props: {
 	LogsPage.LogList = LogList
 	LogsPage.LogCalls = LogCalls
 
+	--[[
+		DebugIds are stable for the lifetime of an Instance, but re-deriving one
+		on the GUI thread is not free, so the last result is remembered per
+		Instance.  Weak keys: the cache never keeps an instance alive.
+	]]
+	local DebugIdCache = setmetatable({}, { __mode = "k" })
+
+	local function GetCachedDebugId(Instance)
+		local Cached = DebugIdCache[Instance]
+		if Cached ~= nil then
+			return Cached
+		end
+
+		local DebugId = wax.shared.GetDebugId(Instance)
+		DebugIdCache[Instance] = DebugId
+		return DebugId
+	end
+
 	wax.shared.Connect(wax.shared.Communicator.Event:Connect(function(Batch)
 		if typeof(Batch) ~= "table" then
 			return
@@ -149,6 +167,13 @@ return function(props: {
 
 		local CurrentTab = LogList.CurrentTab
 		if not CurrentTab then
+			return
+		end
+
+		-- Hoisted out of the loop: wax.shared is a proxy table, and every
+		-- notification used to walk it three times.
+		local Logs = wax.shared.Logs
+		if not Logs then
 			return
 		end
 
@@ -162,17 +187,19 @@ return function(props: {
 			local CallIndex = Notification.CallIndex
 			local LogIndex = Notification.LogIndex
 
-			local InstanceDebugId = wax.shared.GetDebugId(Instance)
+			-- The producer's log is carried by the notification; the
+			-- instance-based lookup stays as the fallback path.
+			local Log = Notification.Log
+			if not Log then
+				local LogsByType = Logs[Type]
 
-			
-			
-			
-			local Log = wax.shared.Logs[Type][InstanceDebugId]
-			if not Log and LogIndex ~= nil then
-				for _, Candidate in wax.shared.Logs[Type] do
-					if Candidate.Index == LogIndex then
-						Log = Candidate
-						break
+				Log = LogsByType and LogsByType[GetCachedDebugId(Instance)]
+				if not Log and LogIndex ~= nil and LogsByType then
+					for _, Candidate in LogsByType do
+						if Candidate.Index == LogIndex then
+							Log = Candidate
+							break
+						end
 					end
 				end
 			end
@@ -183,7 +210,7 @@ return function(props: {
 
 			LogList:EnsureLogButton(Log)
 			LogList:QueueLogButtonUpdate(Log)
-			LogCalls:HandleCallAdded(Log, CallIndex)
+			LogCalls:HandleCallAdded(Log, CallIndex, Notification.Call)
 		end
 	end))
 

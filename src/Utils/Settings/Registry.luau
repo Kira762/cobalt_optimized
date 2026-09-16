@@ -49,6 +49,38 @@ return {
 			NumericOnly = true,
 		},
 	}),
+
+	--[[
+		Interface motion.  Turning this off makes every transition instant; the
+		end state of the interface is identical either way, so it is purely a
+		comfort / low-end-device switch.
+	]]
+	AnimationsEnabled = Setting.new({
+		Key = "AnimationsEnabled",
+		Default = true,
+		Schema = Schema.boolean(),
+		UI = {
+			Type = "Checkbox",
+			Text = "Interface Animations",
+		},
+	}),
+
+	--[[
+		Retention limit per remote.  Captured calls hold a deep copy of their
+		arguments for the whole session, so without a limit a busy game grows
+		memory until the device kills Roblox.  Old calls are dropped once a remote
+		exceeds this many.
+	]]
+	MaxCallsPerRemote = Setting.new({
+		Key = "MaxCallsPerRemote",
+		Default = 500,
+		Schema = PositiveInteger,
+		UI = {
+			Type = "TextBox",
+			Text = "Calls Kept Per Remote",
+			NumericOnly = true,
+		},
+	}),
 	ExecuteOnTeleport = Setting.new({
 		Key = "ExecuteOnTeleport",
 		Default = false,

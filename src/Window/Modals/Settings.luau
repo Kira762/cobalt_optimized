@@ -7,6 +7,7 @@ local SettingsBuilder = require("@src/Window/Components/Modal/Builder/Settings")
 
 local Resize = require("@src/Window/Utils/Input/Resize")
 local DPI = require("@src/Window/Utils/DPI")
+local Animations = require("@src/Window/Utils/Animations")
 
 
 local AnticheatData = require("@src/Utils/Anticheats/Main")
@@ -186,6 +187,14 @@ return function(props: {
 			Refresh = LogsPage.RefreshCurrentLog,
 		})
 
+		Settings.AnimationsEnabled:SetupOption(GeneralSection, {
+			Callback = function(Value)
+				-- Keep the animation layer in sync immediately (it reads the
+				-- setting live, this just makes the change instant).
+				Animations.SetEnabled(Value)
+			end,
+		})
+
 		Settings.ExecuteOnTeleport:SetupOption(GeneralSection)
 
 		GeneralSection:AddSpacer()
@@ -212,6 +221,7 @@ return function(props: {
 		Settings.LogRobloxInternalEvents:SetupOption(CaptureSection)
 		Settings.LogActors:SetupOption(CaptureSection)
 		Settings.LogBlockedRemotes:SetupOption(CaptureSection)
+		Settings.MaxCallsPerRemote:SetupOption(CaptureSection)
 	end
 
 	

@@ -24,7 +24,18 @@ wax.shared.Hooks = {}
 
 
 wax.shared.ExecutorName = identifyexecutor()
+
+-- Device tiering runs first: the frame-time sampler overlaps the
+-- ExecutorSupport tests below, and the adaptive consumers (Log, Calls, List,
+-- Animations) capture their tier preset when they load, so the tier must be
+-- final before the rest of the bundle boots.
+local DeviceProfile = require("@src/Utils/DeviceProfile")
+wax.shared.DeviceProfile = DeviceProfile
+DeviceProfile.Detect()
+DeviceProfile.BeginFrameSampling()
+
 wax.shared.ExecutorSupport = require(script.ExecutorSupport)
+DeviceProfile.FinishDetection()
 
 local AssetManager = require(script.Utils.UI.Assets.Manager)
 AssetManager.PreloadAsync()

@@ -180,5 +180,6 @@ local RefIdToPath = {
     [179] = "src/Window/Views/Logs/Components/Calls.luau",
     [180] = "src/Window/Views/Logs/Components/DirectionTabs.luau",
     [181] = "src/Window/Views/Logs/Components/List.luau",
+    [182] = "src/Utils/DeviceProfile.luau",
 }
 return RefIdToPath

@@ -35,7 +35,18 @@ wax.shared.Hooks = {}
 
 
 wax.shared.ExecutorName = identifyexecutor()
+
+-- Device tiering runs first: the frame-time sampler overlaps the
+-- ExecutorSupport tests below, and the adaptive consumers (Log, Calls, List,
+-- Animations) capture their tier preset when they load, so the tier must be
+-- final before the rest of the bundle boots.
+local DeviceProfile = require("@src/Utils/DeviceProfile")
+wax.shared.DeviceProfile = DeviceProfile
+DeviceProfile.Detect()
+DeviceProfile.BeginFrameSampling()
+
 wax.shared.ExecutorSupport = require(script.ExecutorSupport)
+DeviceProfile.FinishDetection()
 
 local AssetManager = require(script.Utils.UI.Assets.Manager)
 AssetManager.PreloadAsync()
@@ -27855,6 +27866,338 @@ return function(props: {
 	return List
 end
     end)(...) end,
+    [182] = function(...) local wax,script,require=ImportGlobals(182) local ImportGlobals return (function(...)
+--[[
+	DeviceProfile
+
+	One-shot device capability detection, run once at boot.
+
+	The result drives every adaptive budget in Cobalt (capture budgets, call
+	frame queue caps, animation limits, page sizes, ...).  Consumers read the
+	preset fields at module load time - they are plain numbers, so reading them
+	costs nothing in a hot path.
+
+	Tier signals (weakest first):
+
+	- `UserInputService.TouchEnabled` - phones/tablets cap out at "medium".
+	- `workspace.CurrentCamera.ViewportSize` - small screens (< 500px height)
+	  and small windows (< 800px) downgrade.
+	- `Stats` memory if the executor exposes it - low data memory downgrades.
+	- executor name - a known premium desktop executor can promote one tier.
+	- frame time sampling - a median frame above 18ms downgrades, above 33ms
+	  floors at "low".
+
+	`Detect` is synchronous and cheap.  `Init` additionally samples ~10 frames
+	so the GPU/CPU signal is included; it yields, so it must run before the
+	modules that capture the preset values (src/init.luau does this before
+	requiring ExecutorSupport, whose tests overlap with the sampling window).
+]]
+
+local DeviceProfile = {
+	Tier = "medium",
+
+	IsMobile = false,
+	IsSmallScreen = false,
+	ViewportSize = nil,
+
+	-- Tier presets (see TIER_PRESETS below).  Kept as direct fields so hot
+	-- paths can capture them into locals once at module load.
+	CaptureBudgetPerRemote = 120,
+	CaptureBudgetGlobal = 600,
+	MaxCallFrameQueue = 40,
+	ArgumentBuildSliceMs = 4,
+	MaxCallsPerPage = 20,
+	MaxNotificationsPerHeartbeat = 96,
+	MaxPendingNotifications = 256,
+	MaxAnimations = 64,
+	RowStaggerStep = 0.018,
+	LogButtonUpdateSeconds = 0.1,
+}
+
+-- Frame-time sampling.  A median frame above FRAME_SLOW_MS downgrades one
+-- tier; above FRAME_VERY_SLOW_MS the device floors at "low".
+local FRAME_SAMPLE_COUNT = 12
+local FRAME_SAMPLE_WARMUP = 2
+local FRAME_SLOW_MS = 18
+local FRAME_VERY_SLOW_MS = 33
+
+-- Screen height at or below this is treated as a phone-sized viewport.
+local SMALL_SCREEN_HEIGHT = 500
+-- Window height below this downgrades one tier (full desktop monitors are far
+-- above it; small side-by-side windows are not).
+local MEDIUM_SCREEN_HEIGHT = 800
+-- Data memory (MB) under which a device is treated as memory constrained.
+local LOW_MEMORY_MB = 1500
+local VERY_LOW_MEMORY_MB = 800
+
+-- Substring match against identifyexecutor(); desktop executors in this list
+-- are assumed to have enough headroom to promote one tier.
+local PremiumExecutorHints = {
+	"synapse",
+	"script-ware",
+	"scriptware",
+	"sirhurt",
+	"protosmasher",
+	"sentinel",
+	"awp",
+	"wave",
+	"krnl",
+	"oxygen",
+}
+
+local TIER_ORDER = { "low", "medium", "high" }
+local TIER_INDEX = { low = 1, medium = 2, high = 3 }
+
+local TIER_PRESETS = {
+	high = {
+		CaptureBudgetPerRemote = 120,
+		CaptureBudgetGlobal = 600,
+		MaxCallFrameQueue = 40,
+		ArgumentBuildSliceMs = 4,
+		MaxCallsPerPage = 25,
+		MaxNotificationsPerHeartbeat = 96,
+		MaxPendingNotifications = 256,
+		MaxAnimations = 64,
+		RowStaggerStep = 0.018,
+		LogButtonUpdateSeconds = 0.1,
+	},
+	medium = {
+		CaptureBudgetPerRemote = 80,
+		CaptureBudgetGlobal = 300,
+		MaxCallFrameQueue = 24,
+		ArgumentBuildSliceMs = 3,
+		MaxCallsPerPage = 20,
+		MaxNotificationsPerHeartbeat = 48,
+		MaxPendingNotifications = 128,
+		MaxAnimations = 32,
+		RowStaggerStep = 0.012,
+		LogButtonUpdateSeconds = 0.15,
+	},
+	low = {
+		CaptureBudgetPerRemote = 40,
+		CaptureBudgetGlobal = 150,
+		MaxCallFrameQueue = 12,
+		ArgumentBuildSliceMs = 2,
+		MaxCallsPerPage = 15,
+		MaxNotificationsPerHeartbeat = 24,
+		MaxPendingNotifications = 64,
+		MaxAnimations = 8,
+		RowStaggerStep = 0,
+		LogButtonUpdateSeconds = 0.2,
+	},
+}
+
+local function ApplyPreset(Tier: string)
+	local Preset = TIER_PRESETS[Tier] or TIER_PRESETS.medium
+	for Key, Value in Preset do
+		DeviceProfile[Key] = Value
+	end
+end
+
+local function GetExecutorName(): string
+	local Success, Name = pcall(function()
+		return identifyexecutor and identifyexecutor() or ""
+	end)
+	if Success and type(Name) == "string" then
+		return string.lower(Name)
+	end
+
+	return ""
+end
+
+local function IsPremiumExecutor(): boolean
+	local Name = GetExecutorName()
+	if Name == "" then
+		return false
+	end
+
+	for _, Hint in PremiumExecutorHints do
+		if string.find(Name, Hint, 1, true) then
+			return true
+		end
+	end
+
+	return false
+end
+
+local function IsTouchDevice(): boolean
+	local Success, Enabled = pcall(function()
+		return typeof(UserInputService) == "Instance" and UserInputService.TouchEnabled == true
+	end)
+	return Success and Enabled == true
+end
+
+local function GetViewportSize()
+	local Success, Size = pcall(function()
+		local Camera = typeof(workspace) == "Instance" and workspace.CurrentCamera or nil
+		if Camera then
+			return Camera.ViewportSize
+		end
+		return nil
+	end)
+
+	if Success and typeof(Size) == "Vector2" then
+		return Size
+	end
+
+	return nil
+end
+
+local function GetDataMemoryMB(): number?
+	local Success, MemoryMB = pcall(function()
+		local StatsService = game:GetService("Stats")
+		-- Executors differ in what they expose; try the common surfaces.
+		if type(StatsService.DataMemory) == "number" then
+			return StatsService.DataMemory
+		end
+		if type(StatsService.GetTotalMemoryUsageMb) == "function" then
+			return StatsService:GetTotalMemoryUsageMb()
+		end
+		return nil
+	end)
+
+	if Success and type(MemoryMB) == "number" and MemoryMB > 0 then
+		return MemoryMB
+	end
+
+	return nil
+end
+
+--[[
+	Static, non-yielding detection.  Safe to call anywhere; leaves the frame
+	time signal out of the tier decision until `Init` runs.
+]]
+function DeviceProfile.Detect()
+	local Viewport = GetViewportSize()
+	local ViewportHeight = Viewport and Viewport.Y or math.huge
+
+	local Tier = 3 -- high
+
+	if IsTouchDevice() then
+		DeviceProfile.IsMobile = true
+		Tier = math.min(Tier, 2) -- touch caps at medium
+	end
+
+	if Viewport and ViewportHeight <= SMALL_SCREEN_HEIGHT then
+		DeviceProfile.IsSmallScreen = true
+		Tier = 1 -- small screen floors at low
+	elseif Viewport and ViewportHeight < MEDIUM_SCREEN_HEIGHT then
+		Tier = math.min(Tier, 2)
+	end
+
+	local MemoryMB = GetDataMemoryMB()
+	if MemoryMB then
+		if MemoryMB <= VERY_LOW_MEMORY_MB then
+			Tier = 1
+		elseif MemoryMB <= LOW_MEMORY_MB then
+			Tier = math.min(Tier, 2)
+		end
+	end
+
+	if IsPremiumExecutor() then
+		Tier = math.min(Tier + 1, if DeviceProfile.IsMobile then 2 else 3)
+	end
+
+	DeviceProfile.ViewportSize = Viewport
+	DeviceProfile.Tier = TIER_ORDER[Tier] or "medium"
+	ApplyPreset(DeviceProfile.Tier)
+	return DeviceProfile.Tier
+end
+
+-- Frame-time sampling state (drive with BeginFrameSampling/FinishDetection).
+local SamplingDone = true
+local SamplingMedianMs = nil
+
+local function SampleFrameTime(): number?
+	local Success, MedianMs = pcall(function()
+		local RunService = game:GetService("RunService")
+		local Signal = RunService.Heartbeat
+
+		local Samples = table.create(FRAME_SAMPLE_COUNT)
+		for Index = 1, FRAME_SAMPLE_COUNT do
+			local Start = os.clock()
+			Signal:Wait()
+			Samples[Index] = (os.clock() - Start) * 1000
+		end
+
+		table.sort(Samples)
+		return Samples[math.floor((FRAME_SAMPLE_COUNT + 1) / 2)]
+	end)
+
+	if Success and type(MedianMs) == "number" then
+		return MedianMs
+	end
+
+	return nil
+end
+
+--[[
+	Collects the frame-time signal in the background so it overlaps the rest
+	of boot (ExecutorSupport tests, asset preloading).  Does not yield the
+	caller.  `FinishDetection` blocks until the samples are in.
+]]
+function DeviceProfile.BeginFrameSampling()
+	SamplingDone = false
+
+	task.spawn(function()
+		SamplingMedianMs = SampleFrameTime()
+		SamplingDone = true
+	end)
+end
+
+function DeviceProfile.FinishDetection(): string
+	if not SamplingDone then
+		-- Each sample costs exactly one Heartbeat, so this is bounded.
+		pcall(function()
+			local RunService = game:GetService("RunService")
+			local Deadline = os.clock() + 1
+			while not SamplingDone and os.clock() < Deadline do
+				RunService.Heartbeat:Wait()
+			end
+		end)
+	end
+
+	if SamplingMedianMs then
+		local TierIndex = TIER_INDEX[DeviceProfile.Tier] or 2
+
+		if SamplingMedianMs >= FRAME_VERY_SLOW_MS then
+			TierIndex = 1
+		elseif SamplingMedianMs >= FRAME_SLOW_MS then
+			TierIndex = math.max(1, TierIndex - 1)
+		end
+
+		-- A slow frame time is a stronger signal than a premium executor
+		-- name, but never invalidates the touch cap.
+		if DeviceProfile.IsMobile then
+			TierIndex = math.min(TierIndex, 2)
+		end
+
+		DeviceProfile.Tier = TIER_ORDER[TierIndex] or "medium"
+		ApplyPreset(DeviceProfile.Tier)
+	end
+
+	return DeviceProfile.Tier
+end
+
+--[[
+	Full boot-time detection: static signals plus frame sampling.  Yields for
+	about FRAME_SAMPLE_COUNT frames.  Call once, before anything that captures
+	the preset fields.
+]]
+function DeviceProfile.Init(): string
+	DeviceProfile.Detect()
+	DeviceProfile.BeginFrameSampling()
+	return DeviceProfile.FinishDetection()
+end
+
+-- Static-only detection at load time so the module is never left on defaults
+-- when boot forgets to call Init (actors, plugins, tests).
+pcall(function()
+	DeviceProfile.Detect()
+end)
+
+return DeviceProfile
+    end)(...) end,
 }
 
 local ObjectTree = {
@@ -29028,6 +29371,13 @@ local ObjectTree = {
                         }
                     },
                     {
+                        182,
+                        2,
+                        {
+                            "DeviceProfile"
+                        }
+                    },
+                    {
                         23,
                         1,
                         {
@@ -29215,156 +29565,157 @@ local ObjectTree = {
 
 local LineOffsets = {
     [1] = 12,
-    [2] = 586,
-    [3] = 1215,
-    [5] = 1243,
-    [7] = 1622,
-    [9] = 5199,
-    [10] = 5829,
-    [11] = 6105,
-    [12] = 6134,
-    [14] = 6157,
-    [15] = 6273,
-    [16] = 6384,
-    [17] = 6516,
-    [20] = 6786,
-    [22] = 6851,
-    [24] = 6930,
-    [25] = 7126,
-    [26] = 7568,
-    [27] = 7690,
-    [29] = 7787,
-    [30] = 7904,
-    [31] = 7979,
-    [32] = 8284,
-    [34] = 8583,
-    [35] = 8856,
-    [36] = 9838,
-    [38] = 10067,
-    [39] = 10089,
-    [40] = 10115,
-    [41] = 10258,
-    [43] = 10310,
-    [44] = 10360,
-    [45] = 10385,
-    [46] = 10580,
-    [48] = 10689,
-    [50] = 10775,
-    [51] = 10995,
-    [52] = 11642,
-    [55] = 11728,
-    [56] = 11799,
-    [57] = 11828,
-    [58] = 11844,
-    [59] = 11861,
-    [60] = 11886,
-    [61] = 11908,
-    [62] = 11947,
-    [63] = 12007,
-    [64] = 12111,
-    [65] = 12129,
-    [66] = 12176,
-    [67] = 12233,
-    [68] = 12265,
-    [69] = 12351,
-    [70] = 12384,
-    [71] = 12403,
-    [72] = 12464,
-    [73] = 12482,
-    [74] = 12540,
-    [75] = 12577,
-    [76] = 12599,
-    [77] = 12634,
-    [78] = 12684,
-    [79] = 12706,
-    [80] = 12726,
-    [81] = 12771,
-    [82] = 12830,
-    [83] = 12927,
-    [84] = 12943,
-    [85] = 12965,
-    [86] = 13004,
-    [87] = 13022,
-    [88] = 13042,
-    [89] = 13058,
-    [90] = 13077,
-    [91] = 13136,
-    [92] = 13316,
-    [93] = 13384,
-    [94] = 14149,
-    [95] = 14186,
-    [98] = 14352,
-    [99] = 14396,
-    [100] = 14497,
-    [101] = 14907,
-    [102] = 14931,
-    [103] = 15019,
-    [104] = 15063,
-    [105] = 15104,
-    [106] = 15128,
-    [107] = 15175,
-    [108] = 15205,
-    [109] = 15396,
-    [110] = 15427,
-    [111] = 15549,
-    [112] = 15558,
-    [113] = 15831,
-    [114] = 15899,
-    [117] = 15990,
-    [118] = 16127,
-    [119] = 16280,
-    [120] = 16368,
-    [121] = 16496,
-    [122] = 16524,
-    [123] = 16845,
-    [125] = 17076,
-    [126] = 17436,
-    [127] = 18076,
-    [128] = 18085,
-    [129] = 18206,
-    [130] = 18236,
-    [131] = 18262,
-    [132] = 18288,
-    [133] = 18321,
-    [134] = 18349,
-    [135] = 18396,
-    [136] = 18439,
-    [139] = 18667,
-    [140] = 18955,
-    [141] = 19082,
-    [142] = 19364,
-    [143] = 19597,
-    [144] = 19627,
-    [145] = 19795,
-    [146] = 19946,
-    [147] = 20004,
-    [148] = 20024,
-    [149] = 21247,
-    [150] = 21669,
-    [151] = 21898,
-    [153] = 21915,
-    [155] = 22101,
-    [156] = 22359,
-    [157] = 22439,
-    [158] = 22735,
-    [159] = 22776,
-    [160] = 23225,
-    [161] = 23541,
-    [162] = 24022,
-    [163] = 24484,
-    [165] = 24744,
-    [166] = 25331,
-    [168] = 25363,
-    [169] = 25449,
-    [170] = 25478,
-    [171] = 25794,
-    [173] = 25869,
-    [174] = 26117,
-    [175] = 26171,
-    [177] = 26222,
-    [179] = 26441,
-    [180] = 27423,
-    [181] = 27501,
+    [2] = 597,
+    [3] = 1226,
+    [5] = 1254,
+    [7] = 1633,
+    [9] = 5210,
+    [10] = 5840,
+    [11] = 6116,
+    [12] = 6145,
+    [14] = 6168,
+    [15] = 6284,
+    [16] = 6395,
+    [17] = 6527,
+    [20] = 6797,
+    [22] = 6862,
+    [24] = 6941,
+    [25] = 7137,
+    [26] = 7579,
+    [27] = 7701,
+    [29] = 7798,
+    [30] = 7915,
+    [31] = 7990,
+    [32] = 8295,
+    [34] = 8594,
+    [35] = 8867,
+    [36] = 9849,
+    [38] = 10078,
+    [39] = 10100,
+    [40] = 10126,
+    [41] = 10269,
+    [43] = 10321,
+    [44] = 10371,
+    [45] = 10396,
+    [46] = 10591,
+    [48] = 10700,
+    [50] = 10786,
+    [51] = 11006,
+    [52] = 11653,
+    [55] = 11739,
+    [56] = 11810,
+    [57] = 11839,
+    [58] = 11855,
+    [59] = 11872,
+    [60] = 11897,
+    [61] = 11919,
+    [62] = 11958,
+    [63] = 12018,
+    [64] = 12122,
+    [65] = 12140,
+    [66] = 12187,
+    [67] = 12244,
+    [68] = 12276,
+    [69] = 12362,
+    [70] = 12395,
+    [71] = 12414,
+    [72] = 12475,
+    [73] = 12493,
+    [74] = 12551,
+    [75] = 12588,
+    [76] = 12610,
+    [77] = 12645,
+    [78] = 12695,
+    [79] = 12717,
+    [80] = 12737,
+    [81] = 12782,
+    [82] = 12841,
+    [83] = 12938,
+    [84] = 12954,
+    [85] = 12976,
+    [86] = 13015,
+    [87] = 13033,
+    [88] = 13053,
+    [89] = 13069,
+    [90] = 13088,
+    [91] = 13147,
+    [92] = 13327,
+    [93] = 13395,
+    [94] = 14160,
+    [95] = 14197,
+    [98] = 14363,
+    [99] = 14407,
+    [100] = 14508,
+    [101] = 14918,
+    [102] = 14942,
+    [103] = 15030,
+    [104] = 15074,
+    [105] = 15115,
+    [106] = 15139,
+    [107] = 15186,
+    [108] = 15216,
+    [109] = 15407,
+    [110] = 15438,
+    [111] = 15560,
+    [112] = 15569,
+    [113] = 15842,
+    [114] = 15910,
+    [117] = 16001,
+    [118] = 16138,
+    [119] = 16291,
+    [120] = 16379,
+    [121] = 16507,
+    [122] = 16535,
+    [123] = 16856,
+    [125] = 17087,
+    [126] = 17447,
+    [127] = 18087,
+    [128] = 18096,
+    [129] = 18217,
+    [130] = 18247,
+    [131] = 18273,
+    [132] = 18299,
+    [133] = 18332,
+    [134] = 18360,
+    [135] = 18407,
+    [136] = 18450,
+    [139] = 18678,
+    [140] = 18966,
+    [141] = 19093,
+    [142] = 19375,
+    [143] = 19608,
+    [144] = 19638,
+    [145] = 19806,
+    [146] = 19957,
+    [147] = 20015,
+    [148] = 20035,
+    [149] = 21258,
+    [150] = 21680,
+    [151] = 21909,
+    [153] = 21926,
+    [155] = 22112,
+    [156] = 22370,
+    [157] = 22450,
+    [158] = 22746,
+    [159] = 22787,
+    [160] = 23236,
+    [161] = 23552,
+    [162] = 24033,
+    [163] = 24495,
+    [165] = 24755,
+    [166] = 25342,
+    [168] = 25374,
+    [169] = 25460,
+    [170] = 25489,
+    [171] = 25805,
+    [173] = 25880,
+    [174] = 26128,
+    [175] = 26182,
+    [177] = 26233,
+    [179] = 26452,
+    [180] = 27434,
+    [181] = 27512,
+    [182] = 27870,
 }
 
 

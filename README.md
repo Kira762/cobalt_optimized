@@ -1,63 +1,51 @@
 # cobalt_optimized
 
-Refactored modular version of Cobalt (originally single-file `cobalt.luau` 25k+ lines).
+Modular source tree for Cobalt (upstream ships it as a single 25k-line `cobalt.luau`).
+
+`src/` is where you edit. `cobalt.luau` is the **generated** single-file bundle you
+actually execute — regenerate it with `python3 tools/bundle.py` after changing `src/`.
 
 ## Structure
 
 ```
-loader.luau          # Robust executor loader: pcall-guarded local candidates -> GitHub raw fallback
-cobalt.luau          # Main entry point — still executable via loadstring, now thin (~7.5k lines, 494KB)
-                     # Loads modules from src/ via wax virtual FS with filesystem fallback
-src/                 # Extracted source modules (152 files)
-  init.luau          # Main LocalScript (formerly ClosureBindings[1])
+loader.luau          # Optional executor loader: pcall-guarded local read -> GitHub raw fallback
+cobalt.luau          # GENERATED bundle, ~960KB / ~28.5k lines. Fully self-contained:
+                     #   ClosureBindings  - one closure per module, body inlined from src/
+                     #   ObjectTree       - virtual Instance tree the closures hang off
+                     #   LineOffsets      - bundle line -> module line, for error messages
+                     #   wax runtime      - ImportGlobals / LoadScript / virtual require
+src/                 # Source of truth: 152 .luau modules
+  init.luau          # Main LocalScript
   ExecutorSupport.luau
-  Spy/
-    init.luau
-    Hooks/
-      Luau/
-        init.luau
-        Actors/
-          Environment.luau
-        Interceptors/
-          Incoming.luau
-          Outgoing.luau
-      RakNet/
-        ...
-  Utils/
-    Anticheats/
-    CallFilter/
-    CodeGen/
-    Hook/
-    Plugins/
-    ...
-  Window/
-    Components/
-    Modals/
-    Utils/
-    Views/
-    ...
-lib/                 # Wax bundling support (modularized runtime)
+  Spy/               # Luau + RakNet hooks, interceptors, invocation tracking
+  Utils/             # Anticheats, CallFilter, CodeGen, Hook, Plugins, UI helpers
+  Window/            # Components, Modals, Utils, Views
+lib/                 # Bundle inputs / dev artifacts
+  ref_map.luau       # RefId -> src path; drives the bundler
+  object_tree.luau   # ObjectTree source
+  line_offsets.luau  # LineOffsets source
+  wax_runtime.luau   # Wax runtime source
   config.luau        # Aliases, WaxVersion, EnvName
-  object_tree.luau   # ObjectTree (virtual DOM)
-  line_offsets.luau  # LineOffsets for debugging
-  ref_map.luau       # RefId -> file path mapping
-  wax_runtime.luau   # Wax runtime (virtual FS, ImportGlobals, LoadScript)
-  fallback_closures.luau # Embedded fallback for loadstring without filesystem
+tools/
+  bundle.py          # src/ -> cobalt.luau (also `--check` for CI)
+  modulecheck.py     # Emits a Luau harness that executes every module in the bundle
 .luaurc              # Aliases: src -> ./src, lib -> ./lib
+verify.sh            # Structural checks; set LUAU=... to also execute the bundle
 ```
 
 ## How to Run
 
-### Roblox (loadstring)
+`cobalt.luau` is self-contained — one request, no local files needed:
 
-Paste `loader.luau` (preferred) — it tries local file candidates (each
-`pcall`-guarded) and falls back to GitHub raw, so it boots whether or not the
-repo is inside the script directory:
+```luau
+loadstring(game:HttpGet("https://raw.githubusercontent.com/Kira762/cobalt_optimized/main/cobalt.luau"))()
+```
+
+Or paste `loader.luau`, which prefers a local copy of `cobalt.luau` when the repo
+sits inside the executor's script directory and falls back to raw GitHub:
 
 ```luau
 loadstring(game:HttpGet("https://raw.githubusercontent.com/Kira762/cobalt_optimized/main/loader.luau"))()
--- or
-loadstring(game:HttpGet("https://raw.githubusercontent.com/Kira762/cobalt_optimized/main/cobalt.luau"))()
 ```
 
 **Gotcha:** `readfile()` relative paths resolve against the *executor's script
@@ -68,28 +56,44 @@ directory* (e.g. Synapse's `scripts/` folder), **not** wherever you ran
 `loader.luau` wraps every local read in `pcall`, adds absolute-path
 candidates via `getworkingdirectory()`, and falls back to raw GitHub.
 
-For local/dev use, clone (or copy) the repo **into the script directory** so
-`readfile("cobalt.luau")` resolves. `cobalt.luau` remains self-contained via
-fallback closures; if `src/` is present next to it, it will load modules from
-the filesystem for development; otherwise it uses the embedded fallback.
+## Build
 
-### Lune / Luau Development
 ```bash
-lune run src/init.luau
-# or verify syntax
-lua -l cobalt.luau
+python3 tools/bundle.py            # regenerate cobalt.luau from src/
+python3 tools/bundle.py --check    # fail if cobalt.luau is stale
 ```
 
-The `.luaurc` configures aliases so `require("@src/...")` and `require("@lib/...")` resolve correctly.
+Every `ClosureBindings[N]` is emitted from `lib/ref_map.luau` as:
+
+```luau
+[N] = function(...) local wax,script,require=ImportGlobals(N) local ImportGlobals return (function(...)
+<body of ref_map[N], verbatim>
+end)(...) end,
+```
+
+The trailing `(...)` is what runs the module. `LoadScript()` treats a closure's
+return values as the module's return values, so a closure that merely *returns*
+the inner function reports success while the module body never executes — the UI
+never appears and nothing errors. `tools/bundle.py --check` and `verify.sh` both
+assert the invocating form is present.
 
 ## Verification
 
-- Original: 911KB, 25688 lines, single file
-- Refactored: 494KB main + 1.2MB src + 900KB lib (modular, comments stripped)
-- All comments removed from every file (verified via stripper)
-- `cobalt.luau` still passes `loadstring` syntax check and retains `wax.shared`, `ObjectTree`, `ImportGlobals` behavior
-- No logic or behavior changes; public API stable (`getgenv().Cobalt = wax`)
+```bash
+./verify.sh                        # structural: bundle freshness, closure/LineOffsets alignment
+LUAU=/path/to/luau ./verify.sh     # + executes the bundle and loads every ModuleScript
+```
 
-## Build
+Build the Luau CLI once with
+`git clone --depth 1 https://github.com/luau-lang/luau && cd luau && make -j config=release luau`.
 
-No build step required for development. To re-bundle for distribution, the `lib/fallback_closures.luau` is regenerated from `src/` via the extraction script in `tmp/`.
+The executed check runs `loadstring(cobalt.luau)()` with `readfile` wired to fail
+and `require` wired to reject strings — i.e. the remote-load configuration — then
+drives the bundle's real `LoadScript()` over every ModuleScript. A healthy bundle
+reports a mix of `table` and `function` first-return-values (the 5 modules that
+legitimately `return` a function); the remaining errors are missing executor APIs
+in the stub environment, not load failures.
+
+- Bundle: ~960KB, ~28.5k lines, 151 module closures
+- `cobalt.luau` compiles under Luau and runs to the point of touching real Roblox APIs
+- Public API stable: `getgenv().Cobalt = wax`

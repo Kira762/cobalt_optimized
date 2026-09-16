@@ -10,9 +10,10 @@
 --     readfile("cobalt.luau") hard-errors ("failed to read file") if the
 --     repo isn't inside that folder, and it kills the script before any
 --     fallback runs.
---   * For dev with src/ present, clone the repo INTO the script directory
---     (so readfile("src/init.luau") resolves) - then local files win and
---     cobalt.luau auto-prefers src/ over its embedded fallback.
+--   * cobalt.luau is self-contained (every module body is inlined by
+--     tools/bundle.py), so either source boots the full UI. Cloning the repo
+--     into the script directory just skips the HTTP round trip - it does not
+--     pick up edits to src/ until you re-run tools/bundle.py.
 
 local REMOTE_URL = "https://raw.githubusercontent.com/Kira762/cobalt_optimized/main/cobalt.luau"
 

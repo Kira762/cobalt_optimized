@@ -14,6 +14,8 @@
 	unchanged - existing callers keep working exactly as before.
 ]]
 
+local DeviceProfile = require("@src/Utils/DeviceProfile")
+
 local Animations = {
 	TweenInfo = TweenInfo.new(0.25, Enum.EasingStyle.Exponential),
 	FastTweenInfo = TweenInfo.new(0.14, Enum.EasingStyle.Quad),
@@ -21,9 +23,9 @@ local Animations = {
 	SlowTweenInfo = TweenInfo.new(0.35, Enum.EasingStyle.Exponential),
 
 	-- How many objects a single group fade may touch.  Big groups (a full log
-	-- page, a large modal) are clamped so a fade can never turn into hundreds of
-	-- simultaneous tweens on a phone.
-	MaxGroupFadeObjects = 64,
+	-- page, a large modal) are clamped so a fade can never turn into hundreds
+	-- of simultaneous tweens on a phone.  Tier-aware: 64/32/8.
+	MaxGroupFadeObjects = DeviceProfile.MaxAnimations or 64,
 
 	Exclusions = {},
 	Expectations = { In = {}, Out = {} },

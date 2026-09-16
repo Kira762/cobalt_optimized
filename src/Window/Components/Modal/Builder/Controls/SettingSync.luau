@@ -16,6 +16,13 @@ function SettingSync.Save(Idx: string, Value: any)
 		return false, Error
 	end
 
+	-- The ShouldIgnore fast path caches per-instance verdicts, and the
+	-- settings it reads only change through this call, so drop the cache
+	-- whenever any setting is written.
+	if wax.shared.InvalidateShouldIgnoreCache then
+		wax.shared.InvalidateShouldIgnoreCache()
+	end
+
 	SettingSync.Broadcast(Idx, Value)
 	return true
 end

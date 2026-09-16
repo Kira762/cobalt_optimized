@@ -8,18 +8,20 @@ local CodeGen = require("@src/Utils/CodeGen/Generator")
 local InstanceSerializer = require("@src/Utils/CodeGen/Serializer/Instance")
 local Ratelimiter = require("@src/Utils/Ratelimiter")
 local Animations = require("@src/Window/Utils/Animations")
+local DeviceProfile = require("@src/Utils/DeviceProfile")
 
 local MaxArgumentPreviewLength = 500
 local PreviewCacheByCallInfo = setmetatable({}, { __mode = "k" })
 
 -- Row entrance motion.  Staggered so a freshly rendered page flows in instead of
 -- popping, but capped so the last row never waits more than a fifth of a second.
+-- The stagger step scales with the device tier (0 disables the stagger).
 local RowFadeDuration = 0.16
-local RowStaggerStep = 0.018
+local RowStaggerStep = DeviceProfile.RowStaggerStep or 0.018
 local RowStaggerMax = 0.18
 
 -- How much work one call frame may do before yielding the frame back.
-local ArgumentBuildSliceSeconds = 0.004
+local ArgumentBuildSliceSeconds = (DeviceProfile.ArgumentBuildSliceMs or 4) / 1000
 
 
 return function(props: {

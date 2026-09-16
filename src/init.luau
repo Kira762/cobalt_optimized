@@ -24,7 +24,18 @@ wax.shared.Hooks = {}
 
 
 wax.shared.ExecutorName = identifyexecutor()
+
+-- Device tiering runs first: the frame-time sampler overlaps the
+-- ExecutorSupport tests below, and the adaptive consumers (Log, Calls, List,
+-- Animations) capture their tier preset when they load, so the tier must be
+-- final before the rest of the bundle boots.
+local DeviceProfile = require("@src/Utils/DeviceProfile")
+wax.shared.DeviceProfile = DeviceProfile
+DeviceProfile.Detect()
+DeviceProfile.BeginFrameSampling()
+
 wax.shared.ExecutorSupport = require(script.ExecutorSupport)
+DeviceProfile.FinishDetection()
 
 local AssetManager = require(script.Utils.UI.Assets.Manager)
 AssetManager.PreloadAsync()
@@ -214,15 +225,65 @@ wax.shared.IsPlayerModule = function(Origin: LocalScript | ModuleScript, Instanc
 
 	return false
 end
+--[[
+
+	ShouldIgnore fast path.
+
+	ShouldIgnore runs on every intercepted remote call, but its verdict only
+	changes when the settings it reads change, so both verdicts are cached
+	against the instance (weak keys: a destroyed remote drops its entry) and a
+	repeat call for the same remote costs one table lookup instead of an
+	IsDescendantOf walk plus settings reads.
+
+	Only origin-independent verdicts are cached - the player-module check
+	depends on the calling script, so those results are recomputed per call.
+	The cache is dropped through `InvalidateShouldIgnoreCache`, which
+	SettingSync.Save invokes whenever a setting is written.
+]]
+local IgnoredInstanceCache = setmetatable({}, { __mode = "k" })
+local NotIgnoredInstanceCache = setmetatable({}, { __mode = "k" })
+
+wax.shared.InvalidateShouldIgnoreCache = function()
+	table.clear(IgnoredInstanceCache)
+	table.clear(NotIgnoredInstanceCache)
+end
+
 wax.shared.ShouldIgnore = function(Instance, Origin)
+	if IgnoredInstanceCache[Instance] then
+		return true
+	end
+
+	if NotIgnoredInstanceCache[Instance] then
+		return false
+	end
+
+	local Ignored = false
+	local OriginDependent = false
+
 	if not wax.shared.Settings.LogRobloxInternalEvents.Value then
 		if Instance.IsDescendantOf(Instance, wax.shared.RobloxReplicatedStorage) then
-			return true
+			Ignored = true
 		end
 	end
 
-	return wax.shared.Settings.IgnoredRemotesDropdown.Value[Instance.ClassName] == true
-		or (wax.shared.Settings.IgnorePlayerModule.Value and wax.shared.IsPlayerModule(Origin, Instance))
+	if not Ignored then
+		Ignored = wax.shared.Settings.IgnoredRemotesDropdown.Value[Instance.ClassName] == true
+	end
+
+	if not Ignored and wax.shared.Settings.IgnorePlayerModule.Value then
+		OriginDependent = true
+		Ignored = wax.shared.IsPlayerModule(Origin, Instance)
+	end
+
+	if not OriginDependent then
+		if Ignored then
+			IgnoredInstanceCache[Instance] = true
+		else
+			NotIgnoredInstanceCache[Instance] = true
+		end
+	end
+
+	return Ignored
 end
 
 

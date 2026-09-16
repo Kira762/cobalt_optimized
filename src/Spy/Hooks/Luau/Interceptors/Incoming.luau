@@ -166,83 +166,105 @@ local function CreateConnectionFunction(Instance: InstancesToHook, Method: Metho
 	local CachedConnectionInfo = nil
 	local CachedConnectionCount = -1
 
+	-- getconnections() is the single most expensive executor call on the
+	-- incoming path, and a remote's connection set rarely changes mid-burst,
+	-- so it is refreshed at most once per expiry window per remote.  Between
+	-- refreshes the cached entries are reused as-is; a connection added
+	-- inside the window is picked up by the next refresh.
+	local ConnectionCacheExpiry = 0.2
+	local CachedConnections = nil
+	local CachedConnectionsAt = 0
+
 	local DebugId = wax.shared.GetDebugId(Instance)
 
+	local function BuildConnectionInformation(Connections)
+		local Information = {
+			HasValidConnections = false,
+			HasForeignLuaConnections = false,
+			Entries = {},
+		}
+
+		for _, Connection in Connections do
+			-- Skip connections that are in a foreign state
+			if Connection.ForeignState then
+				-- Check if the connection is a LuaConnection
+				if Connection.LuaConnection then
+					Information.HasForeignLuaConnections = true
+				end
+
+				continue
+			end
+
+			-- Skip Cobalt's own connection functions
+			local Function = typeof(Connection.Function) == "function" and (Connection.Function) or (nil)
+			if IsCobaltConnectionFunction(Function) then
+				continue
+			end
+
+			Information.HasValidConnections = true
+
+			-- Resolve the originating script from the thread or environment
+			local Thread = Connection.Thread
+			local Origin = nil
+
+			if Thread and getscriptfromthread then
+				Origin = getscriptfromthread(Thread)
+			end
+
+			if not Origin and Function then
+				-- The environment script fallback: getcallingscript is not
+				-- usable here (this runs inside our own observer).
+
+				local Script = rawget(getfenv(Function), "script")
+				if typeof(Script) == "Instance" then
+					Origin = Script
+				end
+			end
+
+			table.insert(Information.Entries, {
+				Function = Function,
+				Origin = Origin,
+				IsExecutor = Function and isexecutorclosure(Function) or false,
+			})
+		end
+
+		return Information
+	end
+
 	local ConnectionFunction = function(...)
-		
+		-- If this log is ignored, don't process the event
 		local ExistingLog = wax.shared.Logs.Incoming[DebugId]
 		if ExistingLog and ExistingLog.Ignored then
 			return
 		end
 
-		local Signal = (Instance :: any)[Method]
-		local Connections = getconnections(Signal)
-		local ConnectionCount = #Connections
+		-- Refresh the connection listing at most once per expiry window; every
+		-- other fire of this remote reuses the cached entries without paying
+		-- for a getconnections() round-trip.
+		local Now = os.clock()
+		if not CachedConnections or Now - CachedConnectionsAt >= ConnectionCacheExpiry then
+			local Signal = (Instance :: any)[Method]
+			CachedConnections = getconnections(Signal)
+			CachedConnectionsAt = Now
 
-		
-		if ConnectionCount ~= CachedConnectionCount then
-			CachedConnectionCount = ConnectionCount
-
-			local Information = {
-				HasValidConnections = false,
-				HasForeignLuaConnections = false,
-				Entries = {},
-			}
-
-			for _, Connection in Connections do
-				
-				if Connection.ForeignState then
-					
-					if Connection.LuaConnection then
-						Information.HasForeignLuaConnections = true
-					end
-
-					continue
-				end
-
-				
-				local Function = typeof(Connection.Function) == "function" and (Connection.Function) or (nil)
-				if IsCobaltConnectionFunction(Function) then
-					continue
-				end
-
-				Information.HasValidConnections = true
-
-				
-				local Thread = Connection.Thread
-				local Origin = nil
-
-				if Thread and getscriptfromthread then
-					Origin = getscriptfromthread(Thread)
-				end
-
-				if not Origin and Function then
-					
-					
-
-					local Script = rawget(getfenv(Function), "script")
-					if typeof(Script) == "Instance" then
-						Origin = Script
-					end
-				end
-
-				table.insert(Information.Entries, {
-					Function = Function,
-					Origin = Origin,
-					IsExecutor = Function and isexecutorclosure(Function) or false,
-				})
+			-- Rebuild the connection info if the count changed
+			local ConnectionCount = #CachedConnections
+			if ConnectionCount ~= CachedConnectionCount then
+				CachedConnectionCount = ConnectionCount
+				CachedConnectionInfo = BuildConnectionInformation(CachedConnections)
 			end
-
-			CachedConnectionInfo = Information
 		end
 
-		local Arguments = wax.shared.SafePack.Pack(...)
+		-- Arguments are packed into a reusable scratch buffer; every LogRemote
+		-- below deep-clones them synchronously, so the buffer is handed back
+		-- before this observer returns.
+		local Arguments = wax.shared.SafePack.PackFast(...)
 		local TargetLog, TargetCallIndex
 
 		-- Resolved once for the whole invocation (used to be one per entry).
 		local CallingScript = getcallingscript()
 
-		
+
 		if CachedConnectionInfo.HasValidConnections then
 			for _, Entry in CachedConnectionInfo.Entries do
 				TargetLog, TargetCallIndex = select(2, LogRemote(Instance, Entry.Function, {
@@ -285,6 +307,8 @@ local function CreateConnectionFunction(Instance: InstancesToHook, Method: Metho
 				)
 			end
 		end
+
+		wax.shared.SafePack.ReleaseFast(Arguments)
 	end
 
 	local OriginalEnvironment = getfenv(ConnectionFunction)

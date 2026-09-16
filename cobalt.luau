@@ -5513,13 +5513,16 @@ local function CreateConnectionFunction(Instance: InstancesToHook, Method: Metho
 			end
 		end
 
-		local Arguments = wax.shared.SafePack.Pack(...)
+		-- Arguments are packed into a reusable scratch buffer; every LogRemote
+		-- below deep-clones them synchronously, so the buffer is handed back
+		-- before this observer returns.
+		local Arguments = wax.shared.SafePack.PackFast(...)
 		local TargetLog, TargetCallIndex
 
 		-- Resolved once for the whole invocation (used to be one per entry).
 		local CallingScript = getcallingscript()
 
-		
+
 		if CachedConnectionInfo.HasValidConnections then
 			for _, Entry in CachedConnectionInfo.Entries do
 				TargetLog, TargetCallIndex = select(2, LogRemote(Instance, Entry.Function, {
@@ -5562,6 +5565,8 @@ local function CreateConnectionFunction(Instance: InstancesToHook, Method: Metho
 				)
 			end
 		end
+
+		wax.shared.SafePack.ReleaseFast(Arguments)
 	end
 
 	local OriginalEnvironment = getfenv(ConnectionFunction)
@@ -6009,7 +6014,10 @@ local function HandleLogging(TargetInstance: Instance, Method: string, OldFuncti
 	if not Log then
 		return OldFunction(...)
 	end
-	local Arguments = wax.shared.SafePack.Pack(select(2, ...))
+
+	-- Arguments are packed into a reusable scratch buffer: Log:Call deep-clones
+	-- them synchronously, so the buffer is free again right after the capture.
+	local Arguments = wax.shared.SafePack.PackFast(select(2, ...))
 
 	local CallingScript = getcallingscript()
 	local CallingFunction, CallingSource, CallingLine = GetCallerInfo()
@@ -6026,6 +6034,7 @@ local function HandleLogging(TargetInstance: Instance, Method: string, OldFuncti
 	local ShouldBlock = Log:ShouldBlock(Info)
 	Log:Call(Info)
 	if ShouldBlock then
+		wax.shared.SafePack.ReleaseFast(Arguments)
 		return
 	end
 
@@ -6038,10 +6047,17 @@ local function HandleLogging(TargetInstance: Instance, Method: string, OldFuncti
 	)
 
 	if IsRemoteFunctionInvoke or IsBindableFunctionInvoke then
-		
+
+		-- The invoke flow logs the arguments a second time, after the game
+		-- produced a result.  They must survive the call into the game, so
+		-- this (rare) path copies them into a stable table and returns the
+		-- scratch buffer first.
+		local StableArguments = wax.shared.SafePack.Copy(Arguments)
+		wax.shared.SafePack.ReleaseFast(Arguments)
+
 		Log = GetLog(TargetInstance, "Incoming", DebugId)
 		local RFResultInfo = {
-			Arguments = Arguments,
+			Arguments = StableArguments,
 			InvokeResult = nil,
 			Origin = CallingScript,
 			Function = CallingFunction,
@@ -6059,6 +6075,7 @@ local function HandleLogging(TargetInstance: Instance, Method: string, OldFuncti
 		return HandleLoggingResult(Log, RFResultInfo, "InvokeResult", OldFunction(...))
 	end
 
+	wax.shared.SafePack.ReleaseFast(Arguments)
 	return OldFunction(...)
 end
 
@@ -15478,8 +15495,100 @@ local TableProxy = {}
 local UNPACK_CHUNK = 7997
 local SAFE_LIMIT = 12000
 
+-- Scratch buffers for PackFast, indexed by re-entrancy depth.  Hooks are
+-- synchronous per invocation, so a small stack covers every realistic nesting
+-- level (a hook running inside another hook's capture window); beyond that,
+-- PackFast falls back to a fresh table and correctness never depends on the
+-- pool size.
+local MAX_SCRATCH_DEPTH = 3
+local ScratchPool = {}
+local ScratchDepth = 0
+
+local function ClearScratch(Scratch)
+	local Count = Scratch.n or 0
+	for Index = 1, Count do
+		Scratch[Index] = nil
+	end
+	Scratch.n = 0
+end
+
 function TableProxy.Pack(...)
     return { n = select("#", ...), ... }
+end
+
+--[[
+
+	Packs `...` into a shared scratch buffer instead of allocating a table.
+
+	The hook path packs arguments on every intercepted call, so the fresh
+	table per call adds avoidable GC pressure on busy games.  The returned
+	table is only valid until the next PackFast at the same nesting depth:
+	callers must be done with it (Log:Call deep-clones synchronously) and
+	then hand it back via ReleaseFast.
+
+	Re-entrant hooks nest onto the next scratch slot, and a nesting depth
+	beyond the pool degrades to `Pack` (a fresh allocation) rather than
+	corrupting an outer frame's arguments.
+]]
+function TableProxy.PackFast(...)
+	local Scratch = ScratchPool[ScratchDepth + 1]
+	if not Scratch then
+		if ScratchDepth + 1 > MAX_SCRATCH_DEPTH then
+			return TableProxy.Pack(...)
+		end
+
+		Scratch = { n = 0 }
+		ScratchPool[ScratchDepth + 1] = Scratch
+	end
+
+	ScratchDepth += 1
+
+	local Count = select("#", ...)
+	for Index = 1, Count do
+		Scratch[Index] = select(Index, ...)
+	end
+
+	-- Entries left over from the previous user of this slot must go: callers
+	-- iterate with next() (DeepClone, LuaEncode) and would see stale values.
+	local PreviousCount = Scratch.n or 0
+	for Index = Count + 1, PreviousCount do
+		Scratch[Index] = nil
+	end
+	Scratch.n = Count
+
+	return Scratch
+end
+
+--[[
+
+	Returns a scratch buffer taken by PackFast.  Safe to call with any packed
+	table: foreign tables (e.g. from a Pack fallback) are simply cleared.
+]]
+function TableProxy.ReleaseFast(Scratch)
+	if not Scratch then
+		return
+	end
+
+	if ScratchPool[ScratchDepth] == Scratch then
+		ScratchDepth -= 1
+	end
+
+	ClearScratch(Scratch)
+end
+
+--[[
+
+	Stable copy of a packed table - used when arguments must outlive the hook
+	frame that packed them (e.g. RemoteFunction invoke results).
+]]
+function TableProxy.Copy(Source)
+	local Count = Source.n or #Source
+	local Copy = {}
+	for Index = 1, Count do
+		Copy[Index] = Source[Index]
+	end
+	Copy.n = Count
+	return Copy
 end
 
 function TableProxy.Unpack(Tbl, I, J)
@@ -29651,152 +29760,152 @@ local LineOffsets = {
     [5] = 1304,
     [7] = 1683,
     [9] = 5260,
-    [10] = 5909,
-    [11] = 6185,
-    [12] = 6214,
-    [14] = 6237,
-    [15] = 6353,
-    [16] = 6464,
-    [17] = 6596,
-    [20] = 6866,
-    [22] = 6931,
-    [24] = 7010,
-    [25] = 7206,
-    [26] = 7648,
-    [27] = 7770,
-    [29] = 7867,
-    [30] = 7984,
-    [31] = 8059,
-    [32] = 8364,
-    [34] = 8663,
-    [35] = 8936,
-    [36] = 9918,
-    [38] = 10147,
-    [39] = 10169,
-    [40] = 10195,
-    [41] = 10338,
-    [43] = 10390,
-    [44] = 10440,
-    [45] = 10465,
-    [46] = 10660,
-    [48] = 10769,
-    [50] = 10855,
-    [51] = 11075,
-    [52] = 11722,
-    [55] = 11808,
-    [56] = 11879,
-    [57] = 11908,
-    [58] = 11924,
-    [59] = 11941,
-    [60] = 11966,
-    [61] = 11988,
-    [62] = 12027,
-    [63] = 12087,
-    [64] = 12191,
-    [65] = 12209,
-    [66] = 12256,
-    [67] = 12313,
-    [68] = 12345,
-    [69] = 12431,
-    [70] = 12464,
-    [71] = 12483,
-    [72] = 12544,
-    [73] = 12562,
-    [74] = 12620,
-    [75] = 12657,
-    [76] = 12679,
-    [77] = 12714,
-    [78] = 12764,
-    [79] = 12786,
-    [80] = 12806,
-    [81] = 12851,
-    [82] = 12910,
-    [83] = 13007,
-    [84] = 13023,
-    [85] = 13045,
-    [86] = 13084,
-    [87] = 13102,
-    [88] = 13122,
-    [89] = 13138,
-    [90] = 13157,
-    [91] = 13216,
-    [92] = 13396,
-    [93] = 13464,
-    [94] = 14229,
-    [95] = 14266,
-    [98] = 14432,
-    [99] = 14476,
-    [100] = 14577,
-    [101] = 14987,
-    [102] = 15011,
-    [103] = 15099,
-    [104] = 15143,
-    [105] = 15184,
-    [106] = 15208,
-    [107] = 15255,
-    [108] = 15285,
-    [109] = 15476,
-    [110] = 15507,
-    [111] = 15629,
-    [112] = 15638,
-    [113] = 15911,
-    [114] = 15979,
-    [117] = 16070,
-    [118] = 16207,
-    [119] = 16360,
-    [120] = 16448,
-    [121] = 16576,
-    [122] = 16604,
-    [123] = 16925,
-    [125] = 17156,
-    [126] = 17516,
-    [127] = 18156,
-    [128] = 18165,
-    [129] = 18286,
-    [130] = 18316,
-    [131] = 18342,
-    [132] = 18368,
-    [133] = 18401,
-    [134] = 18429,
-    [135] = 18476,
-    [136] = 18519,
-    [139] = 18747,
-    [140] = 19035,
-    [141] = 19162,
-    [142] = 19444,
-    [143] = 19677,
-    [144] = 19714,
-    [145] = 19882,
-    [146] = 20033,
-    [147] = 20091,
-    [148] = 20111,
-    [149] = 21334,
-    [150] = 21756,
-    [151] = 21985,
-    [153] = 22002,
-    [155] = 22188,
-    [156] = 22446,
-    [157] = 22526,
-    [158] = 22822,
-    [159] = 22863,
-    [160] = 23312,
-    [161] = 23628,
-    [162] = 24109,
-    [163] = 24571,
-    [165] = 24831,
-    [166] = 25420,
-    [168] = 25452,
-    [169] = 25538,
-    [170] = 25567,
-    [171] = 25883,
-    [173] = 25958,
-    [174] = 26206,
-    [175] = 26260,
-    [177] = 26311,
-    [179] = 26530,
-    [180] = 27514,
-    [181] = 27592,
-    [182] = 27951,
+    [10] = 5914,
+    [11] = 6202,
+    [12] = 6231,
+    [14] = 6254,
+    [15] = 6370,
+    [16] = 6481,
+    [17] = 6613,
+    [20] = 6883,
+    [22] = 6948,
+    [24] = 7027,
+    [25] = 7223,
+    [26] = 7665,
+    [27] = 7787,
+    [29] = 7884,
+    [30] = 8001,
+    [31] = 8076,
+    [32] = 8381,
+    [34] = 8680,
+    [35] = 8953,
+    [36] = 9935,
+    [38] = 10164,
+    [39] = 10186,
+    [40] = 10212,
+    [41] = 10355,
+    [43] = 10407,
+    [44] = 10457,
+    [45] = 10482,
+    [46] = 10677,
+    [48] = 10786,
+    [50] = 10872,
+    [51] = 11092,
+    [52] = 11739,
+    [55] = 11825,
+    [56] = 11896,
+    [57] = 11925,
+    [58] = 11941,
+    [59] = 11958,
+    [60] = 11983,
+    [61] = 12005,
+    [62] = 12044,
+    [63] = 12104,
+    [64] = 12208,
+    [65] = 12226,
+    [66] = 12273,
+    [67] = 12330,
+    [68] = 12362,
+    [69] = 12448,
+    [70] = 12481,
+    [71] = 12500,
+    [72] = 12561,
+    [73] = 12579,
+    [74] = 12637,
+    [75] = 12674,
+    [76] = 12696,
+    [77] = 12731,
+    [78] = 12781,
+    [79] = 12803,
+    [80] = 12823,
+    [81] = 12868,
+    [82] = 12927,
+    [83] = 13024,
+    [84] = 13040,
+    [85] = 13062,
+    [86] = 13101,
+    [87] = 13119,
+    [88] = 13139,
+    [89] = 13155,
+    [90] = 13174,
+    [91] = 13233,
+    [92] = 13413,
+    [93] = 13481,
+    [94] = 14246,
+    [95] = 14283,
+    [98] = 14449,
+    [99] = 14493,
+    [100] = 14594,
+    [101] = 15004,
+    [102] = 15028,
+    [103] = 15116,
+    [104] = 15160,
+    [105] = 15201,
+    [106] = 15225,
+    [107] = 15272,
+    [108] = 15302,
+    [109] = 15493,
+    [110] = 15616,
+    [111] = 15738,
+    [112] = 15747,
+    [113] = 16020,
+    [114] = 16088,
+    [117] = 16179,
+    [118] = 16316,
+    [119] = 16469,
+    [120] = 16557,
+    [121] = 16685,
+    [122] = 16713,
+    [123] = 17034,
+    [125] = 17265,
+    [126] = 17625,
+    [127] = 18265,
+    [128] = 18274,
+    [129] = 18395,
+    [130] = 18425,
+    [131] = 18451,
+    [132] = 18477,
+    [133] = 18510,
+    [134] = 18538,
+    [135] = 18585,
+    [136] = 18628,
+    [139] = 18856,
+    [140] = 19144,
+    [141] = 19271,
+    [142] = 19553,
+    [143] = 19786,
+    [144] = 19823,
+    [145] = 19991,
+    [146] = 20142,
+    [147] = 20200,
+    [148] = 20220,
+    [149] = 21443,
+    [150] = 21865,
+    [151] = 22094,
+    [153] = 22111,
+    [155] = 22297,
+    [156] = 22555,
+    [157] = 22635,
+    [158] = 22931,
+    [159] = 22972,
+    [160] = 23421,
+    [161] = 23737,
+    [162] = 24218,
+    [163] = 24680,
+    [165] = 24940,
+    [166] = 25529,
+    [168] = 25561,
+    [169] = 25647,
+    [170] = 25676,
+    [171] = 25992,
+    [173] = 26067,
+    [174] = 26315,
+    [175] = 26369,
+    [177] = 26420,
+    [179] = 26639,
+    [180] = 27623,
+    [181] = 27701,
+    [182] = 28060,
 }
 
 

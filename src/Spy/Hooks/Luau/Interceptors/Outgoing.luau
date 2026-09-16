@@ -101,7 +101,10 @@ local function HandleLogging(TargetInstance: Instance, Method: string, OldFuncti
 	if not Log then
 		return OldFunction(...)
 	end
-	local Arguments = wax.shared.SafePack.Pack(select(2, ...))
+
+	-- Arguments are packed into a reusable scratch buffer: Log:Call deep-clones
+	-- them synchronously, so the buffer is free again right after the capture.
+	local Arguments = wax.shared.SafePack.PackFast(select(2, ...))
 
 	local CallingScript = getcallingscript()
 	local CallingFunction, CallingSource, CallingLine = GetCallerInfo()
@@ -118,6 +121,7 @@ local function HandleLogging(TargetInstance: Instance, Method: string, OldFuncti
 	local ShouldBlock = Log:ShouldBlock(Info)
 	Log:Call(Info)
 	if ShouldBlock then
+		wax.shared.SafePack.ReleaseFast(Arguments)
 		return
 	end
 
@@ -130,10 +134,17 @@ local function HandleLogging(TargetInstance: Instance, Method: string, OldFuncti
 	)
 
 	if IsRemoteFunctionInvoke or IsBindableFunctionInvoke then
-		
+
+		-- The invoke flow logs the arguments a second time, after the game
+		-- produced a result.  They must survive the call into the game, so
+		-- this (rare) path copies them into a stable table and returns the
+		-- scratch buffer first.
+		local StableArguments = wax.shared.SafePack.Copy(Arguments)
+		wax.shared.SafePack.ReleaseFast(Arguments)
+
 		Log = GetLog(TargetInstance, "Incoming", DebugId)
 		local RFResultInfo = {
-			Arguments = Arguments,
+			Arguments = StableArguments,
 			InvokeResult = nil,
 			Origin = CallingScript,
 			Function = CallingFunction,
@@ -151,6 +162,7 @@ local function HandleLogging(TargetInstance: Instance, Method: string, OldFuncti
 		return HandleLoggingResult(Log, RFResultInfo, "InvokeResult", OldFunction(...))
 	end
 
+	wax.shared.SafePack.ReleaseFast(Arguments)
 	return OldFunction(...)
 end
 

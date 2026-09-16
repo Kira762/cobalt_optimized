@@ -255,13 +255,16 @@ local function CreateConnectionFunction(Instance: InstancesToHook, Method: Metho
 			end
 		end
 
-		local Arguments = wax.shared.SafePack.Pack(...)
+		-- Arguments are packed into a reusable scratch buffer; every LogRemote
+		-- below deep-clones them synchronously, so the buffer is handed back
+		-- before this observer returns.
+		local Arguments = wax.shared.SafePack.PackFast(...)
 		local TargetLog, TargetCallIndex
 
 		-- Resolved once for the whole invocation (used to be one per entry).
 		local CallingScript = getcallingscript()
 
-		
+
 		if CachedConnectionInfo.HasValidConnections then
 			for _, Entry in CachedConnectionInfo.Entries do
 				TargetLog, TargetCallIndex = select(2, LogRemote(Instance, Entry.Function, {
@@ -304,6 +307,8 @@ local function CreateConnectionFunction(Instance: InstancesToHook, Method: Metho
 				)
 			end
 		end
+
+		wax.shared.SafePack.ReleaseFast(Arguments)
 	end
 
 	local OriginalEnvironment = getfenv(ConnectionFunction)

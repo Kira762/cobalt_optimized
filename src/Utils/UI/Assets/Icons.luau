@@ -33,12 +33,26 @@ end)
 local IconCache = {}
 
 function Icons.GetIcon(iconName: string): Icon?
+	-- Context-menu options and dropdown entries do not always carry an icon
+	-- (e.g. array-style dropdown values such as the interface-scale list), so
+	-- SetIcon is routinely called with nil. A nil *read* is harmless in Luau,
+	-- but once the remote module has loaded (request available) the miss
+	-- branch below would *write* IconCache[nil] and abort the whole load with
+	-- "table index is nil". Treat a missing name as a missing icon instead.
+	if iconName == nil then
+		return nil
+	end
+
 	local Cached = IconCache[iconName]
 	if Cached ~= nil then
 		return Cached or nil
 	end
 
-	if not Success then
+	-- A 200 response with an empty or unexpected body still sets Success (e.g.
+	-- loadstring("")() returns nil), leaving IconsModule unusable. Evaluating
+	-- IconsModule.GetAsset would then throw *outside* the pcall below, so bail
+	-- out here: a missing icon must never abort the interface load.
+	if not Success or type(IconsModule) ~= "table" or type(IconsModule.GetAsset) ~= "function" then
 		return nil
 	end
 

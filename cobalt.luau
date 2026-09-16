@@ -15729,12 +15729,26 @@ end)
 local IconCache = {}
 
 function Icons.GetIcon(iconName: string): Icon?
+	-- Context-menu options and dropdown entries do not always carry an icon
+	-- (e.g. array-style dropdown values such as the interface-scale list), so
+	-- SetIcon is routinely called with nil. A nil *read* is harmless in Luau,
+	-- but once the remote module has loaded (request available) the miss
+	-- branch below would *write* IconCache[nil] and abort the whole load with
+	-- "table index is nil". Treat a missing name as a missing icon instead.
+	if iconName == nil then
+		return nil
+	end
+
 	local Cached = IconCache[iconName]
 	if Cached ~= nil then
 		return Cached or nil
 	end
 
-	if not Success then
+	-- A 200 response with an empty or unexpected body still sets Success (e.g.
+	-- loadstring("")() returns nil), leaving IconsModule unusable. Evaluating
+	-- IconsModule.GetAsset would then throw *outside* the pcall below, so bail
+	-- out here: a missing icon must never abort the interface load.
+	if not Success or type(IconsModule) ~= "table" or type(IconsModule.GetAsset) ~= "function" then
 		return nil
 	end
 
@@ -29191,60 +29205,60 @@ local LineOffsets = {
     [113] = 15538,
     [114] = 15606,
     [117] = 15697,
-    [118] = 15774,
-    [119] = 16171,
-    [120] = 16268,
-    [121] = 16387,
-    [122] = 16415,
-    [123] = 16736,
-    [125] = 16957,
-    [126] = 17317,
-    [127] = 17957,
-    [128] = 17966,
-    [129] = 18087,
-    [130] = 18117,
-    [131] = 18143,
-    [132] = 18169,
-    [133] = 18202,
-    [134] = 18230,
-    [135] = 18277,
-    [136] = 18320,
-    [139] = 18548,
-    [140] = 18836,
-    [141] = 18963,
-    [142] = 19245,
-    [143] = 19478,
-    [144] = 19508,
-    [145] = 19676,
-    [146] = 19827,
-    [147] = 19885,
-    [148] = 19905,
-    [149] = 21129,
-    [150] = 21551,
-    [151] = 21780,
-    [153] = 21797,
-    [155] = 21983,
-    [156] = 22241,
-    [157] = 22321,
-    [158] = 22617,
-    [159] = 22658,
-    [160] = 23107,
-    [161] = 23423,
-    [162] = 23904,
-    [163] = 24366,
-    [165] = 24626,
-    [166] = 25211,
-    [168] = 25243,
-    [169] = 25329,
-    [170] = 25358,
-    [171] = 25674,
-    [173] = 25749,
-    [174] = 25997,
-    [175] = 26051,
-    [177] = 26102,
-    [179] = 26321,
-    [180] = 27303,
-    [181] = 27381,
+    [118] = 15788,
+    [119] = 16185,
+    [120] = 16282,
+    [121] = 16401,
+    [122] = 16429,
+    [123] = 16750,
+    [125] = 16971,
+    [126] = 17331,
+    [127] = 17971,
+    [128] = 17980,
+    [129] = 18101,
+    [130] = 18131,
+    [131] = 18157,
+    [132] = 18183,
+    [133] = 18216,
+    [134] = 18244,
+    [135] = 18291,
+    [136] = 18334,
+    [139] = 18562,
+    [140] = 18850,
+    [141] = 18977,
+    [142] = 19259,
+    [143] = 19492,
+    [144] = 19522,
+    [145] = 19690,
+    [146] = 19841,
+    [147] = 19899,
+    [148] = 19919,
+    [149] = 21143,
+    [150] = 21565,
+    [151] = 21794,
+    [153] = 21811,
+    [155] = 21997,
+    [156] = 22255,
+    [157] = 22335,
+    [158] = 22631,
+    [159] = 22672,
+    [160] = 23121,
+    [161] = 23437,
+    [162] = 23918,
+    [163] = 24380,
+    [165] = 24640,
+    [166] = 25225,
+    [168] = 25257,
+    [169] = 25343,
+    [170] = 25372,
+    [171] = 25688,
+    [173] = 25763,
+    [174] = 26011,
+    [175] = 26065,
+    [177] = 26116,
+    [179] = 26335,
+    [180] = 27317,
+    [181] = 27395,
 }
 
 

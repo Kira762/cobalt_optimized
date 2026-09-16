@@ -11,14 +11,16 @@ local KIND_ID_URI: { [number]: (number) -> string } = {
 	[3] = function(id)
 		return "rbxassetid://" .. tostring(id)
 	end,
+	-- Numeric content kinds are normalized to the local Roblox id form.  Cobalt
+	-- displays and serializes the value but never resolves it through HTTP.
 	[11] = function(id)
-		return "http://www.roblox.com/asset/?id=" .. tostring(id)
+		return "rbxassetid://" .. tostring(id)
 	end,
 	[13] = function(id)
-		return "https://www.roblox.com/asset/?id=" .. tostring(id)
+		return "rbxassetid://" .. tostring(id)
 	end,
 	[21] = function(id)
-		return "https://assetdelivery.roblox.com/v1/asset/?id=" .. tostring(id)
+		return "rbxassetid://" .. tostring(id)
 	end,
 }
 

@@ -1,4 +1,9 @@
-local Interface = {}
+local Interface = {
+	-- Borders are decorative, but every UIStroke is another rendered object and
+	-- another property update when rows are recycled. Keep one switch here so
+	-- built-in and plugin-created nested UI use the same low-cost style.
+	DecorativeOutlinesEnabled = false,
+}
 local Icons = require(script.Parent.Assets.Icons)
 local AssetManager = require(script.Parent.Assets.Manager)
 
@@ -59,6 +64,10 @@ function Interface.New(ClassName: string, Properties: { [string | number]: any }
 	end
 
 	for Key, Value in pairs(Properties or {}) do
+		if Key == "UIStroke" and not Interface.DecorativeOutlinesEnabled then
+			continue
+		end
+
 		if typeof(Value) == "table" then
 			local SubObject = Interface.New(Key, Value)
 			SubObject.Parent = Object

@@ -232,7 +232,9 @@ function Animations.Cancel(object, ResetScale: boolean?)
 end
 
 function Animations.IsEnabled(): boolean
-	return GetBooleanSetting("AnimationsEnabled", true) ~= false
+	-- Instant transitions are the safe default for a remote-spy UI: they avoid
+	-- creating a tween for every hover and every newly visible row.
+	return GetBooleanSetting("AnimationsEnabled", false) == true
 end
 
 function Animations.SetEnabled(Enabled: boolean)

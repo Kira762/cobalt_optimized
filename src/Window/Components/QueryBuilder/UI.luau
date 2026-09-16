@@ -438,7 +438,7 @@ local function CreateScrollableRow(Parent: GuiObject, LayoutOrder: number)
 	end)
 
 	UpdateCanvasSize()
-	return Row, Content, Content.UIStroke, UpdateCanvasSize
+	return Row, Content, UpdateCanvasSize
 end
 
 function UI.new(Dialog: Dialog, props: QueryBuilderProps, ContextMenu: any, Operators: Validator): QueryBuilder
@@ -470,7 +470,7 @@ function UI.new(Dialog: Dialog, props: QueryBuilderProps, ContextMenu: any, Oper
 		Padding = UDim.new(0, 6),
 		Parent = RemoteRight,
 	})
-	local _, RemoteDisplay, _, UpdateRemoteDisplay = CreateScrollableRow(RemoteRight, 0)
+	local _, RemoteDisplay, UpdateRemoteDisplay = CreateScrollableRow(RemoteRight, 0)
 
 	local ExactRemote = if props.Target.Type == "Instance" then props.Target.Remote else props.SampleRemote
 	local ScopeOptions = table.clone(Scopes)
@@ -606,10 +606,10 @@ function UI.new(Dialog: Dialog, props: QueryBuilderProps, ContextMenu: any, Oper
 		WhereLeft.Size = UDim2.new(0, 0, 0, 35 * (#Builder.Conditions + 1) + (Builder.IsValid and 0 or 28))
 
 		for Index, RowData in Builder.ConditionRows do
-			RowData.Stroke.Color = if ConflictingRows[Index] then ErrorColor else BorderColor
+			RowData.Content.BackgroundColor3 = if ConflictingRows[Index] then Color3.fromRGB(48, 24, 24) else BackgroundColor
 		end
 		for Index, RowData in TargetConditionRows do
-			RowData.Stroke.Color = if TargetConflictingRows[Index] then ErrorColor else BorderColor
+			RowData.Content.BackgroundColor3 = if TargetConflictingRows[Index] then Color3.fromRGB(48, 24, 24) else BackgroundColor
 		end
 
 		if props.OnValidationChanged then
@@ -664,7 +664,7 @@ function UI.new(Dialog: Dialog, props: QueryBuilderProps, ContextMenu: any, Oper
 	})
 
 	local function CreateTargetConditionRow(Data: QueryRemoteCondition, Index: number)
-		local Row, Content, Stroke, UpdateCanvasSize = CreateScrollableRow(TargetRows, Index)
+		local Row, Content, UpdateCanvasSize = CreateScrollableRow(TargetRows, Index)
 
 		local JoinSeparator = CreateSeparator(Content, -1)
 		local Join = CreateSelect({
@@ -802,7 +802,7 @@ function UI.new(Dialog: Dialog, props: QueryBuilderProps, ContextMenu: any, Oper
 
 		table.insert(TargetConditionRows, {
 			Row = Row,
-			Stroke = Stroke,
+			Content = Content,
 			UpdateCanvasSize = UpdateCanvasSize,
 		})
 		UpdateCanvasSize()
@@ -856,7 +856,7 @@ function UI.new(Dialog: Dialog, props: QueryBuilderProps, ContextMenu: any, Oper
 		})
 		table.insert(self.Conditions, Data)
 
-		local Row, Content, ContentStroke, UpdateCanvasSize = CreateScrollableRow(Rows, #self.Conditions - 1)
+		local Row, Content, UpdateCanvasSize = CreateScrollableRow(Rows, #self.Conditions - 1)
 
 		local JoinSeparator = CreateSeparator(Content, -1)
 		local Join = CreateSelect({
@@ -1098,7 +1098,6 @@ function UI.new(Dialog: Dialog, props: QueryBuilderProps, ContextMenu: any, Oper
 		local RowData = {
 			Row = Row,
 			Content = Content,
-			Stroke = ContentStroke,
 			Join = Join,
 			JoinContainer = JoinContainer,
 			JoinSeparator = JoinSeparator,

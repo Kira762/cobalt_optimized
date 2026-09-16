@@ -618,12 +618,12 @@ if CheckFFlagValue("DebugRunParallelLuaOnMainThread", false) and not ExecutorSup
 end
 
 function ExecutorSupport.ValidateCustomAssets(AssetManager)
-	test("getcustomasset", function()
-		assert(typeof(getcustomasset) == "function", "getcustomasset is not a function")
-
-		local Success, Error = AssetManager.ValidateCustomFonts()
-		assert(Success, Error)
-	end, { Essential = false })
+	-- Assets are repository-local now.  Do not probe executor download helpers
+	-- during boot; packaged Roblox font fallbacks work without them.
+	local Success, Error = AssetManager.ValidateCustomFonts()
+	if not Success then
+		warn(`Cobalt: local asset validation failed: {Error}`)
+	end
 end
 
 return ExecutorSupport

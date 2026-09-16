@@ -67,6 +67,7 @@ return function(Options: Options?)
 
 		local IgnorePlayerModule = wax.shared.SaveManager:GetState("IgnorePlayerModule")
 		local LogBlockedRemotes = wax.shared.SaveManager:GetState("LogBlockedRemotes")
+		local AutoIgnoreSpammyEvents = wax.shared.SaveManager:GetState("AutoIgnoreSpammyEvents")
 		local IngoredRemotesDropdown = wax.shared.SaveManager:GetState("IgnoredRemotesDropdown")
 		local LogRobloxInternalEvents = wax.shared.SaveManager:GetState("LogRobloxInternalEvents")
 
@@ -83,6 +84,7 @@ return function(Options: Options?)
 			LogRobloxInternalEvents = LogRobloxInternalEvents,
 			IgnorePlayerModule = IgnorePlayerModule,
 			LogBlockedRemotes = LogBlockedRemotes,
+			AutoIgnoreSpammyEvents = AutoIgnoreSpammyEvents,
 			IgnoredRemotesDropdown = IngoredRemotesDropdown,
 
 			

@@ -33,6 +33,10 @@ import sys
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 COBALT = ROOT / "cobalt.luau"
 REF_MAP = ROOT / "lib" / "ref_map.luau"
+SESSION_TEMPLATE = ROOT / "src" / "Utils" / "CodeGen" / "Templates" / "SessionHTMLView.html"
+SESSION_MARKER = '"SessionHTMLView",\n'
+ACTOR_LOG_SOURCE = ROOT / "src" / "Utils" / "Log.luau"
+ACTOR_ENVIRONMENT_MARKER = '"Environment",\n'
 
 CLOSURE_START = "local ClosureBindings = {"
 OBJECT_TREE_START = "local ObjectTree = {"
@@ -54,6 +58,157 @@ def read_source(path: str) -> str:
     # Trim blank lines at both ends so the body starts exactly one line below the
     # closure header and the closing `end)(...) end,` stays on its own line.
     return text.strip("\n")
+
+
+def lua_quote(value: str) -> str:
+    """Quote UTF-8 text as a Luau double-quoted string.
+
+    ObjectTree stores the HTML as a normal Lua string rather than reading a
+    second file at runtime. Decimal byte escapes keep the generated object tree
+    portable across executors with different source encodings.
+    """
+    out = ['"']
+    for byte in value.encode("utf-8"):
+        if byte == 10:
+            out.append("\\n")
+        elif byte == 13:
+            out.append("\\r")
+        elif byte == 9:
+            out.append("\\t")
+        elif byte == 92:
+            out.append("\\\\")
+        elif byte == 34:
+            out.append('\\"')
+        elif 32 <= byte <= 126:
+            out.append(chr(byte))
+        else:
+            out.append("\\%03d" % byte)
+    out.append('"')
+    return "".join(out)
+
+
+def find_value_span(object_tree: str, marker: str) -> tuple[int, int]:
+    """Return the content span of a serialized `Value = "..."` field."""
+    # ObjectTree also contains an enum entry named Environment; the serialized
+    # ModuleScript is the last matching node and is the one with a Value field.
+    marker_index = object_tree.rfind(marker)
+    if marker_index < 0:
+        raise AssertionError(f"object-tree marker is missing: {marker!r}")
+
+    prefix = 'Value = "'
+    value_start = object_tree.find(prefix, marker_index) + len(prefix)
+    if value_start < len(prefix):
+        raise AssertionError(f"Value field is missing after {marker!r}")
+
+    escaped = False
+    index = value_start
+    # Recover from an early synchronizer version that emitted a second opening
+    # quote for the session template.
+    if object_tree.startswith('"<!DOCTYPE html>', value_start):
+        index += 1
+    while index < len(object_tree):
+        char = object_tree[index]
+        if char == '"' and not escaped:
+            return value_start, index
+        if char == "\\" and not escaped:
+            escaped = True
+        else:
+            escaped = False
+        index += 1
+
+    raise AssertionError(f"serialized Value field is unterminated after {marker!r}")
+
+
+def decode_lua_string(raw: str) -> str:
+    """Decode the small Lua escape subset emitted by the object-tree builder."""
+    out: list[str] = []
+    index = 0
+    escapes = {"n": "\n", "r": "\r", "t": "\t", '"': '"', "\\": "\\"}
+    while index < len(raw):
+        char = raw[index]
+        index += 1
+        if char != "\\":
+            out.append(char)
+            continue
+        if index >= len(raw):
+            raise AssertionError("dangling escape in serialized Value")
+        char = raw[index]
+        index += 1
+        if char in escapes:
+            out.append(escapes[char])
+        elif char.isdigit():
+            digits = char
+            while len(digits) < 3 and index < len(raw) and raw[index].isdigit():
+                digits += raw[index]
+                index += 1
+            out.append(chr(int(digits)))
+        else:
+            out.append(char)
+    return "".join(out)
+
+
+def replace_serialized_value(object_tree: str, marker: str, value: str) -> str:
+    start, end = find_value_span(object_tree, marker)
+    quoted = lua_quote(value)
+    return object_tree[:start] + quoted[1:-1] + object_tree[end:]
+
+
+def sync_session_template(object_tree: str) -> str:
+    """Keep the serialized SessionHTMLView in sync with its editable template."""
+    template = SESSION_TEMPLATE.read_text().replace("\r\n", "\n")
+    return replace_serialized_value(object_tree, SESSION_MARKER, template)
+
+
+def sync_actor_environment(object_tree: str) -> str:
+    """Propagate hot-path actor changes into the virtual actor source.
+
+    Actors execute the `Environment.Value` stored in ObjectTree, not the
+    ModuleScript closure alone. The build system normally expands include
+    regions into that value, so replace only the generated Log region and the
+    small actor-data declarations while preserving its generated scaffolding.
+    """
+    start, end = find_value_span(object_tree, ACTOR_ENVIRONMENT_MARKER)
+    embedded = decode_lua_string(object_tree[start:end])
+    source = ACTOR_LOG_SOURCE.read_text().replace("\r\n", "\n").strip("\n")
+
+    actor_data_old = (
+        "\tLogBlockedRemotes: boolean,\n"
+        "\tIgnoredRemotesDropdown: { [string]: boolean },"
+    )
+    actor_data_new = (
+        "\tLogBlockedRemotes: boolean,\n"
+        "\tAutoIgnoreSpammyEvents: boolean,\n"
+        "\tIgnoredRemotesDropdown: { [string]: boolean },"
+    )
+    if actor_data_old in embedded and "AutoIgnoreSpammyEvents: boolean" not in embedded:
+        embedded = embedded.replace(actor_data_old, actor_data_new, 1)
+
+    settings_old = (
+        "\t\tLogBlockedRemotes = { Value = Data.LogBlockedRemotes },\n"
+        "\t\tIgnoredRemotesDropdown = { Value = Data.IgnoredRemotesDropdown },"
+    )
+    settings_new = (
+        "\t\tLogBlockedRemotes = { Value = Data.LogBlockedRemotes },\n"
+        "\t\tAutoIgnoreSpammyEvents = { Value = Data.AutoIgnoreSpammyEvents },\n"
+        "\t\tIgnoredRemotesDropdown = { Value = Data.IgnoredRemotesDropdown },"
+    )
+    if settings_old in embedded and "AutoIgnoreSpammyEvents = { Value = Data.AutoIgnoreSpammyEvents }" not in embedded:
+        embedded = embedded.replace(settings_old, settings_new, 1)
+
+    log_start = embedded.find("do\n\tlocal Log = {}\n")
+    log_end = embedded.find("\nend\n--#endregion", log_start)
+    if log_start < 0 or log_end < 0:
+        raise AssertionError("generated actor Log region is missing")
+    log_end += len("\nend")
+
+    log_source = source
+    if not log_source.endswith("return Log"):
+        raise AssertionError("actor Log source must end with `return Log`")
+    log_source = log_source[: -len("return Log")] + "wax.shared.Log = Log"
+    indented_log = "\n".join("\t" + line if line else "" for line in log_source.split("\n"))
+    embedded = embedded[:log_start] + "do\n" + indented_log + "\nend" + embedded[log_end:]
+
+    return replace_serialized_value(object_tree, ACTOR_ENVIRONMENT_MARKER, embedded)
 
 
 def build_closures(ref_map: dict[int, str], closure_start_line: int) -> tuple[str, dict[int, int]]:
@@ -155,7 +310,9 @@ def main() -> int:
     args = ap.parse_args()
 
     current = COBALT.read_text()
-    new = bundle(current)
+    synced = sync_actor_environment(current)
+    synced = sync_session_template(synced)
+    new = bundle(synced)
     verify(new)
 
     if args.check:

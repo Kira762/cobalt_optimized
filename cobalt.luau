@@ -5424,74 +5424,93 @@ local function CreateConnectionFunction(Instance: InstancesToHook, Method: Metho
 	local CachedConnectionInfo = nil
 	local CachedConnectionCount = -1
 
+	-- getconnections() is the single most expensive executor call on the
+	-- incoming path, and a remote's connection set rarely changes mid-burst,
+	-- so it is refreshed at most once per expiry window per remote.  Between
+	-- refreshes the cached entries are reused as-is; a connection added
+	-- inside the window is picked up by the next refresh.
+	local ConnectionCacheExpiry = 0.2
+	local CachedConnections = nil
+	local CachedConnectionsAt = 0
+
 	local DebugId = wax.shared.GetDebugId(Instance)
 
+	local function BuildConnectionInformation(Connections)
+		local Information = {
+			HasValidConnections = false,
+			HasForeignLuaConnections = false,
+			Entries = {},
+		}
+
+		for _, Connection in Connections do
+			-- Skip connections that are in a foreign state
+			if Connection.ForeignState then
+				-- Check if the connection is a LuaConnection
+				if Connection.LuaConnection then
+					Information.HasForeignLuaConnections = true
+				end
+
+				continue
+			end
+
+			-- Skip Cobalt's own connection functions
+			local Function = typeof(Connection.Function) == "function" and (Connection.Function) or (nil)
+			if IsCobaltConnectionFunction(Function) then
+				continue
+			end
+
+			Information.HasValidConnections = true
+
+			-- Resolve the originating script from the thread or environment
+			local Thread = Connection.Thread
+			local Origin = nil
+
+			if Thread and getscriptfromthread then
+				Origin = getscriptfromthread(Thread)
+			end
+
+			if not Origin and Function then
+				-- The environment script fallback: getcallingscript is not
+				-- usable here (this runs inside our own observer).
+
+				local Script = rawget(getfenv(Function), "script")
+				if typeof(Script) == "Instance" then
+					Origin = Script
+				end
+			end
+
+			table.insert(Information.Entries, {
+				Function = Function,
+				Origin = Origin,
+				IsExecutor = Function and isexecutorclosure(Function) or false,
+			})
+		end
+
+		return Information
+	end
+
 	local ConnectionFunction = function(...)
-		
+		-- If this log is ignored, don't process the event
 		local ExistingLog = wax.shared.Logs.Incoming[DebugId]
 		if ExistingLog and ExistingLog.Ignored then
 			return
 		end
 
-		local Signal = (Instance :: any)[Method]
-		local Connections = getconnections(Signal)
-		local ConnectionCount = #Connections
+		-- Refresh the connection listing at most once per expiry window; every
+		-- other fire of this remote reuses the cached entries without paying
+		-- for a getconnections() round-trip.
+		local Now = os.clock()
+		if not CachedConnections or Now - CachedConnectionsAt >= ConnectionCacheExpiry then
+			local Signal = (Instance :: any)[Method]
+			CachedConnections = getconnections(Signal)
+			CachedConnectionsAt = Now
 
-		
-		if ConnectionCount ~= CachedConnectionCount then
-			CachedConnectionCount = ConnectionCount
-
-			local Information = {
-				HasValidConnections = false,
-				HasForeignLuaConnections = false,
-				Entries = {},
-			}
-
-			for _, Connection in Connections do
-				
-				if Connection.ForeignState then
-					
-					if Connection.LuaConnection then
-						Information.HasForeignLuaConnections = true
-					end
-
-					continue
-				end
-
-				
-				local Function = typeof(Connection.Function) == "function" and (Connection.Function) or (nil)
-				if IsCobaltConnectionFunction(Function) then
-					continue
-				end
-
-				Information.HasValidConnections = true
-
-				
-				local Thread = Connection.Thread
-				local Origin = nil
-
-				if Thread and getscriptfromthread then
-					Origin = getscriptfromthread(Thread)
-				end
-
-				if not Origin and Function then
-					
-					
-
-					local Script = rawget(getfenv(Function), "script")
-					if typeof(Script) == "Instance" then
-						Origin = Script
-					end
-				end
-
-				table.insert(Information.Entries, {
-					Function = Function,
-					Origin = Origin,
-					IsExecutor = Function and isexecutorclosure(Function) or false,
-				})
+			-- Rebuild the connection info if the count changed
+			local ConnectionCount = #CachedConnections
+			if ConnectionCount ~= CachedConnectionCount then
+				CachedConnectionCount = ConnectionCount
+				CachedConnectionInfo = BuildConnectionInformation(CachedConnections)
 			end
-
-			CachedConnectionInfo = Information
 		end
 
 		local Arguments = wax.shared.SafePack.Pack(...)
@@ -29627,152 +29646,152 @@ local LineOffsets = {
     [5] = 1304,
     [7] = 1683,
     [9] = 5260,
-    [10] = 5890,
-    [11] = 6166,
-    [12] = 6195,
-    [14] = 6218,
-    [15] = 6334,
-    [16] = 6445,
-    [17] = 6577,
-    [20] = 6847,
-    [22] = 6912,
-    [24] = 6991,
-    [25] = 7187,
-    [26] = 7629,
-    [27] = 7751,
-    [29] = 7848,
-    [30] = 7965,
-    [31] = 8040,
-    [32] = 8345,
-    [34] = 8644,
-    [35] = 8917,
-    [36] = 9899,
-    [38] = 10128,
-    [39] = 10150,
-    [40] = 10176,
-    [41] = 10319,
-    [43] = 10371,
-    [44] = 10421,
-    [45] = 10446,
-    [46] = 10641,
-    [48] = 10750,
-    [50] = 10836,
-    [51] = 11056,
-    [52] = 11703,
-    [55] = 11789,
-    [56] = 11860,
-    [57] = 11889,
-    [58] = 11905,
-    [59] = 11922,
-    [60] = 11947,
-    [61] = 11969,
-    [62] = 12008,
-    [63] = 12068,
-    [64] = 12172,
-    [65] = 12190,
-    [66] = 12237,
-    [67] = 12294,
-    [68] = 12326,
-    [69] = 12412,
-    [70] = 12445,
-    [71] = 12464,
-    [72] = 12525,
-    [73] = 12543,
-    [74] = 12601,
-    [75] = 12638,
-    [76] = 12660,
-    [77] = 12695,
-    [78] = 12745,
-    [79] = 12767,
-    [80] = 12787,
-    [81] = 12832,
-    [82] = 12891,
-    [83] = 12988,
-    [84] = 13004,
-    [85] = 13026,
-    [86] = 13065,
-    [87] = 13083,
-    [88] = 13103,
-    [89] = 13119,
-    [90] = 13138,
-    [91] = 13197,
-    [92] = 13377,
-    [93] = 13445,
-    [94] = 14210,
-    [95] = 14247,
-    [98] = 14413,
-    [99] = 14457,
-    [100] = 14558,
-    [101] = 14968,
-    [102] = 14992,
-    [103] = 15080,
-    [104] = 15124,
-    [105] = 15165,
-    [106] = 15189,
-    [107] = 15236,
-    [108] = 15266,
-    [109] = 15457,
-    [110] = 15488,
-    [111] = 15610,
-    [112] = 15619,
-    [113] = 15892,
-    [114] = 15960,
-    [117] = 16051,
-    [118] = 16188,
-    [119] = 16341,
-    [120] = 16429,
-    [121] = 16557,
-    [122] = 16585,
-    [123] = 16906,
-    [125] = 17137,
-    [126] = 17497,
-    [127] = 18137,
-    [128] = 18146,
-    [129] = 18267,
-    [130] = 18297,
-    [131] = 18323,
-    [132] = 18349,
-    [133] = 18382,
-    [134] = 18410,
-    [135] = 18457,
-    [136] = 18500,
-    [139] = 18728,
-    [140] = 19016,
-    [141] = 19143,
-    [142] = 19425,
-    [143] = 19658,
-    [144] = 19695,
-    [145] = 19863,
-    [146] = 20014,
-    [147] = 20072,
-    [148] = 20092,
-    [149] = 21315,
-    [150] = 21737,
-    [151] = 21966,
-    [153] = 21983,
-    [155] = 22169,
-    [156] = 22427,
-    [157] = 22507,
-    [158] = 22803,
-    [159] = 22844,
-    [160] = 23293,
-    [161] = 23609,
-    [162] = 24090,
-    [163] = 24552,
-    [165] = 24812,
-    [166] = 25399,
-    [168] = 25431,
-    [169] = 25517,
-    [170] = 25546,
-    [171] = 25862,
-    [173] = 25937,
-    [174] = 26185,
-    [175] = 26239,
-    [177] = 26290,
-    [179] = 26509,
-    [180] = 27491,
-    [181] = 27569,
-    [182] = 27927,
+    [10] = 5909,
+    [11] = 6185,
+    [12] = 6214,
+    [14] = 6237,
+    [15] = 6353,
+    [16] = 6464,
+    [17] = 6596,
+    [20] = 6866,
+    [22] = 6931,
+    [24] = 7010,
+    [25] = 7206,
+    [26] = 7648,
+    [27] = 7770,
+    [29] = 7867,
+    [30] = 7984,
+    [31] = 8059,
+    [32] = 8364,
+    [34] = 8663,
+    [35] = 8936,
+    [36] = 9918,
+    [38] = 10147,
+    [39] = 10169,
+    [40] = 10195,
+    [41] = 10338,
+    [43] = 10390,
+    [44] = 10440,
+    [45] = 10465,
+    [46] = 10660,
+    [48] = 10769,
+    [50] = 10855,
+    [51] = 11075,
+    [52] = 11722,
+    [55] = 11808,
+    [56] = 11879,
+    [57] = 11908,
+    [58] = 11924,
+    [59] = 11941,
+    [60] = 11966,
+    [61] = 11988,
+    [62] = 12027,
+    [63] = 12087,
+    [64] = 12191,
+    [65] = 12209,
+    [66] = 12256,
+    [67] = 12313,
+    [68] = 12345,
+    [69] = 12431,
+    [70] = 12464,
+    [71] = 12483,
+    [72] = 12544,
+    [73] = 12562,
+    [74] = 12620,
+    [75] = 12657,
+    [76] = 12679,
+    [77] = 12714,
+    [78] = 12764,
+    [79] = 12786,
+    [80] = 12806,
+    [81] = 12851,
+    [82] = 12910,
+    [83] = 13007,
+    [84] = 13023,
+    [85] = 13045,
+    [86] = 13084,
+    [87] = 13102,
+    [88] = 13122,
+    [89] = 13138,
+    [90] = 13157,
+    [91] = 13216,
+    [92] = 13396,
+    [93] = 13464,
+    [94] = 14229,
+    [95] = 14266,
+    [98] = 14432,
+    [99] = 14476,
+    [100] = 14577,
+    [101] = 14987,
+    [102] = 15011,
+    [103] = 15099,
+    [104] = 15143,
+    [105] = 15184,
+    [106] = 15208,
+    [107] = 15255,
+    [108] = 15285,
+    [109] = 15476,
+    [110] = 15507,
+    [111] = 15629,
+    [112] = 15638,
+    [113] = 15911,
+    [114] = 15979,
+    [117] = 16070,
+    [118] = 16207,
+    [119] = 16360,
+    [120] = 16448,
+    [121] = 16576,
+    [122] = 16604,
+    [123] = 16925,
+    [125] = 17156,
+    [126] = 17516,
+    [127] = 18156,
+    [128] = 18165,
+    [129] = 18286,
+    [130] = 18316,
+    [131] = 18342,
+    [132] = 18368,
+    [133] = 18401,
+    [134] = 18429,
+    [135] = 18476,
+    [136] = 18519,
+    [139] = 18747,
+    [140] = 19035,
+    [141] = 19162,
+    [142] = 19444,
+    [143] = 19677,
+    [144] = 19714,
+    [145] = 19882,
+    [146] = 20033,
+    [147] = 20091,
+    [148] = 20111,
+    [149] = 21334,
+    [150] = 21756,
+    [151] = 21985,
+    [153] = 22002,
+    [155] = 22188,
+    [156] = 22446,
+    [157] = 22526,
+    [158] = 22822,
+    [159] = 22863,
+    [160] = 23312,
+    [161] = 23628,
+    [162] = 24109,
+    [163] = 24571,
+    [165] = 24831,
+    [166] = 25418,
+    [168] = 25450,
+    [169] = 25536,
+    [170] = 25565,
+    [171] = 25881,
+    [173] = 25956,
+    [174] = 26204,
+    [175] = 26258,
+    [177] = 26309,
+    [179] = 26528,
+    [180] = 27510,
+    [181] = 27588,
+    [182] = 27946,
 }
 
 

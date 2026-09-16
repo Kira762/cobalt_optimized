@@ -2,10 +2,9 @@
 """Generate a Luau harness that loads every ModuleScript in cobalt.luau through
 the bundle's real LoadScript(), then prints how many actually executed.
 
-The harness runs cobalt.luau exactly the way an executor does -
-`loadstring(source)()` - with `readfile` wired to fail and `require` wired to
-reject strings, i.e. the *remote* case: nothing on disk, no `@lib` aliases.
-That is the configuration `loadstring(game:HttpGet(...))()` runs in.
+The harness runs cobalt.luau with `readfile` wired to fail and `require`
+wired to reject strings. This exercises the self-contained bundle without
+assuming that the source tree or local assets are present.
 
   python3 tools/modulecheck.py <cobalt.luau> <out.luau>
   luau <out.luau>
@@ -58,7 +57,6 @@ game = {
         if not Services[name] then Services[name] = NewInstance(name) end
         return Services[name]
     end,
-    HttpGet = function(_, url) RealError("HttpGet stub: " .. tostring(url)) end,
 }
 Services.HttpService = setmetatable({ __class = "HttpService" }, {
     __index = function(_, k)
@@ -127,9 +125,6 @@ function replaceclosure() end
 function getaddress() return "0x0" end
 function getcallbackvalue() return nil end
 function setfflag() end
-function request() return { StatusCode = 200, Body = "" } end
-http_request = request
-
 task = {
     spawn = function(f, ...) pcall(f, ...) end,
     defer = function() end,
@@ -231,7 +226,7 @@ local okKnown, knownIcon = pcall(Icons.GetIcon, "chevron-down")
 assert(okKnown, "REGRESSION: GetIcon(valid) errored with unusable icon module: " .. tostring(knownIcon))
 assert(knownIcon == nil, "REGRESSION: GetIcon(valid) must return nil when the icon module is unusable")
 print("icon nil-name regression check     : OK")
-print("RESULT: OK - module bodies execute under the remote-load configuration")
+print("RESULT: OK - module bodies execute under the self-contained bundle configuration")
 if #failures > 0 then
     print("(the " .. #failures .. " errors below are missing executor APIs in this stub env, not load failures)")
     for _, f in ipairs(failures) do print("  env " .. f) end

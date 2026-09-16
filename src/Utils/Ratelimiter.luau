@@ -8,6 +8,10 @@ type RatelimiterOptions = {
 	MainCallback: (...any) -> ...any,
 	ShouldProcess: ((...any) -> boolean)?,
 	OnUnload: (() -> ())?,
+	-- A bounded queue is important for UI jobs: once a page is stale, waiting
+	-- behind thousands of old rows is worse than dropping a few rows.
+	MaxQueue: number?,
+	DropOldest: boolean?,
 }
 
 local Ratelimits = {}
@@ -15,7 +19,15 @@ local Ratelimiter = {}
 Ratelimiter.__index = Ratelimiter
 
 function Ratelimiter.new(Options: RatelimiterOptions)
+	assert(type(Options) == "table", "Ratelimiter options must be a table")
+	assert(type(Options.MainCallback) == "function", "Ratelimiter requires MainCallback")
+
 	local self = setmetatable(Options, Ratelimiter)
+	self.Burst = self.Burst or { Time = 0.1, Max = 1 }
+	self.Burst.Time = math.max(tonumber(self.Burst.Time) or 0.1, 0.001)
+	self.Burst.Max = math.max(math.floor(tonumber(self.Burst.Max) or 1), 1)
+	self.MaxQueue = self.MaxQueue and math.max(math.floor(self.MaxQueue), 1) or nil
+	self.DropOldest = self.DropOldest ~= false
 	self.Bucket = {}
 	self.Queue = {}
 	self.QueueHead = 1
@@ -39,13 +51,24 @@ function Ratelimiter.StopAll()
 	table.clear(Ratelimits)
 end
 
-function Ratelimiter:QueueOperation(...: any)
+function Ratelimiter:QueueOperation(...: any): boolean
 	if self.IsDestroyed then
-		return
+		return false
+	end
+
+	local Pending = self.QueueTail - self.QueueHead + 1
+	if self.MaxQueue and Pending >= self.MaxQueue then
+		if not self.DropOldest then
+			return false
+		end
+
+		self.Queue[self.QueueHead] = nil
+		self.QueueHead += 1
 	end
 
 	self.QueueTail += 1
 	self.Queue[self.QueueTail] = table.pack(...)
+	return true
 end
 
 function Ratelimiter:SetupManagerThread()
@@ -59,28 +82,27 @@ function Ratelimiter:SetupManagerThread()
 	self.QueueTail = 0
 
 	if self.ManagerThread then
-		task.cancel(self.ManagerThread)
+		pcall(task.cancel, self.ManagerThread)
 		self.ManagerThread = nil
 	end
 
 	if self.PeriodicThread then
-		task.cancel(self.PeriodicThread)
+		pcall(task.cancel, self.PeriodicThread)
 		self.PeriodicThread = nil
 	end
 
 	self.ManagerThread = task.spawn(function()
 		while not wax.shared.Unloaded and not self.IsDestroyed do
-			local CurrentTime = tick()
+			local CurrentTime = os.clock()
 			local DidWork = false
 
 			if #self.Bucket > 0 then
 				local NewBucket = {}
 				for _, Time in self.Bucket do
 					if CurrentTime - Time < self.Burst.Time then
-						table.insert(NewBucket, Time)
+						NewBucket[#NewBucket + 1] = Time
 					end
 				end
-
 				self.Bucket = NewBucket
 			end
 
@@ -90,33 +112,31 @@ function Ratelimiter:SetupManagerThread()
 				self.QueueHead += 1
 
 				if self.QueueHead > self.QueueTail then
-					self.Queue = {}
+					table.clear(self.Queue)
 					self.QueueHead = 1
 					self.QueueTail = 0
 				end
 
-				if TaskData and self.ShouldProcess and not self.ShouldProcess(table.unpack(TaskData, 1, TaskData.n)) then
-					continue
+				local ShouldRun = TaskData ~= nil
+				if ShouldRun and self.ShouldProcess then
+					local Success, Result = pcall(self.ShouldProcess, table.unpack(TaskData, 1, TaskData.n))
+					ShouldRun = Success and Result ~= false
 				end
 
-				if TaskData then
-					table.insert(self.Bucket, tick())
+				if ShouldRun then
+					self.Bucket[#self.Bucket + 1] = os.clock()
 					DidWork = true
-
 					task.defer(function()
 						if self.IsDestroyed then
 							return
 						end
-
-						self.MainCallback(table.unpack(TaskData, 1, TaskData.n))
+						pcall(self.MainCallback, table.unpack(TaskData, 1, TaskData.n))
 					end)
 				end
 			end
 
-			-- Stay frame-accurate while there is traffic, but back off when idle:
-			-- an unattended limiter no longer wakes the scheduler every frame
-			-- (which matters a lot on a phone), while still picking up new work
-			-- within a few frames.
+			-- Do not wake every frame when idle.  A bounded queue still picks up
+			-- new work quickly without turning an unused limiter into a heartbeat.
 			if DidWork or self.QueueHead <= self.QueueTail then
 				task.wait()
 			else
@@ -125,7 +145,7 @@ function Ratelimiter:SetupManagerThread()
 		end
 
 		if wax.shared.Unloaded and not self.IsDestroyed and self.OnUnload then
-			self.OnUnload()
+			pcall(self.OnUnload)
 		end
 	end)
 

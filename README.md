@@ -1,99 +1,82 @@
-# cobalt_optimized
+# Cobalt Optimized
 
-Modular source tree for Cobalt (upstream ships it as a single 25k-line `cobalt.luau`).
+Cobalt is a modular Luau remote inspector. `src/` is the source of truth and
+`cobalt.luau` is the generated, self-contained bundle used by the executor.
 
-`src/` is where you edit. `cobalt.luau` is the **generated** single-file bundle you
-actually execute — regenerate it with `python3 tools/bundle.py` after changing `src/`.
+This checkout is deliberately offline at runtime:
+
+- `assets/` contains the UI PNGs used by the local asset resolver.
+- External asset/module downloads were removed. Missing local images fall back to
+  the packaged Roblox asset ids and fonts use their packaged font ids.
+- `loader.luau` reads only a local `cobalt.luau`; it never calls an HTTP loader.
+- Teleport relaunch uses the same local-file policy.
 
 ## Structure
 
 ```
-loader.luau          # Optional executor loader: pcall-guarded local read -> GitHub raw fallback
-cobalt.luau          # GENERATED bundle, ~960KB / ~28.5k lines. Fully self-contained:
-                     #   ClosureBindings  - one closure per module, body inlined from src/
-                     #   ObjectTree       - virtual Instance tree the closures hang off
-                     #   LineOffsets      - bundle line -> module line, for error messages
-                     #   wax runtime      - ImportGlobals / LoadScript / virtual require
-src/                 # Source of truth: 152 .luau modules
-  init.luau          # Main LocalScript
-  ExecutorSupport.luau
-  Spy/               # Luau + RakNet hooks, interceptors, invocation tracking
-  Utils/             # Anticheats, CallFilter, CodeGen, Hook, Plugins, UI helpers
-  Window/            # Components, Modals, Utils, Views
-lib/                 # Bundle inputs / dev artifacts
-  ref_map.luau       # RefId -> src path; drives the bundler
-  object_tree.luau   # ObjectTree source
-  line_offsets.luau  # LineOffsets source
-  wax_runtime.luau   # Wax runtime source
-  config.luau        # Aliases, WaxVersion, EnvName
-tools/
-  bundle.py          # src/ -> cobalt.luau (also `--check` for CI)
-  modulecheck.py     # Emits a Luau harness that executes every module in the bundle
-.luaurc              # Aliases: src -> ./src, lib -> ./lib
-verify.sh            # Structural checks; set LUAU=... to also execute the bundle
+loader.luau          # local-only executor loader
+cobalt.luau          # generated single-file bundle
+assets/              # repository-owned logo, class markers, and icon atlas
+src/                 # editable Luau modules
+  init.luau          # runtime setup and cleanup
+  Utils/Log.luau     # bounded capture, spam admission, and UI notifications
+  Utils/Ratelimiter.luau
+  Window/            # low-cost UI and views
+lib/                 # bundle inputs and the virtual module tree
+tools/bundle.py      # regenerates closures and serialized actor/HTML values
+tools/modulecheck.py # emits the Luau module-load harness
+verify.sh            # structural verification
 ```
 
-## How to Run
+## Run locally
 
-`cobalt.luau` is self-contained — one request, no local files needed:
+Put the repository (including `assets/`) in the executor's script directory and
+paste the contents of `loader.luau`. Alternatively, read `cobalt.luau` directly
+with the executor's local file API.
 
-```luau
-loadstring(game:HttpGet("https://raw.githubusercontent.com/Kira762/cobalt_optimized/main/cobalt.luau"))()
-```
+The bundle does not need the source tree at runtime, but the local assets are
+used when the executor supports `getcustomasset`. If they are unavailable the
+interface still loads without decorative icons.
 
-Or paste `loader.luau`, which prefers a local copy of `cobalt.luau` when the repo
-sits inside the executor's script directory and falls back to raw GitHub:
+## Performance safeguards
 
-```luau
-loadstring(game:HttpGet("https://raw.githubusercontent.com/Kira762/cobalt_optimized/main/loader.luau"))()
-```
+The hot capture path now rejects work before deep-cloning arguments:
 
-**Gotcha:** `readfile()` relative paths resolve against the *executor's script
-directory* (e.g. Synapse's `scripts/` folder), **not** wherever you ran
-`git clone`. A bare `readfile("cobalt.luau")` hard-errors with
-`failed to read file` if the repo isn't inside that folder — and with no
-`pcall` around it, the script dies before any remote fallback can run.
-`loader.luau` wraps every local read in `pcall`, adds absolute-path
-candidates via `getworkingdirectory()`, and falls back to raw GitHub.
+- at most 120 captures per remote per one-second window;
+- at most 600 captures across all remotes per one-second window;
+- a bounded, per-remote-coalesced notification queue;
+- bounded GUI render jobs so stale call rows cannot grow without limit;
+- per-remote call retention remains configurable and defaults to a finite cap;
+- animations are off by default and decorative `UIStroke` outlines are skipped;
+- the Cobalt window is centered and ignores the Roblox top inset.
 
-## Build
+The high-frequency auto-ignore setting is enabled by default. Turn it off only
+when a complete high-volume trace is intentional; the hard capture budgets
+remain in place so tracing cannot freeze the game.
+
+## Build and verify
 
 ```bash
-python3 tools/bundle.py            # regenerate cobalt.luau from src/
-python3 tools/bundle.py --check    # fail if cobalt.luau is stale
+python3 tools/bundle.py
+python3 tools/bundle.py --check
+./verify.sh
 ```
 
-Every `ClosureBindings[N]` is emitted from `lib/ref_map.luau` as:
+If a Luau CLI is available, set `LUAU` before running `verify.sh` to execute the
+bundle's module-load harness as well. The harness intentionally stubs Roblox
+APIs; failures that require a live executor are reported separately from bundle
+and module-structure errors.
 
-```luau
-[N] = function(...) local wax,script,require=ImportGlobals(N) local ImportGlobals return (function(...)
-<body of ref_map[N], verbatim>
-end)(...) end,
-```
+## Improved maintenance prompt
 
-The trailing `(...)` is what runs the module. `LoadScript()` treats a closure's
-return values as the module's return values, so a closure that merely *returns*
-the inner function reports success while the module body never executes — the UI
-never appears and nothing errors. `tools/bundle.py --check` and `verify.sh` both
-assert the invocating form is present.
-
-## Verification
-
-```bash
-./verify.sh                        # structural: bundle freshness, closure/LineOffsets alignment
-LUAU=/path/to/luau ./verify.sh     # + executes the bundle and loads every ModuleScript
-```
-
-Build the Luau CLI once with
-`git clone --depth 1 https://github.com/luau-lang/luau && cd luau && make -j config=release luau`.
-
-The executed check runs `loadstring(cobalt.luau)()` with `readfile` wired to fail
-and `require` wired to reject strings — i.e. the remote-load configuration — then
-drives the bundle's real `LoadScript()` over every ModuleScript. A healthy bundle
-reports a mix of `table` and `function` first-return-values (the 5 modules that
-legitimately `return` a function); the remaining errors are missing executor APIs
-in the stub environment, not load failures.
-
-- Bundle: ~960KB, ~28.5k lines, 151 module closures
-- `cobalt.luau` compiles under Luau and runs to the point of touching real Roblox APIs
-- Public API stable: `getgenv().Cobalt = wax`
+> Optimize Cobalt for games where a remote can fire continuously. Keep runtime
+> execution offline: move every file-backed asset into `assets/`, remove runtime
+> HTTP/module downloads, and provide safe local or packaged fallbacks. Protect
+> the hot hook path with bounded per-remote and global capture budgets, bounded
+> notification and GUI queues, finite call retention, and early dropping before
+> argument cloning. Reduce unnecessary UI work by disabling decorative outlines
+> and animations by default, reusing rows where practical, and keeping the main
+> window centered and usable on small viewports. Preserve blocking, filtering,
+> cleanup, logging, and plugin APIs. Put shared behavior in focused modules,
+> regenerate the bundle, and run structural plus Luau verification before
+> delivering the change.

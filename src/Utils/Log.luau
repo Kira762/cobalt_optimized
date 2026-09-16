@@ -99,71 +99,148 @@ local function GetMaxCallsPerRemote(): number
 	return CachedCallCap
 end
 
-local function CheckSpamThreshold(Target)
-	return Target:IsOverSpamThreshold()
-end
-
-
+-- The producer is on a remote hook, while the consumer is the UI heartbeat.
+-- Keep the hand-off bounded and coalesce updates for the same remote.  A noisy
+-- remote therefore costs one small notification per frame, not one table per
+-- packet.
+local MaxPendingNotifications = 256
+local MaxNotificationsPerHeartbeat = 96
 wax.shared.LogNotificationQueue = {
 	Items = {},
 	Head = 1,
 	Tail = 0,
+	PendingByLog = setmetatable({}, { __mode = "k" }),
+	Dropped = 0,
 }
 
 local function QueueNotification(LogObject, CallIndex: number, Call)
 	local Queue = wax.shared.LogNotificationQueue
-	Queue.Tail += 1
-	Queue.Items[Queue.Tail] = {
+	local Existing = Queue.PendingByLog[LogObject]
+	if Existing then
+		Existing.CallIndex = CallIndex
+		Existing.Call = Call or LogObject.Calls[CallIndex]
+		Existing.Suppressed = (Existing.Suppressed or 0) + 1
+		return
+	end
+
+	local Pending = Queue.Tail - Queue.Head + 1
+	while Pending >= MaxPendingNotifications do
+		local Oldest = Queue.Items[Queue.Head]
+		Queue.Items[Queue.Head] = nil
+		Queue.Head += 1
+		Pending -= 1
+		Queue.Dropped += 1
+		if Oldest and Oldest.Log then
+			Queue.PendingByLog[Oldest.Log] = nil
+		end
+	end
+
+	if Queue.Head > Queue.Tail then
+		table.clear(Queue.Items)
+		Queue.Head = 1
+		Queue.Tail = 0
+	end
+
+	local Notification = {
 		Instance = LogObject.Instance,
 		Type = LogObject.Type,
 		LogIndex = LogObject.Index,
 		CallIndex = CallIndex,
-		-- Direct references: indices can shift when a log trims old calls, and
-		-- consumers would otherwise have to re-derive the log from the instance
-		-- (a DebugId lookup) for every single notification.
+		-- Direct references avoid another DebugId lookup on the UI thread.
 		Log = LogObject,
 		Call = Call or LogObject.Calls[CallIndex],
+		Suppressed = 0,
 	}
+	Queue.Tail += 1
+	Queue.Items[Queue.Tail] = Notification
+	Queue.PendingByLog[LogObject] = Notification
 end
 
-
-local SpamCallCountThreshold = 15
+local SpamCallCountThreshold = 120
 local SpamTimeWindowSeconds = 1
-local AutoIgnoreSpammyEvents = false
+local HardCaptureLimitPerRemote = 120
+local HardCaptureLimitGlobal = 600
+local GlobalCaptureWindowStart = 0
+local GlobalCaptureCount = 0
+local AutoIgnoreSpammyEvents = true
+
+do
+	local Success, Value = pcall(function()
+		return wax.shared.SaveManager:GetState("AutoIgnoreSpammyEvents", true)
+	end)
+	if Success then
+		AutoIgnoreSpammyEvents = Value == true
+	end
+end
+
+local function ShouldAutoIgnore(): boolean
+	local Control = wax.shared.Settings and wax.shared.Settings.AutoIgnoreSpammyEvents
+	if Control and Control.Value ~= nil then
+		return Control.Value == true
+	end
+	return AutoIgnoreSpammyEvents
+end
+
+local function RejectCapture(LogObject, Now: number): boolean
+	if Now - LogObject.SpamWindowStart >= SpamTimeWindowSeconds then
+		LogObject.SpamWindowStart = Now
+		LogObject.SpamCallCount = 0
+	end
+
+	if Now - GlobalCaptureWindowStart >= SpamTimeWindowSeconds then
+		GlobalCaptureWindowStart = Now
+		GlobalCaptureCount = 0
+	end
+
+	if LogObject.SpamCallCount >= HardCaptureLimitPerRemote or GlobalCaptureCount >= HardCaptureLimitGlobal then
+		LogObject.SuppressedCalls += 1
+		if ShouldAutoIgnore() and not LogObject.Ignored then
+			LogObject:Ignore()
+			local Sonner = wax.shared.Sonner
+			if Sonner then
+				local InstanceName = LogObject.Instance and LogObject.Instance.Name or "remote"
+				pcall(Sonner.info, Sonner, `Ignored {InstanceName} ({LogObject.Type}) after sustained event spam.`)
+			end
+		end
+		return true
+	end
+
+	LogObject.SpamCallCount += 1
+	GlobalCaptureCount += 1
+	return false
+end
 
 if not wax.shared.IS_ACTOR then
 	wax.shared.Connect(wax.shared.RunService.Heartbeat:Connect(function()
 		local Queue = wax.shared.LogNotificationQueue
-		local Tail = Queue.Tail
-
-		if Queue.Head > Tail then
+		if Queue.Head > Queue.Tail then
 			return
 		end
 
-		local Batch = {}
+		local Batch = table.create(math.min(MaxNotificationsPerHeartbeat, Queue.Tail - Queue.Head + 1))
 		local BatchSize = 0
-		while Queue.Head <= Tail do
+		while Queue.Head <= Queue.Tail and BatchSize < MaxNotificationsPerHeartbeat do
 			local Notification = Queue.Items[Queue.Head]
 			Queue.Items[Queue.Head] = nil
 			Queue.Head += 1
-
 			if Notification then
+				Queue.PendingByLog[Notification.Log] = nil
 				BatchSize += 1
 				Batch[BatchSize] = Notification
 			end
 		end
 
-		table.clear(Queue.Items)
-		Queue.Head = 1
-		Queue.Tail = 0
+		if Queue.Head > Queue.Tail then
+			table.clear(Queue.Items)
+			Queue.Head = 1
+			Queue.Tail = 0
+		end
 
 		if BatchSize > 0 then
 			local Communicator = wax.shared.Communicator
 			if Communicator then
-				AutoIgnoreSpammyEvents = wax.shared.SaveManager:GetState("AutoIgnoreSpammyEvents", false)
 				Communicator:Fire(Batch)
 			end
-
 			table.clear(Batch)
 		end
 	end))
@@ -391,6 +468,7 @@ function Log.new(Instance, Type, Index, CallingScript)
 		GameCalls = {},
 		SpamWindowStart = 0,
 		SpamCallCount = 0,
+		SuppressedCalls = 0,
 		Ignored = false,
 		Blocked = false,
 		Button = nil,
@@ -400,28 +478,9 @@ function Log.new(Instance, Type, Index, CallingScript)
 end
 
 function Log:IsOverSpamThreshold()
-	if not AutoIgnoreSpammyEvents then
-		return false
-	end
-
-	local Now = tick()
-	if Now - self.SpamWindowStart > SpamTimeWindowSeconds then
-		self.SpamWindowStart = Now
-		self.SpamCallCount = 0
-	end
-
-	self.SpamCallCount = self.SpamCallCount + 1
-
-	if self.SpamCallCount > SpamCallCountThreshold then
-		if not self.Ignored then
-			self.Ignore(self)
-			wax.shared.Sonner.info(`Ignored {self.Instance.Name} ({self.Type}) due to event spam.`)
-		end
-
-		return true
-	end
-
-	return false
+	-- Kept for plugins that query the old API.  Capture admission is enforced
+	-- centrally in `Log:Call`, even when the optional auto-ignore setting is off.
+	return self.SpamCallCount >= SpamCallCountThreshold
 end
 
 local function RunInterceptors(Interceptors: { (...any) -> ...any }, Info: any, Log): boolean
@@ -525,15 +584,13 @@ function Log:Call(RawInfo): number?
 		return nil
 	end
 
-	
-	if not wax.shared.IS_ACTOR then
-		local Success, SpamData = pcall(CheckSpamThreshold, self)
-		if Success and SpamData then
-			return nil
-		end
+	-- Do this before DeepClone.  Cloning arguments is the expensive part of a
+	-- capture, and a hard per-remote/global budget prevents one spammy event
+	-- from consuming the frame and memory budgets of the whole game.
+	if RejectCapture(self, os.clock()) then
+		return nil
 	end
 
-	
 	local Info = DeepClone(RawInfo)
 	Info.CreationTime = tick()
 
@@ -626,6 +683,15 @@ end
 function Log:ClearCalls()
 	table.clear(self.Calls)
 	table.clear(self.GameCalls)
+	local Pending = wax.shared.LogNotificationQueue.PendingByLog[self]
+	if Pending then
+		Pending.Call = nil
+		Pending.CallIndex = nil
+		wax.shared.LogNotificationQueue.PendingByLog[self] = nil
+	end
+	self.SpamWindowStart = os.clock()
+	self.SpamCallCount = 0
+	self.SuppressedCalls = 0
 end
 
 function Log:Ignore()

@@ -1,34 +1,19 @@
--- Cobalt loader (paste this whole file into the executor)
+-- Cobalt local loader.
 --
--- Load order:
---   1. Local file  - dev/after-clone, preferred when present
---   2. Remote      - raw GitHub fallback, always works
---
--- Why this instead of a bare readfile:
---   * readfile() relative paths resolve against the EXECUTOR'S script
---     directory, not wherever you ran `git clone`. A bare
---     readfile("cobalt.luau") hard-errors ("failed to read file") if the
---     repo isn't inside that folder, and it kills the script before any
---     fallback runs.
---   * cobalt.luau is self-contained (every module body is inlined by
---     tools/bundle.py), so either source boots the full UI. Cloning the repo
---     into the script directory just skips the HTTP round trip - it does not
---     pick up edits to src/ until you re-run tools/bundle.py.
-
-local REMOTE_URL = "https://raw.githubusercontent.com/Kira762/cobalt_optimized/main/cobalt.luau"
+-- The loader is intentionally offline. Keep cobalt.luau and the assets/
+-- directory beside this file (or inside a cobalt_optimized folder) in the
+-- executor's script directory. No remote source is fetched at runtime.
 
 local function TryRead(Candidates)
 	if typeof(readfile) ~= "function" then
 		return nil
 	end
 
-	for i = 1, #Candidates do
-		local Ok, Res = pcall(function()
-			return readfile(Candidates[i])
-		end)
-		if Ok and type(Res) == "string" and Res ~= "" then
-			print("[Cobalt] source: local file " .. Candidates[i])
-			return Res
+	for _, Path in Candidates do
+		local Success, Result = pcall(readfile, Path)
+		if Success and type(Result) == "string" and Result ~= "" then
+			print("[Cobalt] source: local file " .. Path)
+			return Result
 		end
 	end
 
@@ -40,37 +25,26 @@ local LocalCandidates = {
 	"cobalt_optimized/cobalt.luau",
 }
 
--- Absolute fallbacks: the clone may live outside the script directory.
 if typeof(getworkingdirectory) == "function" then
-		local Ok, Dir = pcall(getworkingdirectory)
-		if Ok and type(Dir) == "string" and Dir ~= "" then
-			-- Some executors (e.g. Synapse) return a trailing separator.
-			local Last = Dir:sub(-1)
-			if (Last == "/" or Last == "\\") and #Dir > 3 then
-				Dir = Dir:sub(1, -2)
-			end
-			table.insert(LocalCandidates, Dir .. "/cobalt.luau")
-			table.insert(LocalCandidates, Dir .. "/cobalt_optimized/cobalt.luau")
+	local Success, Directory = pcall(getworkingdirectory)
+	if Success and type(Directory) == "string" and Directory ~= "" then
+		local Last = Directory:sub(-1)
+		if (Last == "/" or Last == "\\") and #Directory > 3 then
+			Directory = Directory:sub(1, -2)
 		end
-end
-
-local Source = TryRead(LocalCandidates)
-
-if not Source then
-	local Ok, Res = pcall(function()
-		return game:HttpGet(REMOTE_URL)
-	end)
-	if Ok and type(Res) == "string" and Res ~= "" then
-		print("[Cobalt] source: remote " .. REMOTE_URL)
-		Source = Res
-	else
-		error("[Cobalt] could not load: no local cobalt.luau found and remote fetch failed (" .. tostring(Res) .. ")")
+		table.insert(LocalCandidates, Directory .. "/cobalt.luau")
+		table.insert(LocalCandidates, Directory .. "/cobalt_optimized/cobalt.luau")
 	end
 end
 
-local Fn = loadstring(Source)
+local Source = TryRead(LocalCandidates)
+if not Source then
+	error("[Cobalt] no local cobalt.luau was found; copy the repository into the executor script directory")
+end
+
+local Fn, CompileError = loadstring(Source, "cobalt.luau")
 if not Fn then
-	error("[Cobalt] loaded source failed to compile")
+	error("[Cobalt] local source failed to compile: " .. tostring(CompileError))
 end
 
 Fn()

@@ -4,8 +4,7 @@
 #   ./verify.sh                # structural checks (python3 only)
 #   LUAU=/path/to/luau ./verify.sh   # + actually execute the bundle
 #
-# The Luau CLI can be built with:
-#   git clone --depth 1 https://github.com/luau-lang/luau && cd luau && make -j config=release luau
+# Point LUAU at a locally built Luau CLI to run the optional execution check.
 set -e
 cd "$(dirname "$0")"
 
@@ -47,14 +46,21 @@ echo "== 3. src/ tree =="
 echo "src files: $(find src -type f -name '*.luau' | wc -l)"
 echo "ref_map entries: $(grep -cE '^\s*\[[0-9]+\] = "' lib/ref_map.luau)"
 
+if grep -RInE 'https?://|game:HttpGet\(|request[[:space:]]*\(' --exclude-dir=.git .; then
+    echo "offline runtime-link check failed" >&2
+    exit 1
+fi
+echo "== 4. offline runtime-link check =="
+echo "no external runtime links found"
+
 if [ -z "${LUAU:-}" ]; then
     echo
-    echo "== 4. skipped: set LUAU=/path/to/luau to execute the bundle =="
+    echo "== 5. skipped: set LUAU=/path/to/luau to execute the bundle =="
     exit 0
 fi
 
 echo
-echo "== 4. execute the bundle (remote-load config: no readfile, Roblox require) =="
+echo "== 5. execute the self-contained bundle (no readfile, Roblox require) =="
 OUT="$(mktemp -t cobalt_modulecheck.XXXXXX.luau)"
 trap 'rm -f "$OUT"' EXIT
 python3 tools/modulecheck.py cobalt.luau "$OUT"

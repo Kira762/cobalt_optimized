@@ -369,17 +369,22 @@ return function(props: {
 			Constants.MainUICorner,
 		})
 
-		local HighlightStroke = Interface.New("UIStroke", {
-			ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
-			Thickness = 1,
-			Transparency = 1,
+		-- Row highlighting uses the background instead of a UIStroke. This keeps
+		-- pooled call rows to the minimum number of rendered objects.
+		self.CallFrameData[CallFrame] = {}
 
-			Parent = CallFrame,
-		})
+		local function SetRowHighlight(Data, Active: boolean)
+			if not Data then
+				return
+			end
 
-		self.CallFrameData[CallFrame] = {
-			HighlightStroke = HighlightStroke,
-		}
+			local TargetColor = if Active
+				then Color3.fromRGB(48, 48, 48)
+				else Data.BaseBackgroundColor or Color3.fromRGB(25, 25, 25)
+			Animations.Play(CallFrame, {
+				BackgroundColor3 = TargetColor,
+			}, Constants.DefaultTweenInfo)
+		end
 
 		CallFrame.MouseEnter:Connect(function()
 			local Data = self.CallFrameData[CallFrame]
@@ -387,9 +392,7 @@ return function(props: {
 				return
 			end
 
-			Animations.Play(Data.HighlightStroke, {
-				Transparency = 0,
-			}, Constants.DefaultTweenInfo)
+			SetRowHighlight(Data, true)
 		end)
 
 		CallFrame.MouseLeave:Connect(function()
@@ -398,9 +401,7 @@ return function(props: {
 				return
 			end
 
-			Animations.Play(Data.HighlightStroke, {
-				Transparency = if Data.IsBlockedCall then 0.5 elseif Data.IsHighlightedCall then 0.35 else 1,
-			}, Constants.DefaultTweenInfo)
+			SetRowHighlight(Data, false)
 		end)
 
 		-- Touch devices rarely hover, so pressing a row highlights it too.
@@ -421,9 +422,7 @@ return function(props: {
 			end
 
 			Data.WasPressed = true
-			Animations.Play(Data.HighlightStroke, {
-				Transparency = 0,
-			}, Constants.DefaultTweenInfo)
+			SetRowHighlight(Data, true)
 		end)
 
 		CallFrame.InputEnded:Connect(function(Input: InputObject)
@@ -440,9 +439,7 @@ return function(props: {
 			end
 
 			Data.WasPressed = nil
-			Animations.Play(Data.HighlightStroke, {
-				Transparency = if Data.IsBlockedCall then 0.5 elseif Data.IsHighlightedCall then 0.35 else 1,
-			}, Constants.DefaultTweenInfo)
+			SetRowHighlight(Data, false)
 		end)
 
 		local CallContextMenu = GetSharedCallContextMenu()
@@ -498,13 +495,12 @@ return function(props: {
 		Data.IsBlockedCall = IsBlockedCall
 		Data.IsHighlightedCall = IsHighlightedCall
 
-		CallFrame.BackgroundColor3 = if IsBlockedCall then Color3.fromRGB(34, 18, 18) else Color3.fromRGB(25, 25, 25)
+		Data.BaseBackgroundColor = if IsBlockedCall
+			then Color3.fromRGB(34, 18, 18)
+			elseif IsHighlightedCall then Color3.fromRGB(42, 35, 22)
+			else Color3.fromRGB(25, 25, 25)
+		CallFrame.BackgroundColor3 = Data.BaseBackgroundColor
 		CallFrame.LayoutOrder = CallInfo.Order
-		Data.HighlightStroke.Color = if IsBlockedCall
-			then Color3.fromRGB(222, 82, 82)
-			elseif IsHighlightedCall then Color3.fromRGB(230, 170, 65)
-			else Color3.fromRGB(75, 75, 75)
-		Data.HighlightStroke.Transparency = if IsBlockedCall then 0.5 elseif IsHighlightedCall then 0.35 else 1
 
 		local InitialDataView = if CallInfo.Type == "Incoming" and CallInfo.InvokeResult
 			then "InvokeResult"
@@ -678,6 +674,10 @@ return function(props: {
 			Time = 0.1,
 			Max = 2,
 		},
+		-- Rendering is best-effort.  Never let a spammy remote build an
+		-- unbounded backlog of GUI jobs behind the current page.
+		MaxQueue = 40,
+		DropOldest = true,
 		ShouldProcess = IsCallFrameJobCurrent,
 		MainCallback = function(Data)
 			if not IsCallFrameJobCurrent(Data) then

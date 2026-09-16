@@ -310,6 +310,14 @@ wax.shared.Unload = function()
 	table.clear(wax.shared.Logs)
 	table.clear(wax.shared.IncomingLogConnectionFunctions)
 
+	local NotificationQueue = wax.shared.LogNotificationQueue
+	if NotificationQueue then
+		table.clear(NotificationQueue.Items)
+		table.clear(NotificationQueue.PendingByLog)
+		NotificationQueue.Head = 1
+		NotificationQueue.Tail = 0
+	end
+
 	getgenv().CobaltInitialized = false
 	getgenv().Cobalt = nil
 
@@ -527,20 +535,33 @@ wax.shared.Connect(wax.shared.LocalPlayer.OnTeleport:Connect(function()
 		return
 	end
 
-	
-	local CobaltURL = getgenv().COBALT_LATEST_URL
-		or "https://gitlab.com/upio/cobalt/-/releases/permalink/latest/downloads/Cobalt.luau"
-	wax.shared.queue_on_teleport(string.format(
-		[[
+	-- Relaunch from the executor's local script directory.  Teleport support is
+	-- intentionally offline as well; a missing local copy is a harmless no-op.
+	wax.shared.queue_on_teleport([[
 		if getgenv().CobaltAutoExecuted then
 			return
 		end
 
-		getgenv().CobaltAutoExecuted = true
-		loadstring(game:HttpGet("%s"))()
-	]],
-		CobaltURL
-	))
+		local function cobaltRead()
+			if typeof(readfile) ~= "function" then
+				return nil
+			end
+			for _, path in { "cobalt.luau", "cobalt_optimized/cobalt.luau" } do
+				local ok, source = pcall(readfile, path)
+				if ok and type(source) == "string" and source ~= "" then
+					return source
+				end
+			end
+			return nil
+		end
+
+		local source = cobaltRead()
+		local fn = source and loadstring(source, "cobalt.luau")
+		if fn then
+			getgenv().CobaltAutoExecuted = true
+			fn()
+		end
+	]])
 end))
 
 getgenv().Cobalt = wax

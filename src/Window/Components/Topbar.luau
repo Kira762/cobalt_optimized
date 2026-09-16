@@ -44,7 +44,7 @@ return function(props: {
 			Image = props.CobaltLogo,
 		},
 	})
-	Interface.HideCorner(TopBar, UDim2.fromScale(1, 0.5), Vector2.yAxis)
+	-- The top bar follows the parent corner; avoid a second masking Frame here.
 
 	local TopButtons = Interface.New("Frame", {
 		BackgroundTransparency = 1,

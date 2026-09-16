@@ -31,6 +31,7 @@ end
 local ScreenGui = Interface.New("ScreenGui", {
 	Name = "Cobalt",
 	ResetOnSpawn = false,
+	IgnoreGuiInset = true,
 	Parent = Interface.GetScreenParent(),
 	ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
 })
@@ -46,6 +47,15 @@ local MainFrame = Interface.New("Frame", {
 	Constants.MainUICorner,
 	Parent = ScreenGui,
 })
+
+-- Keep the initial window centered in the full viewport. IgnoreGuiInset above
+-- prevents the Roblox top bar from making the visual center appear too low.
+local function CenterMainFrame()
+	MainFrame.AnchorPoint = Vector2.new(0.5, 0.5)
+	MainFrame.Position = UDim2.fromScale(0.5, 0.5)
+end
+CenterMainFrame()
+
 do
 	Resize.new({
 		MainFrame = MainFrame,

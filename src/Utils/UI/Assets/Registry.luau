@@ -1,93 +1,84 @@
+-- Local asset manifest.
+--
+-- Cobalt used to fetch these files from several third-party hosts during boot.
+-- The manifest now points only at files shipped with this repository.  When a
+-- local file is unavailable, the Roblox asset id is used as a compatibility
+-- fallback; no HTTP request is made by the asset system.
+
 export type FontAsset = {
 	Type: "Font",
 	FileName: string,
 	FamilyName: string,
-	Url: string,
 	FallbackId: number,
+	LocalPath: string?,
 }
 
 export type ImageAsset = {
 	Type: "Image",
 	FileName: string,
-	Url: string,
+	LocalPath: string?,
 	FallbackId: string,
 	Group: string?,
 }
 
 export type Asset = FontAsset | ImageAsset
 
-local RepositoryAssetUrl = "https://gitlab.com/upio/cobalt/-/raw/main/Assets"
-local RobloxClassIconUrl = "https://robloxapi.github.io/ref/icons/dark"
-
 local Registry: { [string]: Asset } = {
 	Inter = {
 		Type = "Font",
-		
 		FileName = "Inter.ttf",
 		FamilyName = "Inter",
-		
-		Url = `{RepositoryAssetUrl}/Inter.ttf`,
 		FallbackId = 12187365364,
+		-- The UI uses the Roblox fallback for fonts.  Keeping the font out of the
+		-- runtime download path makes a one-file copy work on every executor.
+		LocalPath = nil,
 	},
 	IBMPlexMono = {
 		Type = "Font",
-		
 		FileName = "IBMPlexMono.ttf",
 		FamilyName = "IBM Plex Mono",
-
-		Url = `{RepositoryAssetUrl}/IBMPlexMono.ttf`,
 		FallbackId = 16658246179,
+		LocalPath = nil,
 	},
 	Logo = {
 		Type = "Image",
-		FileName = "Logo.png",
-
-		Url = `{RepositoryAssetUrl}/Logo.png`,
+		FileName = "cobalt-logo.png",
+		LocalPath = "assets/cobalt-logo.png",
 		FallbackId = "rbxassetid://91685317120520",
 	},
 	RemoteEvent = {
 		Group = "InstanceClass",
-		
 		Type = "Image",
 		FileName = "RemoteEvent.png",
-
-		Url = `{RobloxClassIconUrl}/RemoteEvent.png`,
+		LocalPath = "assets/remote-event.png",
 		FallbackId = "rbxassetid://110803789420086",
 	},
 	UnreliableRemoteEvent = {
 		Group = "InstanceClass",
-
 		Type = "Image",
 		FileName = "UnreliableRemoteEvent.png",
-
-		Url = `{RobloxClassIconUrl}/UnreliableRemoteEvent.png`,
+		LocalPath = "assets/unreliable-remote-event.png",
 		FallbackId = "rbxassetid://126244162339059",
 	},
 	RemoteFunction = {
 		Group = "InstanceClass",
-
 		Type = "Image",
 		FileName = "RemoteFunction.png",
-		
-		Url = `{RobloxClassIconUrl}/RemoteFunction.png`,
+		LocalPath = "assets/remote-function.png",
 		FallbackId = "rbxassetid://108537517159060",
 	},
 	BindableEvent = {
 		Group = "InstanceClass",
-
 		Type = "Image",
 		FileName = "BindableEvent.png",
-		
-		Url = `{RobloxClassIconUrl}/BindableEvent.png`,
+		LocalPath = "assets/bindable-event.png",
 		FallbackId = "rbxassetid://116839398727495",
 	},
 	BindableFunction = {
 		Group = "InstanceClass",
-
 		Type = "Image",
 		FileName = "BindableFunction.png",
-		
-		Url = `{RobloxClassIconUrl}/BindableFunction.png`,
+		LocalPath = "assets/bindable-function.png",
 		FallbackId = "rbxassetid://112264959079193",
 	},
 }

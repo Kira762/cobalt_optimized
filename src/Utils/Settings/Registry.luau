@@ -57,7 +57,7 @@ return {
 	]]
 	AnimationsEnabled = Setting.new({
 		Key = "AnimationsEnabled",
-		Default = true,
+		Default = false,
 		Schema = Schema.boolean(),
 		UI = {
 			Type = "Checkbox",
@@ -160,7 +160,9 @@ return {
 	}),
 	AutoIgnoreSpammyEvents = Setting.new({
 		Key = "AutoIgnoreSpammyEvents",
-		Default = false,
+		-- Protect the game by default; the user can turn this off when a full
+		-- high-frequency trace is intentional.
+		Default = true,
 		Schema = Schema.boolean(),
 		UI = {
 			Type = "Checkbox",

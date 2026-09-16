@@ -103,8 +103,8 @@ end
 -- Keep the hand-off bounded and coalesce updates for the same remote.  A noisy
 -- remote therefore costs one small notification per frame, not one table per
 -- packet.
-local MaxPendingNotifications = 256
-local MaxNotificationsPerHeartbeat = 96
+local MaxPendingNotifications = ProfileValue("MaxPendingNotifications", 256)
+local MaxNotificationsPerHeartbeat = ProfileValue("MaxNotificationsPerHeartbeat", 96)
 wax.shared.LogNotificationQueue = {
 	Items = {},
 	Head = 1,

@@ -6,6 +6,7 @@ local Types = require("@src/Window/Types")
 local DirectionTabs = require(script.Parent.DirectionTabs)
 local Ratelimiter = require("@src/Utils/Ratelimiter")
 local Animations = require("@src/Window/Utils/Animations")
+local DeviceProfile = require("@src/Utils/DeviceProfile")
 
 
 return function(props: {

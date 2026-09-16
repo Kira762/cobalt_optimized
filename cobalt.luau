@@ -236,15 +236,65 @@ wax.shared.IsPlayerModule = function(Origin: LocalScript | ModuleScript, Instanc
 
 	return false
 end
+--[[
+
+	ShouldIgnore fast path.
+
+	ShouldIgnore runs on every intercepted remote call, but its verdict only
+	changes when the settings it reads change, so both verdicts are cached
+	against the instance (weak keys: a destroyed remote drops its entry) and a
+	repeat call for the same remote costs one table lookup instead of an
+	IsDescendantOf walk plus settings reads.
+
+	Only origin-independent verdicts are cached - the player-module check
+	depends on the calling script, so those results are recomputed per call.
+	The cache is dropped through `InvalidateShouldIgnoreCache`, which
+	SettingSync.Save invokes whenever a setting is written.
+]]
+local IgnoredInstanceCache = setmetatable({}, { __mode = "k" })
+local NotIgnoredInstanceCache = setmetatable({}, { __mode = "k" })
+
+wax.shared.InvalidateShouldIgnoreCache = function()
+	table.clear(IgnoredInstanceCache)
+	table.clear(NotIgnoredInstanceCache)
+end
+
 wax.shared.ShouldIgnore = function(Instance, Origin)
+	if IgnoredInstanceCache[Instance] then
+		return true
+	end
+
+	if NotIgnoredInstanceCache[Instance] then
+		return false
+	end
+
+	local Ignored = false
+	local OriginDependent = false
+
 	if not wax.shared.Settings.LogRobloxInternalEvents.Value then
 		if Instance.IsDescendantOf(Instance, wax.shared.RobloxReplicatedStorage) then
-			return true
+			Ignored = true
 		end
 	end
 
-	return wax.shared.Settings.IgnoredRemotesDropdown.Value[Instance.ClassName] == true
-		or (wax.shared.Settings.IgnorePlayerModule.Value and wax.shared.IsPlayerModule(Origin, Instance))
+	if not Ignored then
+		Ignored = wax.shared.Settings.IgnoredRemotesDropdown.Value[Instance.ClassName] == true
+	end
+
+	if not Ignored and wax.shared.Settings.IgnorePlayerModule.Value then
+		OriginDependent = true
+		Ignored = wax.shared.IsPlayerModule(Origin, Instance)
+	end
+
+	if not OriginDependent then
+		if Ignored then
+			IgnoredInstanceCache[Instance] = true
+		else
+			NotIgnoredInstanceCache[Instance] = true
+		end
+	end
+
+	return Ignored
 end
 
 
@@ -19623,6 +19673,13 @@ function SettingSync.Save(Idx: string, Value: any)
 		return false, Error
 	end
 
+	-- The ShouldIgnore fast path caches per-instance verdicts, and the
+	-- settings it reads only change through this call, so drop the cache
+	-- whenever any setting is written.
+	if wax.shared.InvalidateShouldIgnoreCache then
+		wax.shared.InvalidateShouldIgnoreCache()
+	end
+
 	SettingSync.Broadcast(Idx, Value)
 	return true
 end
@@ -29565,157 +29622,157 @@ local ObjectTree = {
 
 local LineOffsets = {
     [1] = 12,
-    [2] = 597,
-    [3] = 1226,
-    [5] = 1254,
-    [7] = 1633,
-    [9] = 5210,
-    [10] = 5840,
-    [11] = 6116,
-    [12] = 6145,
-    [14] = 6168,
-    [15] = 6284,
-    [16] = 6395,
-    [17] = 6527,
-    [20] = 6797,
-    [22] = 6862,
-    [24] = 6941,
-    [25] = 7137,
-    [26] = 7579,
-    [27] = 7701,
-    [29] = 7798,
-    [30] = 7915,
-    [31] = 7990,
-    [32] = 8295,
-    [34] = 8594,
-    [35] = 8867,
-    [36] = 9849,
-    [38] = 10078,
-    [39] = 10100,
-    [40] = 10126,
-    [41] = 10269,
-    [43] = 10321,
-    [44] = 10371,
-    [45] = 10396,
-    [46] = 10591,
-    [48] = 10700,
-    [50] = 10786,
-    [51] = 11006,
-    [52] = 11653,
-    [55] = 11739,
-    [56] = 11810,
-    [57] = 11839,
-    [58] = 11855,
-    [59] = 11872,
-    [60] = 11897,
-    [61] = 11919,
-    [62] = 11958,
-    [63] = 12018,
-    [64] = 12122,
-    [65] = 12140,
-    [66] = 12187,
-    [67] = 12244,
-    [68] = 12276,
-    [69] = 12362,
-    [70] = 12395,
-    [71] = 12414,
-    [72] = 12475,
-    [73] = 12493,
-    [74] = 12551,
-    [75] = 12588,
-    [76] = 12610,
-    [77] = 12645,
-    [78] = 12695,
-    [79] = 12717,
-    [80] = 12737,
-    [81] = 12782,
-    [82] = 12841,
-    [83] = 12938,
-    [84] = 12954,
-    [85] = 12976,
-    [86] = 13015,
-    [87] = 13033,
-    [88] = 13053,
-    [89] = 13069,
-    [90] = 13088,
-    [91] = 13147,
-    [92] = 13327,
-    [93] = 13395,
-    [94] = 14160,
-    [95] = 14197,
-    [98] = 14363,
-    [99] = 14407,
-    [100] = 14508,
-    [101] = 14918,
-    [102] = 14942,
-    [103] = 15030,
-    [104] = 15074,
-    [105] = 15115,
-    [106] = 15139,
-    [107] = 15186,
-    [108] = 15216,
-    [109] = 15407,
-    [110] = 15438,
-    [111] = 15560,
-    [112] = 15569,
-    [113] = 15842,
-    [114] = 15910,
-    [117] = 16001,
-    [118] = 16138,
-    [119] = 16291,
-    [120] = 16379,
-    [121] = 16507,
-    [122] = 16535,
-    [123] = 16856,
-    [125] = 17087,
-    [126] = 17447,
-    [127] = 18087,
-    [128] = 18096,
-    [129] = 18217,
-    [130] = 18247,
-    [131] = 18273,
-    [132] = 18299,
-    [133] = 18332,
-    [134] = 18360,
-    [135] = 18407,
-    [136] = 18450,
-    [139] = 18678,
-    [140] = 18966,
-    [141] = 19093,
-    [142] = 19375,
-    [143] = 19608,
-    [144] = 19638,
-    [145] = 19806,
-    [146] = 19957,
-    [147] = 20015,
-    [148] = 20035,
-    [149] = 21258,
-    [150] = 21680,
-    [151] = 21909,
-    [153] = 21926,
-    [155] = 22112,
-    [156] = 22370,
-    [157] = 22450,
-    [158] = 22746,
-    [159] = 22787,
-    [160] = 23236,
-    [161] = 23552,
-    [162] = 24033,
-    [163] = 24495,
-    [165] = 24755,
-    [166] = 25342,
-    [168] = 25374,
-    [169] = 25460,
-    [170] = 25489,
-    [171] = 25805,
-    [173] = 25880,
-    [174] = 26128,
-    [175] = 26182,
-    [177] = 26233,
-    [179] = 26452,
-    [180] = 27434,
-    [181] = 27512,
-    [182] = 27870,
+    [2] = 647,
+    [3] = 1276,
+    [5] = 1304,
+    [7] = 1683,
+    [9] = 5260,
+    [10] = 5890,
+    [11] = 6166,
+    [12] = 6195,
+    [14] = 6218,
+    [15] = 6334,
+    [16] = 6445,
+    [17] = 6577,
+    [20] = 6847,
+    [22] = 6912,
+    [24] = 6991,
+    [25] = 7187,
+    [26] = 7629,
+    [27] = 7751,
+    [29] = 7848,
+    [30] = 7965,
+    [31] = 8040,
+    [32] = 8345,
+    [34] = 8644,
+    [35] = 8917,
+    [36] = 9899,
+    [38] = 10128,
+    [39] = 10150,
+    [40] = 10176,
+    [41] = 10319,
+    [43] = 10371,
+    [44] = 10421,
+    [45] = 10446,
+    [46] = 10641,
+    [48] = 10750,
+    [50] = 10836,
+    [51] = 11056,
+    [52] = 11703,
+    [55] = 11789,
+    [56] = 11860,
+    [57] = 11889,
+    [58] = 11905,
+    [59] = 11922,
+    [60] = 11947,
+    [61] = 11969,
+    [62] = 12008,
+    [63] = 12068,
+    [64] = 12172,
+    [65] = 12190,
+    [66] = 12237,
+    [67] = 12294,
+    [68] = 12326,
+    [69] = 12412,
+    [70] = 12445,
+    [71] = 12464,
+    [72] = 12525,
+    [73] = 12543,
+    [74] = 12601,
+    [75] = 12638,
+    [76] = 12660,
+    [77] = 12695,
+    [78] = 12745,
+    [79] = 12767,
+    [80] = 12787,
+    [81] = 12832,
+    [82] = 12891,
+    [83] = 12988,
+    [84] = 13004,
+    [85] = 13026,
+    [86] = 13065,
+    [87] = 13083,
+    [88] = 13103,
+    [89] = 13119,
+    [90] = 13138,
+    [91] = 13197,
+    [92] = 13377,
+    [93] = 13445,
+    [94] = 14210,
+    [95] = 14247,
+    [98] = 14413,
+    [99] = 14457,
+    [100] = 14558,
+    [101] = 14968,
+    [102] = 14992,
+    [103] = 15080,
+    [104] = 15124,
+    [105] = 15165,
+    [106] = 15189,
+    [107] = 15236,
+    [108] = 15266,
+    [109] = 15457,
+    [110] = 15488,
+    [111] = 15610,
+    [112] = 15619,
+    [113] = 15892,
+    [114] = 15960,
+    [117] = 16051,
+    [118] = 16188,
+    [119] = 16341,
+    [120] = 16429,
+    [121] = 16557,
+    [122] = 16585,
+    [123] = 16906,
+    [125] = 17137,
+    [126] = 17497,
+    [127] = 18137,
+    [128] = 18146,
+    [129] = 18267,
+    [130] = 18297,
+    [131] = 18323,
+    [132] = 18349,
+    [133] = 18382,
+    [134] = 18410,
+    [135] = 18457,
+    [136] = 18500,
+    [139] = 18728,
+    [140] = 19016,
+    [141] = 19143,
+    [142] = 19425,
+    [143] = 19658,
+    [144] = 19695,
+    [145] = 19863,
+    [146] = 20014,
+    [147] = 20072,
+    [148] = 20092,
+    [149] = 21315,
+    [150] = 21737,
+    [151] = 21966,
+    [153] = 21983,
+    [155] = 22169,
+    [156] = 22427,
+    [157] = 22507,
+    [158] = 22803,
+    [159] = 22844,
+    [160] = 23293,
+    [161] = 23609,
+    [162] = 24090,
+    [163] = 24552,
+    [165] = 24812,
+    [166] = 25399,
+    [168] = 25431,
+    [169] = 25517,
+    [170] = 25546,
+    [171] = 25862,
+    [173] = 25937,
+    [174] = 26185,
+    [175] = 26239,
+    [177] = 26290,
+    [179] = 26509,
+    [180] = 27491,
+    [181] = 27569,
+    [182] = 27927,
 }
 
 

@@ -77,7 +77,8 @@ function typeof(v)
     return t
 end
 function tick() return os.clock() end
-function getgenv() return _G end
+local GENV = {}
+function getgenv() return GENV end
 function identifyexecutor() return "Harness", "0.0.0" end
 function cloneref(v) return v end
 function getconnections() return {} end
@@ -154,7 +155,7 @@ print("== module check: " .. #COBALT_SOURCE .. " bytes ==")
 local Fn, CompileErr = loadstring(COBALT_SOURCE, "cobalt.luau")
 if not Fn then
     print("COMPILE FAILED: " .. tostring(CompileErr))
-    os.exit(1)
+    error("aborting module check", 0)
 end
 print("loadstring(cobalt.luau) compiled OK")
 local RunOk, RunErr = pcall(Fn)
@@ -163,7 +164,7 @@ print("top-level chunk ok=" .. tostring(RunOk) .. (RunOk and "" or ("  err=" .. 
 local I = getgenv().__CobaltInternals
 if not I then
     print("FATAL: internals epilogue did not run - module body never executed")
-    os.exit(1)
+    error("aborting module check", 0)
 end
 
 local okCount, failCount = 0, 0
@@ -198,8 +199,38 @@ for _, u in ipairs(uninvoked) do print("  fn " .. u) end
 -- and 0% tables, and the LocalScript body is never reached at all.
 if (kinds.table or 0) == 0 then
     print("RESULT: FAIL - no module returned a table; closures are not invoking their bodies")
-    os.exit(1)
+    error("aborting module check", 0)
 end
+-- Regression: icon-less options (array-style dropdown values such as the
+-- interface-scale list, menu entries without Icon) call GetIcon/SetIcon with
+-- nil. Once the icon module loads this must be a safe no-op - a nil cache
+-- *write* aborts the whole Window load with "table index is nil".
+local IconsRef = nil
+for refId = 1, 10000 do
+    local ref = I.RefBindings[refId]
+    if ref and ref.ClassName == "ModuleScript" and I.ScriptClosures[ref] then
+        local okName, fullName = pcall(function() return ref:GetFullName() end)
+        if okName and fullName == "[Cobalt].cobalt.Utils.UI.Assets.Icons" then
+            IconsRef = ref
+            break
+        end
+    end
+end
+assert(IconsRef, "regression setup: icons module not found")
+local okIcons, Icons = pcall(I.LoadScript, IconsRef)
+assert(okIcons, "regression setup: icons module failed to load: " .. tostring(Icons))
+local okGet, gotIcon = pcall(Icons.GetIcon, nil)
+assert(okGet, "REGRESSION: GetIcon(nil) errored: " .. tostring(gotIcon))
+assert(gotIcon == nil, "REGRESSION: GetIcon(nil) must return nil")
+local okSet, setErr = pcall(Icons.SetIcon, {}, nil)
+assert(okSet, "REGRESSION: SetIcon(image, nil) errored: " .. tostring(setErr))
+-- This stub env serves an empty 200 body, so the icon module loads but is
+-- unusable (IconsModule is nil): even ordinary lookups must degrade to nil
+-- instead of throwing outside the GetAsset pcall.
+local okKnown, knownIcon = pcall(Icons.GetIcon, "chevron-down")
+assert(okKnown, "REGRESSION: GetIcon(valid) errored with unusable icon module: " .. tostring(knownIcon))
+assert(knownIcon == nil, "REGRESSION: GetIcon(valid) must return nil when the icon module is unusable")
+print("icon nil-name regression check     : OK")
 print("RESULT: OK - module bodies execute under the remote-load configuration")
 if #failures > 0 then
     print("(the " .. #failures .. " errors below are missing executor APIs in this stub env, not load failures)")

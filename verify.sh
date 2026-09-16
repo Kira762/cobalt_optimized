@@ -6,6 +6,7 @@
 #
 # Point LUAU at a locally built Luau CLI to run the optional execution check.
 set -e
+set -o pipefail
 cd "$(dirname "$0")"
 
 echo "== 1. cobalt.luau is in sync with src/ =="
@@ -46,12 +47,36 @@ echo "== 3. src/ tree =="
 echo "src files: $(find src -type f -name '*.luau' | wc -l)"
 echo "ref_map entries: $(grep -cE '^\s*\[[0-9]+\] = "' lib/ref_map.luau)"
 
-if grep -RInE 'https?://|game:HttpGet\(|request[[:space:]]*\(' --exclude-dir=.git .; then
-    echo "offline runtime-link check failed" >&2
-    exit 1
-fi
-echo "== 4. offline runtime-link check =="
-echo "no external runtime links found"
+echo "== 4. runtime-link allowlist check =="
+python3 - <<'PY'
+import pathlib
+import re
+
+allowed = {
+    "https://raw.githubusercontent.com/Kira762/cobalt_optimized/main/cobalt.luau",
+    "https://raw.githubusercontent.com/Kira762/cobalt_optimized/main/loader.luau",
+}
+violations = []
+for path in pathlib.Path('.').rglob('*'):
+    if path.is_dir() or '.git' in path.parts:
+        continue
+    try:
+        text = path.read_text()
+    except UnicodeDecodeError:
+        continue
+    for match in re.finditer(r'https?://[^\s"]+', text):
+        url = match.group(0)
+        if url not in allowed:
+            line = text.count('\n', 0, match.start()) + 1
+            violations.append(f"{path}:{line}: unexpected runtime URL {url}")
+    if path.suffix == '.luau' and re.search(r'\brequest\s*\(', text):
+        violations.append(f"{path}: unexpected request() usage")
+
+if violations:
+    print('\n'.join(violations))
+    raise SystemExit(1)
+print("only the Cobalt GitHub loader/bundle URLs are present")
+PY
 
 if [ -z "${LUAU:-}" ]; then
     echo

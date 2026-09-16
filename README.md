@@ -3,18 +3,20 @@
 Cobalt is a modular Luau remote inspector. `src/` is the source of truth and
 `cobalt.luau` is the generated, self-contained bundle used by the executor.
 
-This checkout is deliberately offline at runtime:
+Runtime loading is self-contained after the bundle is fetched:
 
 - `assets/` contains the UI PNGs used by the local asset resolver.
 - External asset/module downloads were removed. Missing local images fall back to
   the packaged Roblox asset ids and fonts use their packaged font ids.
-- `loader.luau` reads only a local `cobalt.luau`; it never calls an HTTP loader.
-- Teleport relaunch uses the same local-file policy.
+- `loader.luau` prefers a local/cached `cobalt.luau`, then falls back to
+  downloading the generated bundle from this repository.
+- Teleport relaunch reuses the lightweight loader so one-line loadstring users
+  do not need to copy the large bundle by hand.
 
 ## Structure
 
 ```
-loader.luau          # local-only executor loader
+loader.luau          # lightweight local-or-remote executor loader
 cobalt.luau          # generated single-file bundle
 assets/              # repository-owned logo, class markers, and icon atlas
 src/                 # editable Luau modules
@@ -30,9 +32,16 @@ verify.sh            # structural verification
 
 ## Run locally
 
-Put the repository (including `assets/`) in the executor's script directory and
-paste the contents of `loader.luau`. Alternatively, read `cobalt.luau` directly
-with the executor's local file API.
+Run the lightweight remote loader:
+
+```lua
+loadstring(game:HttpGet("https://raw.githubusercontent.com/Kira762/cobalt_optimized/main/loader.luau"))()
+```
+
+The loader prefers `cobalt.luau` from the executor's script directory when it is
+already present, then downloads the generated bundle from GitHub and caches it
+when `writefile` is available. You can still read `cobalt.luau` directly with
+the executor's local file API if you want a fully local setup.
 
 The bundle does not need the source tree at runtime, but the local assets are
 used when the executor supports `getcustomasset`. If they are unavailable the

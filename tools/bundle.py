@@ -60,31 +60,47 @@ def read_source(path: str) -> str:
     return text.strip("\n")
 
 
-def lua_quote(value: str) -> str:
-    """Quote UTF-8 text as a Luau double-quoted string.
+def lua_quote(value: str, chunk_size: int = 12000) -> str:
+    """Quote UTF-8 text as a Luau string expression.
 
-    ObjectTree stores the HTML as a normal Lua string rather than reading a
-    second file at runtime. Decimal byte escapes keep the generated object tree
-    portable across executors with different source encodings.
+    ObjectTree stores generated text values directly instead of reading extra
+    files at runtime. Decimal byte escapes keep the generated object tree
+    portable across executors with different source encodings. Large values are
+    emitted as concatenated string chunks because Luau rejects extremely long
+    single-line string literals as malformed.
     """
-    out = ['"']
+    escaped: list[str] = []
     for byte in value.encode("utf-8"):
         if byte == 10:
-            out.append("\\n")
+            escaped.append("\\n")
         elif byte == 13:
-            out.append("\\r")
+            escaped.append("\\r")
         elif byte == 9:
-            out.append("\\t")
+            escaped.append("\\t")
         elif byte == 92:
-            out.append("\\\\")
+            escaped.append("\\\\")
         elif byte == 34:
-            out.append('\\"')
+            escaped.append('\\"')
         elif 32 <= byte <= 126:
-            out.append(chr(byte))
+            escaped.append(chr(byte))
         else:
-            out.append("\\%03d" % byte)
-    out.append('"')
-    return "".join(out)
+            escaped.append("\\%03d" % byte)
+
+    chunks: list[str] = []
+    current: list[str] = []
+    current_len = 0
+    for part in escaped:
+        if current and current_len + len(part) > chunk_size:
+            chunks.append('"' + "".join(current) + '"')
+            current = []
+            current_len = 0
+        current.append(part)
+        current_len += len(part)
+    chunks.append('"' + "".join(current) + '"')
+
+    if len(chunks) == 1:
+        return chunks[0]
+    return "(\n" + " ..\n".join("                                            " + chunk for chunk in chunks) + "\n                                        )"
 
 
 def find_value_span(object_tree: str, marker: str) -> tuple[int, int]:
@@ -109,6 +125,22 @@ def find_value_span(object_tree: str, marker: str) -> tuple[int, int]:
     while index < len(object_tree):
         char = object_tree[index]
         if char == '"' and not escaped:
+            # Repair a historical bad SessionHTMLView sync that left two quoted
+            # strings back-to-back (Value = "...""<!DOCTYPE html>...").  Treat
+            # both quoted strings as the old value span so regeneration emits a
+            # single valid Luau string again.
+            if object_tree.startswith('"<!DOCTYPE html>', index + 1):
+                second_index = index + 2
+                second_escaped = False
+                while second_index < len(object_tree):
+                    second_char = object_tree[second_index]
+                    if second_char == '"' and not second_escaped:
+                        return value_start, second_index
+                    if second_char == "\\" and not second_escaped:
+                        second_escaped = True
+                    else:
+                        second_escaped = False
+                    second_index += 1
             return value_start, index
         if char == "\\" and not escaped:
             escaped = True
@@ -147,10 +179,41 @@ def decode_lua_string(raw: str) -> str:
     return "".join(out)
 
 
-def replace_serialized_value(object_tree: str, marker: str, value: str) -> str:
-    start, end = find_value_span(object_tree, marker)
-    quoted = lua_quote(value)
-    return object_tree[:start] + quoted[1:-1] + object_tree[end:]
+def replace_serialized_value(object_tree: str, marker: str, value: str, *, chunk_size: int = 12000) -> str:
+    marker_index = object_tree.rfind(marker)
+    if marker_index < 0:
+        raise AssertionError(f"object-tree marker is missing: {marker!r}")
+
+    prefix = "Value = "
+    expr_start = object_tree.find(prefix, marker_index) + len(prefix)
+    if expr_start < len(prefix):
+        raise AssertionError(f"Value field is missing after {marker!r}")
+
+    quoted = lua_quote(value, chunk_size=chunk_size)
+
+    if object_tree[expr_start] == '"':
+        start, end = find_value_span(object_tree, marker)
+        # Replace the whole quoted literal, not just its contents, so large values
+        # can become parenthesized concatenation expressions.
+        return object_tree[: start - 1] + quoted + object_tree[end + 1 :]
+
+    if object_tree[expr_start] == "(":
+        # Repair/rewrite a chunked expression emitted by this bundler.  The
+        # generated closing parenthesis is intentionally indented to the Value
+        # field, which gives us a stable terminator without having to parse
+        # arbitrary JavaScript inside the string chunks.
+        terminator = "\n                                        )"
+        expr_end = object_tree.find(terminator, expr_start)
+        if expr_end < 0:
+            raise AssertionError(f"chunked Value field is unterminated after {marker!r}")
+        expr_end += len(terminator)
+        if expr_end < len(object_tree) and object_tree[expr_end] == '"':
+            # Recover from an intermediate generator that left the old closing
+            # quote after a parenthesized chunk expression.
+            expr_end += 1
+        return object_tree[:expr_start] + quoted + object_tree[expr_end:]
+
+    raise AssertionError(f"unsupported Value expression after {marker!r}")
 
 
 def sync_session_template(object_tree: str) -> str:
@@ -208,7 +271,7 @@ def sync_actor_environment(object_tree: str) -> str:
     indented_log = "\n".join("\t" + line if line else "" for line in log_source.split("\n"))
     embedded = embedded[:log_start] + "do\n" + indented_log + "\nend" + embedded[log_end:]
 
-    return replace_serialized_value(object_tree, ACTOR_ENVIRONMENT_MARKER, embedded)
+    return replace_serialized_value(object_tree, ACTOR_ENVIRONMENT_MARKER, embedded, chunk_size=1_000_000_000)
 
 
 def build_closures(ref_map: dict[int, str], closure_start_line: int) -> tuple[str, dict[int, int]]:

@@ -1,26 +1,33 @@
--- Cobalt local loader.
+-- Cobalt bootstrap loader.
 --
--- The loader is aggressively offline. Keep cobalt.luau and the assets/
--- directory beside this file (or inside a cobalt_optimized folder) in the
--- executor's script directory. No remote source is fetched at runtime.
+-- Preferred usage:
+--   loadstring(game:HttpGet("https://raw.githubusercontent.com/Kira762/cobalt_optimized/main/loader.luau"))()
 --
--- Supported placements (first match wins):
---   <executor_scripts>/cobalt.luau
---   <executor_scripts>/cobalt_optimized/cobalt.luau
---   (plus common executor-specific subdirectories)
+-- The loader still uses a local cobalt.luau when one exists, but it now falls
+-- back to downloading the generated bundle from GitHub so users do not need to
+-- copy or paste the large bundle by hand.
 
 ------------------------------------------------------------------------
 -- helpers
 ------------------------------------------------------------------------
 
+local COBALT_BUNDLE_URL = "https://raw.githubusercontent.com/Kira762/cobalt_optimized/main/cobalt.luau"
+
+local function SafeTypeof(Value)
+	if typeof then
+		return typeof(Value)
+	end
+	return type(Value)
+end
+
 local function TryRead(Candidates)
-	if typeof(readfile) ~= "function" then
+	if SafeTypeof(readfile) ~= "function" then
 		return nil
 	end
 
 	for _, Path in Candidates do
 		-- Prefer isfile() to avoid unnecessary pcall overhead
-		if typeof(isfile) == "function" then
+		if SafeTypeof(isfile) == "function" then
 			local Ok, Exists = pcall(isfile, Path)
 			if not (Ok and Exists) then
 				continue
@@ -37,12 +44,64 @@ local function TryRead(Candidates)
 	return nil
 end
 
+local function TryWriteCache(Source)
+	if SafeTypeof(writefile) ~= "function" then
+		return
+	end
+
+	pcall(function()
+		writefile("cobalt.luau", Source)
+	end)
+end
+
 local function StripTrailingSep(Dir)
 	local Last = Dir:sub(-1)
 	if (Last == "/" or Last == "\\") and #Dir > 3 then
 		return Dir:sub(1, -2)
 	end
 	return Dir
+end
+
+local function LooksLikeCobaltBundle(Source)
+	return type(Source) == "string"
+		and #Source > 1000
+		and Source:find("Cobalt", 1, true) ~= nil
+		and Source:find("ClosureBindings", 1, true) ~= nil
+end
+
+local function TryHttpGet(Url)
+	if game ~= nil then
+		if SafeTypeof(game.HttpGet) == "function" then
+			local Ok, Content = pcall(function()
+				return game:HttpGet(Url)
+			end)
+			if Ok and LooksLikeCobaltBundle(Content) then
+				return Content
+			end
+		end
+
+		if SafeTypeof(game.HttpGetAsync) == "function" then
+			local Ok, Content = pcall(function()
+				return game:HttpGetAsync(Url)
+			end)
+			if Ok and LooksLikeCobaltBundle(Content) then
+				return Content
+			end
+		end
+	end
+
+	return nil
+end
+
+local function TryRemoteFetch()
+	local Source = TryHttpGet(COBALT_BUNDLE_URL)
+	if Source then
+		print("[Cobalt] source: remote bundle " .. COBALT_BUNDLE_URL)
+		TryWriteCache(Source)
+		return Source
+	end
+
+	return nil
 end
 
 ------------------------------------------------------------------------
@@ -64,7 +123,7 @@ local LocalCandidates = {
 local ExecutorBases = {}
 
 -- getworkingdirectory (Synapse, Script-Ware, Fluxus, etc.)
-if typeof(getworkingdirectory) == "function" then
+if SafeTypeof(getworkingdirectory) == "function" then
 	local Ok, Dir = pcall(getworkingdirectory)
 	if Ok and type(Dir) == "string" and #Dir > 0 then
 		table.insert(ExecutorBases, StripTrailingSep(Dir))
@@ -84,11 +143,11 @@ for _, Base in ipairs(ExecutorBases) do
 end
 
 ------------------------------------------------------------------------
--- try listfiles-based discovery (last resort)
+-- try listfiles-based discovery (last resort before network)
 ------------------------------------------------------------------------
 
 local function TryListFilesDiscovery()
-	if typeof(listfiles) ~= "function" or typeof(readfile) ~= "function" then
+	if SafeTypeof(listfiles) ~= "function" or SafeTypeof(readfile) ~= "function" then
 		return nil
 	end
 
@@ -123,13 +182,19 @@ local Source = TryRead(LocalCandidates)
 if not Source then
 	Source = TryListFilesDiscovery()
 end
+if not Source then
+	Source = TryRemoteFetch()
+end
 
 if not Source then
 	-- Build a helpful diagnostic message
 	local Lines = {
-		"[Cobalt] cobalt.luau was not found on disk.",
+		"[Cobalt] cobalt.luau could not be loaded.",
 		"",
-		"To fix this, place cobalt.luau in your executor's script folder.",
+		"The loader tried local files first, then tried to download:",
+		"  " .. COBALT_BUNDLE_URL,
+		"",
+		"If your executor blocks game:HttpGet, place cobalt.luau in your executor's script folder as a fallback.",
 		"",
 	}
 
@@ -140,23 +205,17 @@ if not Source then
 		end
 	else
 		table.insert(Lines, "Could not detect executor script directory.")
-		table.insert(Lines, "Copy cobalt.luau into the same folder where your executor runs scripts.")
 	end
 
 	table.insert(Lines, "")
-	table.insert(Lines, "Quick steps:")
-	table.insert(Lines, "  1. Copy cobalt.luau from the cobalt_optimized repository")
-	table.insert(Lines, "  2. Paste it into your executor's script directory")
-	table.insert(Lines, "  3. Run this loader again")
-	table.insert(Lines, "")
-	table.insert(Lines, "Searched " .. #LocalCandidates .. " paths without success.")
+	table.insert(Lines, "Searched " .. #LocalCandidates .. " local paths without success.")
 
 	error(table.concat(Lines, "\n"))
 end
 
 local Fn, CompileError = loadstring(Source, "@cobalt.luau")
 if not Fn then
-	error("[Cobalt] local source failed to compile: " .. tostring(CompileError))
+	error("[Cobalt] source failed to compile: " .. tostring(CompileError))
 end
 
 Fn()

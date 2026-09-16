@@ -41,11 +41,16 @@ local LocalCandidates = {
 
 -- Absolute fallbacks: the clone may live outside the script directory.
 if typeof(getworkingdirectory) == "function" then
-	local Ok, Dir = pcall(getworkingdirectory)
-	if Ok and type(Dir) == "string" and Dir ~= "" then
-		table.insert(LocalCandidates, Dir .. "/cobalt.luau")
-		table.insert(LocalCandidates, Dir .. "/cobalt_optimized/cobalt.luau")
-	end
+		local Ok, Dir = pcall(getworkingdirectory)
+		if Ok and type(Dir) == "string" and Dir ~= "" then
+			-- Some executors (e.g. Synapse) return a trailing separator.
+			local Last = Dir:sub(-1)
+			if (Last == "/" or Last == "\\") and #Dir > 3 then
+				Dir = Dir:sub(1, -2)
+			end
+			table.insert(LocalCandidates, Dir .. "/cobalt.luau")
+			table.insert(LocalCandidates, Dir .. "/cobalt_optimized/cobalt.luau")
+		end
 end
 
 local Source = TryRead(LocalCandidates)

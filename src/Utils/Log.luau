@@ -1,0 +1,554 @@
+local Log = {}
+Log.__index = Log
+
+local PendingCallDecisions = setmetatable({}, { __mode = "k" })
+
+
+wax.shared.LogNotificationQueue = {
+	Items = {},
+	Head = 1,
+	Tail = 0,
+}
+
+local function QueueNotification(LogObject, CallIndex: number)
+	local Queue = wax.shared.LogNotificationQueue
+	Queue.Tail += 1
+	Queue.Items[Queue.Tail] = {
+		Instance = LogObject.Instance,
+		Type = LogObject.Type,
+		LogIndex = LogObject.Index,
+		CallIndex = CallIndex,
+	}
+end
+
+
+local SpamCallCountThreshold = 15
+local SpamTimeWindowSeconds = 1
+local AutoIgnoreSpammyEvents = false
+
+if not wax.shared.IS_ACTOR then
+	wax.shared.Connect(wax.shared.RunService.Heartbeat:Connect(function()
+		local Queue = wax.shared.LogNotificationQueue
+		local Tail = Queue.Tail
+
+		if Queue.Head > Tail then
+			return
+		end
+
+		local Batch = {}
+		local BatchSize = 0
+		while Queue.Head <= Tail do
+			local Notification = Queue.Items[Queue.Head]
+			Queue.Items[Queue.Head] = nil
+			Queue.Head += 1
+
+			if Notification then
+				BatchSize += 1
+				Batch[BatchSize] = Notification
+			end
+		end
+
+		table.clear(Queue.Items)
+		Queue.Head = 1
+		Queue.Tail = 0
+
+		if BatchSize > 0 then
+			local Communicator = wax.shared.Communicator
+			if Communicator then
+				AutoIgnoreSpammyEvents = wax.shared.SaveManager:GetState("AutoIgnoreSpammyEvents", false)
+				Communicator:Fire(Batch)
+			end
+
+			table.clear(Batch)
+		end
+	end))
+end
+
+
+local FunctionToMetatadata, FixTable
+do
+	if wax.shared.IS_ACTOR then
+		local FunctionMetadataCache = setmetatable({}, { __mode = "k" })
+
+		local function CreateTraversalState(Refs)
+			return {
+				CyclicRefs = Refs or {},
+				TableIds = setmetatable({}, { __mode = "k" }),
+				Functions = setmetatable({}, { __mode = "k" }),
+				NextId = 0,
+			}
+		end
+
+		local function GenerateId(State)
+			State.NextId += 1
+			return State.NextId
+		end
+
+		FixTable = function(Table, State)
+			if not Table then
+				return nil
+			end
+
+			if not State or not State.CyclicRefs then
+				State = CreateTraversalState(State)
+			end
+
+			local CyclicRefs = State.CyclicRefs
+			local TableId = State.TableIds[Table]
+			if not TableId then
+				TableId = GenerateId(State)
+				State.TableIds[Table] = TableId
+			end
+
+			local OutputTable = {}
+			CyclicRefs[TableId] = OutputTable
+
+			local ContainsCyclicRef = false
+
+			for Key, Value in next, Table do
+				if type(Value) == "table" then
+					local ExistingId = State.TableIds[Value]
+					if ExistingId then
+						ContainsCyclicRef = true
+
+						OutputTable[Key] = {
+							__CyclicRef = true,
+							__Id = ExistingId,
+						}
+						continue
+					end
+
+					if getmetatable(Value) then
+						OutputTable[Key] =
+							"Cobalt: Impossible to bridge table with metatable from actor Environment to main Environment"
+						continue
+					end
+
+					local Result, _, ContainsCyclic = FixTable(Value, State)
+					if not Result then
+						continue
+					end
+
+					OutputTable[Key] = Result
+					ContainsCyclicRef = ContainsCyclicRef or ContainsCyclic
+				elseif type(Value) == "function" then
+					OutputTable[Key] = FunctionToMetatadata(Value, State)
+				else
+					OutputTable[Key] = Value
+				end
+			end
+
+			return OutputTable, CyclicRefs, ContainsCyclicRef
+		end
+
+		FunctionToMetatadata = function(Function, State)
+			if not Function then
+				return nil
+			end
+
+			if not State or not State.CyclicRefs then
+				State = CreateTraversalState()
+			end
+
+			local CachedMetadata = FunctionMetadataCache[Function]
+			if CachedMetadata then
+				return CachedMetadata
+			end
+
+			local Metadata = {
+				Address = tostring(Function),
+				Name = debug.info(Function, "n"),
+				Source = debug.info(Function, "s"),
+				IsC = iscclosure(Function),
+			}
+
+			if State.Functions[Function] then
+				Metadata["Recursive"] = true
+				Metadata["Validation"] = Data.Token
+				Metadata["__Function"] = true
+
+				return Metadata
+			end
+
+			State.Functions[Function] = true
+
+			if not iscclosure(Function) then
+				Metadata["Upvalues"] = debug.getupvalues and #debug.getupvalues(Function) or 0
+				Metadata["Constants"] = debug.getconstants and #debug.getconstants(Function) or 0
+				Metadata["Protos"] = debug.getprotos and #debug.getprotos(Function) or 0
+
+				if getfunctionhash then
+					Metadata["FunctionHash"] = getfunctionhash(Function)
+				end
+			end
+
+			
+			Metadata["Validation"] = Data.Token
+			Metadata["__Function"] = true
+
+			FunctionMetadataCache[Function] = Metadata
+
+			return Metadata
+		end
+	end
+end
+
+
+function DeepClone(OriginalValue, ValueCopies)
+	if wax.shared.IS_ACTOR then
+		return OriginalValue
+	end
+
+	local OriginalType = type(OriginalValue)
+	if OriginalType ~= "table" then
+		if OriginalType == "string" or OriginalType == "number" or OriginalType == "boolean" or OriginalValue == nil then
+			return OriginalValue
+		end
+
+		local RobloxType = typeof(OriginalValue)
+		if RobloxType == "Instance" then
+			return cloneref(OriginalValue)
+	
+		elseif RobloxType == "userdata" then
+			if getmetatable(OriginalValue) then
+				return newproxy(true)
+			else
+				return newproxy()
+			end
+
+		elseif RobloxType == "function" then
+			if clonefunction then
+				return clonefunction(OriginalValue)
+			else
+				return OriginalValue
+			end
+		end
+
+		return OriginalValue
+	end
+
+	
+	if ValueCopies then
+		local CachedValue = ValueCopies[OriginalValue]
+		if CachedValue then
+			return CachedValue
+		end
+	else
+		ValueCopies = {}
+	end
+
+	
+	local ShallowCopy = {}
+	ValueCopies[OriginalValue] = ShallowCopy
+
+	for Key, Value in next, OriginalValue do
+		local ValueType = type(Value)
+
+		if ValueType == "table" then
+			ShallowCopy[Key] = DeepClone(Value, ValueCopies)
+
+		elseif ValueType == "userdata" then
+			local ValueRobloxType = typeof(Value)
+
+			if ValueRobloxType == "Instance" then
+				ShallowCopy[Key] = cloneref(Value)
+
+			elseif ValueRobloxType == "userdata" then
+				if getmetatable(Value) then
+					ShallowCopy[Key] = newproxy(true)
+				else
+					ShallowCopy[Key] = newproxy()
+				end
+
+			else
+				ShallowCopy[Key] = Value
+			end
+
+		elseif ValueType == "function" then
+			if clonefunction then
+				ShallowCopy[Key] = clonefunction(Value)
+			else
+				ShallowCopy[Key] = Value
+			end
+	
+		else
+			ShallowCopy[Key] = Value
+		end
+	end
+
+	return ShallowCopy
+end
+
+if wax.shared.IS_ACTOR then
+	wax.shared.SerializeActorInfo = function(Info)
+		return FixTable(DeepClone(Info))
+	end
+end
+
+function Log.new(Instance, Type, Index, CallingScript)
+	local NewLog = setmetatable({
+		Instance = Instance,
+		Type = Type,
+		Index = Index,
+		Calls = {},
+		GameCalls = {},
+		SpamWindowStart = 0,
+		SpamCallCount = 0,
+		Ignored = false,
+		Blocked = false,
+		Button = nil,
+	}, Log)
+
+	return NewLog
+end
+
+function Log:IsOverSpamThreshold()
+	if not AutoIgnoreSpammyEvents then
+		return false
+	end
+
+	local Now = tick()
+	if Now - self.SpamWindowStart > SpamTimeWindowSeconds then
+		self.SpamWindowStart = Now
+		self.SpamCallCount = 0
+	end
+
+	self.SpamCallCount = self.SpamCallCount + 1
+
+	if self.SpamCallCount > SpamCallCountThreshold then
+		if not self.Ignored then
+			self.Ignore(self)
+			wax.shared.Sonner.info(`Ignored {self.Instance.Name} ({self.Type}) due to event spam.`)
+		end
+
+		return true
+	end
+
+	return false
+end
+
+local function RunInterceptors(Interceptors: { (...any) -> ...any }, Info: any, Log): boolean
+	for _, Callback in Interceptors do
+		local Ok, Result = pcall(Callback, Info, Log.Instance, Log.Type)
+		if not Ok then
+			warn(`[Cobalt Plugin Interceptor] Error: {Result}`)
+		elseif Result == false then
+			return true
+		end
+	end
+
+	return false
+end
+
+function Log:ShouldBlock(RawInfo, PendingCallDecisionsKey): boolean
+	PendingCallDecisionsKey = PendingCallDecisionsKey or tostring(RawInfo)
+
+	local Decision = PendingCallDecisions[PendingCallDecisionsKey]
+	if Decision then
+		return Decision.ShouldBlock
+	end
+
+	local FilterAction
+	local CallFilters = wax.shared.CallFilters
+	do
+		if CallFilters then
+			FilterAction = CallFilters:Resolve(self.Instance, self.Type, RawInfo)
+		end
+	end
+
+	local ShouldBlock = RawInfo.Blocked == true or self.Blocked or FilterAction == "Block"
+	if ShouldBlock then
+		RawInfo.Blocked = true
+	end
+
+	PendingCallDecisions[PendingCallDecisionsKey] = {
+		FilterAction = FilterAction,
+		ShouldBlock = ShouldBlock,
+	}
+	return ShouldBlock
+end
+
+function Log:Call(RawInfo): number?
+	local PendingCallDecisionsKey = tostring(RawInfo)
+
+	local ShouldBlock = self:ShouldBlock(RawInfo, PendingCallDecisionsKey)
+	local Decision = PendingCallDecisions[PendingCallDecisionsKey]
+	PendingCallDecisions[PendingCallDecisionsKey] = nil
+
+	local ShouldCapture = not self.Ignored and Decision.FilterAction ~= "Ignore"
+	do
+		if ShouldBlock then
+			ShouldCapture = wax.shared.SaveManager:GetState("LogBlockedRemotes", false)
+		end
+
+		if RawInfo.Omit then
+			ShouldCapture = false
+		end
+	end
+
+	if not ShouldCapture then
+		return nil
+	end
+
+	
+	if not wax.shared.IS_ACTOR then
+		local Success, SpamData = pcall(function() return self.IsOverSpamThreshold(self) end)
+		if Success and SpamData then
+			return nil
+		end
+	end
+
+	
+	local Info = DeepClone(RawInfo)
+	Info.CreationTime = tick()
+
+	
+	if wax.shared.IS_ACTOR then
+		if self.Instance == wax.shared.Communicator then
+			return nil
+		end
+
+		Info["Actor"] = CurrentActor
+
+		
+		local OldArguments = Info.Arguments
+		Info.Arguments = {
+			Data = OldArguments,
+			n = OldArguments.n,
+		}
+
+		if Info.InvokeResult then
+			local OldInvokeResult = Info.InvokeResult
+			Info.InvokeResult = {
+				Data = OldInvokeResult,
+				n = OldInvokeResult.n,
+			}
+		end
+
+		local FixedInfo, CyclicRefs, ContainsCyclicRef = FixTable(Info)
+
+		
+		local identity = getthreadidentity()
+		setthreadidentity(8)
+		wax.shared.Communicator.Fire(
+			wax.shared.Communicator,
+			"ActorCall",
+			self.Instance,
+			self.Type,
+			FixedInfo,
+			CyclicRefs,
+			ContainsCyclicRef
+		)
+		setthreadidentity(identity)
+		return nil
+	end
+
+	
+	local PluginManager = wax.shared.CobaltPluginManager
+	if PluginManager and PluginManager.HasInterceptors then
+		
+		local InstanceIntercept = PluginManager.Registry.Interceptors.Instance[self.Instance]
+		if InstanceIntercept then
+			if InstanceIntercept[self.Type] and RunInterceptors(InstanceIntercept[self.Type], Info, self) then
+				return nil
+			end
+			if InstanceIntercept["All"] and RunInterceptors(InstanceIntercept["All"], Info, self) then
+				return nil
+			end
+		end
+
+		
+		local GlobalByType = PluginManager.Registry.Interceptors.Global[self.Type]
+		if GlobalByType and RunInterceptors(GlobalByType, Info, self) then
+			return nil
+		end
+
+		local GlobalAll = PluginManager.Registry.Interceptors.Global["All"]
+		if GlobalAll and RunInterceptors(GlobalAll, Info, self) then
+			return nil
+		end
+	end
+
+	
+	local Index = #self.Calls + 1
+	self.Calls[Index] = Info
+	if not Info.IsExecutor then
+		table.insert(self.GameCalls, Index)
+	end
+
+	QueueNotification(self, Index)
+	return Index
+end
+
+function Log:ClearCalls()
+	table.clear(self.Calls)
+	table.clear(self.GameCalls)
+end
+
+function Log:Ignore()
+	self.Ignored = not self.Ignored
+
+	if not wax.shared.IS_ACTOR then
+		if wax.shared.ActorCommunicator then
+			pcall(wax.shared.ActorCommunicator.Fire, wax.shared.ActorCommunicator, "MainIgnore", self.Instance, self.Type)
+		end
+
+		local IgnoredRemoteList = wax.shared.Settings["IgnoredRemotes"]
+		if IgnoredRemoteList then
+			if self.Ignored then
+				IgnoredRemoteList:AddToList(self)
+			else
+				IgnoredRemoteList:RemoveFromList(self)
+			end
+		end
+	end
+end
+
+local ClassesConnectionsToggle = {
+	RemoteEvent = "OnClientEvent",
+	UnreliableRemoteEvent = "OnClientEvent",
+	BindableEvent = "Event",
+}
+
+function Log:SetConnectionsEnabled(enabled: boolean)
+	if not self.Instance or not ClassesConnectionsToggle[self.Instance.ClassName] then
+		return
+	end
+
+	local ConnectionName = ClassesConnectionsToggle[self.Instance.ClassName]
+	if self.Type ~= "Incoming" or not ConnectionName then
+		return
+	end
+
+	local LoggingFunctions = wax.shared.IncomingLogConnectionFunctions
+	for _, Connection in pairs(getconnections(self.Instance[ConnectionName])) do
+		if LoggingFunctions and LoggingFunctions[Connection.Function] then
+			continue
+		end
+
+		if enabled then
+			Connection:Enable()
+		else
+			Connection:Disable()
+		end
+	end
+end
+
+function Log:Block()
+	if not wax.shared.IS_ACTOR and wax.shared.ActorCommunicator then
+		pcall(wax.shared.ActorCommunicator.Fire, wax.shared.ActorCommunicator, "MainBlock", self.Instance, self.Type)
+	end
+
+	self.Blocked = not self.Blocked
+	self:SetConnectionsEnabled(not self.Blocked)
+end
+
+function Log:SetButton(Instance, Name, Calls)
+	self.Button = {
+		Instance = Instance,
+		Name = Name,
+		Calls = Calls,
+	}
+end
+
+return Log

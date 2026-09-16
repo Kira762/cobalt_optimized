@@ -22,16 +22,33 @@ local Success, IconsModule = pcall(function()
 	return (loadstring(IconModuleSource.Body) :: () -> { Icons: { string }, GetAsset: (Name: string) -> Icon? })()
 end)
 
+--[[
+	Icon lookups are memoised.
+
+	SetIcon runs for every icon in the interface (every call row, every menu
+	option, every toast) and each miss used to pay for a pcall plus a lookup
+	inside the loaded icon module.  Negative results are cached too, so an icon
+	that does not exist is not searched for again.
+]]
+local IconCache = {}
+
 function Icons.GetIcon(iconName: string): Icon?
-	if not Success then
-		return
+	local Cached = IconCache[iconName]
+	if Cached ~= nil then
+		return Cached or nil
 	end
 
-	local Success, Icon = pcall(IconsModule.GetAsset, iconName)
 	if not Success then
-		return
+		return nil
 	end
 
+	local Ok, Icon = pcall(IconsModule.GetAsset, iconName)
+	if not Ok or not Icon then
+		IconCache[iconName] = false
+		return nil
+	end
+
+	IconCache[iconName] = Icon
 	return Icon
 end
 
@@ -41,9 +58,18 @@ function Icons.SetIcon(imageInstance: ImageLabel, iconName: string)
 		return
 	end
 
-	imageInstance.Image = Icon.Url
-	imageInstance.ImageRectOffset = Icon.ImageRectOffset
-	imageInstance.ImageRectSize = Icon.ImageRectSize
+	-- Skip redundant property writes: they still dirty the instance.
+	if imageInstance.Image ~= Icon.Url then
+		imageInstance.Image = Icon.Url
+	end
+
+	if imageInstance.ImageRectOffset ~= Icon.ImageRectOffset then
+		imageInstance.ImageRectOffset = Icon.ImageRectOffset
+	end
+
+	if imageInstance.ImageRectSize ~= Icon.ImageRectSize then
+		imageInstance.ImageRectSize = Icon.ImageRectSize
+	end
 end
 
 return Icons

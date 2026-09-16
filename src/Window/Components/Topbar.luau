@@ -3,6 +3,7 @@ local Interface = require("@src/Utils/UI/Interface")
 local Constants = require("@src/Window/Constants")
 local Drag = require("@src/Window/Utils/Input/Drag")
 local ModalController = require("@src/Window/Components/Modal")
+local Animations = require("@src/Window/Utils/Animations")
 
 
 return function(props: {
@@ -90,21 +91,17 @@ return function(props: {
 			Parent = Button,
 		})
 
-		Button.MouseEnter:Connect(function()
-			wax.shared.TweenService
-				:Create(Image, Constants.DefaultTweenInfo, {
-					ImageTransparency = 0.25,
-				})
-				:Play()
-		end)
+		Animations.BindHover(Button, {
+			ImageTransparency = 0.5,
+		}, {
+			ImageTransparency = 0.25,
+		}, Constants.DefaultTweenInfo)
 
-		Button.MouseLeave:Connect(function()
-			wax.shared.TweenService
-				:Create(Image, Constants.DefaultTweenInfo, {
-					ImageTransparency = 0.5,
-				})
-				:Play()
-		end)
+		Animations.BindPress(Button, {
+			Press = { ImageTransparency = 0 },
+			Release = { ImageTransparency = 0.5 },
+			TweenInfo = Constants.DefaultTweenInfo,
+		})
 
 		if Callback then
 			Button.MouseButton1Click:Connect(Callback)
@@ -172,8 +169,33 @@ return function(props: {
 		Type = "Button",
 		Icon = "minus",
 		Callback = function()
-			MainFrame.Visible = false
-			ShowButton.Visible = true
+			local Duration = 0.14
+
+			if not Animations.IsEnabled() then
+				MainFrame.Visible = false
+				ShowButton.Visible = true
+				return
+			end
+
+			-- Collapse into the launcher button instead of vanishing.
+			Animations.Pop(MainFrame, {
+				From = 1,
+				To = 0.96,
+				Duration = Duration,
+				TweenInfo = TweenInfo.new(Duration, Enum.EasingStyle.Quad, Enum.EasingDirection.In),
+			})
+
+			task.delay(Duration, function()
+				MainFrame.Visible = false
+				ShowButton.Visible = true
+
+				Animations.Pop(ShowButton, {
+					From = 0.85,
+					To = 1,
+					Duration = 0.18,
+				})
+				Animations.FadeInPlace(ShowButton, { Duration = 0.18, MaxObjects = 4 })
+			end)
 		end,
 	})
 	table.insert(TopButtonData, {

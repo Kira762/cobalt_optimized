@@ -51,10 +51,22 @@ export type Options = {
 }
 
 
-local function GetLog(Instance: InstancesToHook, Function: (...any) -> ...any)
-	local DebugId = wax.shared.GetDebugId(Instance)
+--[[
+	`DebugId` and `Origin` can be passed in when the caller already resolved
+	them: both cost an executor call (DebugId also switches thread identity) and
+	the incoming path resolves them once per invocation instead of once per
+	connection entry.
+]]
+local function GetLog(
+	Instance: InstancesToHook,
+	Function: (...any) -> ...any,
+	DebugId: number?,
+	Origin: Instance?
+)
+	DebugId = DebugId or wax.shared.GetDebugId(Instance)
+	Origin = Origin or getcallingscript()
 
-	if wax.shared.ShouldIgnore(Instance, getcallingscript()) or LogConnectionFunctions[Function] then
+	if wax.shared.ShouldIgnore(Instance, Origin) or LogConnectionFunctions[Function] then
 		return nil
 	end
 
@@ -65,7 +77,7 @@ local function GetLog(Instance: InstancesToHook, Function: (...any) -> ...any)
 
 	local Log = IncomingLogs[DebugId]
 	if not Log then
-		Log = wax.shared.NewLog(Instance, "Incoming", getcallingscript(), DebugId)
+		Log = wax.shared.NewLog(Instance, "Incoming", Origin, DebugId)
 	end
 
 	return Log
@@ -90,6 +102,8 @@ local function LogRemote(
 	Instance: InstancesToHook,
 	Function: (...any) -> ...any,
 	Info: {
+		DebugId: number?,
+		IgnoreOrigin: Instance?,
 		Arguments: { [number]: any, n: number },
 		Origin: Instance,
 		Function: (...any) -> ...any,
@@ -98,7 +112,7 @@ local function LogRemote(
 		Blocked: boolean?,
 	}
 )
-	local Log = GetLog(Instance, Function)
+	local Log = GetLog(Instance, Function, Info.DebugId, Info.IgnoreOrigin)
 	if not Log then
 		return false, nil
 	end
@@ -225,6 +239,9 @@ local function CreateConnectionFunction(Instance: InstancesToHook, Method: Metho
 		local Arguments = wax.shared.SafePack.Pack(...)
 		local TargetLog, TargetCallIndex
 
+		-- Resolved once for the whole invocation (used to be one per entry).
+		local CallingScript = getcallingscript()
+
 		
 		if CachedConnectionInfo.HasValidConnections then
 			for _, Entry in CachedConnectionInfo.Entries do
@@ -234,6 +251,8 @@ local function CreateConnectionFunction(Instance: InstancesToHook, Method: Metho
 					Function = Entry.Function,
 					Line = nil,
 					IsExecutor = Entry.IsExecutor,
+					DebugId = DebugId,
+					IgnoreOrigin = CallingScript,
 				}))
 			end
 
@@ -244,6 +263,8 @@ local function CreateConnectionFunction(Instance: InstancesToHook, Method: Metho
 				Function = nil,
 				Line = nil,
 				IsExecutor = false,
+				DebugId = DebugId,
+				IgnoreOrigin = CallingScript,
 			}))
 		end
 

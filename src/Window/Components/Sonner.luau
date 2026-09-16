@@ -5,7 +5,14 @@ local Sonner = {
 	TweenInfo = TweenInfo.new(0.5, Enum.EasingStyle.Exponential),
 	Wrapper = nil,
 	PendingQueue = {},
+	PendingHead = 1,
+	PendingTail = 0,
 	Processing = false,
+
+	-- Toasts are cheap to queue but expensive to render, so the backlog is
+	-- bounded: a game spamming events can never grow this without limit.
+	MaxPendingToasts = 32,
+	MaxVisibleToasts = 4,
 }
 
 local Icons = require("@src/Utils/UI/Assets/Icons")
@@ -15,6 +22,67 @@ local Animations = require("@src/Window/Utils/Animations")
 local NOTIFICATION_WIDTH = 250
 local NOTIFICATION_MIN_HEIGHT = 50
 local NOTIFICATION_VERTICAL_PADDING = 20
+
+--[[
+	Spinning icons.
+
+	`Sonner.promise` used to spawn a thread per promise that waited on
+	RenderStepped forever, and re-resolved the icon with FindFirstChild on every
+	frame.  All spinners now share one connection, which is only alive while at
+	least one promise is running.
+]]
+local SpinningIcons = setmetatable({}, { __mode = "k" })
+local SpinnerConnection = nil
+
+local function StopSpinnerDriver()
+	if SpinnerConnection then
+		SpinnerConnection:Disconnect()
+		SpinnerConnection = nil
+	end
+end
+
+local function DriveSpinners()
+	local AnyAlive = false
+
+	for Icon in SpinningIcons do
+		if Icon.Parent == nil then
+			SpinningIcons[Icon] = nil
+			continue
+		end
+
+		AnyAlive = true
+		Icon.Rotation = (Icon.Rotation + 1) % 360
+	end
+
+	if not AnyAlive then
+		StopSpinnerDriver()
+	end
+end
+
+local function StartSpinner(Icon)
+	if not Icon then
+		return nil
+	end
+
+	SpinningIcons[Icon] = true
+
+	if not SpinnerConnection then
+		SpinnerConnection = wax.shared.RunService.RenderStepped:Connect(DriveSpinners)
+	end
+
+	return Icon
+end
+
+local function StopSpinner(Icon)
+	if not Icon then
+		return
+	end
+
+	SpinningIcons[Icon] = nil
+	if next(SpinningIcons) == nil then
+		StopSpinnerDriver()
+	end
+end
 
 local function GetHiddenPosition(Notification: GuiObject): UDim2
 	return UDim2.new(0.5, 0, 1, math.max(NOTIFICATION_MIN_HEIGHT, Notification.AbsoluteSize.Y + 2))
@@ -148,20 +216,15 @@ local function InternalToast(image, text, internalTime, removeCallback)
 
 		object.ZIndex = 500 - (#Sonner.Queue - index)
 
-		
-		wax.shared.TweenService
-			:Create(object.UIScale, Sonner.TweenInfo, {
-				Scale = object.UIScale.Scale * ScaleMultiplier,
-			})
-			:Play()
+		Animations.Play(object.UIScale, {
+			Scale = object.UIScale.Scale * ScaleMultiplier,
+		}, Sonner.TweenInfo)
 
-		wax.shared.TweenService
-			:Create(object, Sonner.TweenInfo, {
-				Position = object.Position - UDim2.fromOffset(0, object.AbsoluteSize.Y * 0.35),
-			})
-			:Play()
+		Animations.Play(object, {
+			Position = object.Position - UDim2.fromOffset(0, object.AbsoluteSize.Y * 0.35),
+		}, Sonner.TweenInfo)
 
-		if ((#Sonner.Queue - index) + 1) >= 4 then
+		if ((#Sonner.Queue - index) + 1) >= Sonner.MaxVisibleToasts then
 			Animations.FadeOut(object)
 			task.delay(0.5, function()
 				object:Destroy()
@@ -174,11 +237,9 @@ local function InternalToast(image, text, internalTime, removeCallback)
 		table.remove(Sonner.Queue, table.find(Sonner.Queue, obj))
 	end
 
-	wax.shared.TweenService
-		:Create(Notif, Sonner.TweenInfo, {
-			Position = UDim2.new(0.5, 0, 1, -20),
-		})
-		:Play()
+	Animations.Play(Notif, {
+		Position = UDim2.new(0.5, 0, 1, -20),
+	}, Sonner.TweenInfo)
 	Animations.FadeIn(Notif)
 
 	if removeCallback then
@@ -191,11 +252,9 @@ local function InternalToast(image, text, internalTime, removeCallback)
 			table.remove(Sonner.Queue, table.find(Sonner.Queue, Notif))
 
 			Animations.FadeOut(Notif, 0.35)
-			wax.shared.TweenService
-				:Create(Notif, Sonner.TweenInfo, {
-					Position = GetHiddenPosition(Notif),
-				})
-				:Play()
+			Animations.Play(Notif, {
+				Position = GetHiddenPosition(Notif),
+			}, Sonner.TweenInfo)
 			task.wait(0.5)
 			Notif:Destroy()
 		end)
@@ -211,22 +270,39 @@ local function ProcessQueue()
 	end
 	Sonner.Processing = true
 
-	while #Sonner.PendingQueue > 0 do
-		local Request = table.remove(Sonner.PendingQueue, 1)
-		InternalToast(Request.image, Request.text, Request.internalTime, Request.removeCallback)
-		task.wait(0.5)
+	while Sonner.PendingHead <= Sonner.PendingTail do
+		local Request = Sonner.PendingQueue[Sonner.PendingHead]
+		Sonner.PendingQueue[Sonner.PendingHead] = nil
+		Sonner.PendingHead += 1
+
+		if Request then
+			InternalToast(Request.image, Request.text, Request.internalTime, Request.removeCallback)
+			task.wait(0.5)
+		end
 	end
 
+	table.clear(Sonner.PendingQueue)
+	Sonner.PendingHead = 1
+	Sonner.PendingTail = 0
 	Sonner.Processing = false
 end
 
 local function toast(image, text, internalTime, removeCallback)
-	table.insert(Sonner.PendingQueue, {
+	local Pending = Sonner.PendingQueue
+	local Queued = Sonner.PendingTail - Sonner.PendingHead + 1
+
+	if Queued >= Sonner.MaxPendingToasts then
+		-- Backlog is full: drop the request rather than growing forever.
+		return
+	end
+
+	Sonner.PendingTail += 1
+	Pending[Sonner.PendingTail] = {
 		image = image,
 		text = text,
 		internalTime = internalTime,
 		removeCallback = removeCallback,
-	})
+	}
 
 	task.spawn(ProcessQueue)
 end
@@ -259,22 +335,16 @@ function Sonner.promise(func, options)
 
 	toast("loader-circle", loadingText, internalTime, function(notif, time)
 		local success, resultOrError = nil, nil
+		local icon = notif:FindFirstChild("ImageLabel")
 
-		local spinnerThread = task.spawn(function()
-			repeat
-				wax.shared.RunService.RenderStepped:Wait()
-
-				local icon = notif:FindFirstChild("ImageLabel")
-				if not icon then
-					continue
-				end
-				icon.Rotation = (icon.Rotation + 1) % 360
-			until success == false or resultOrError ~= nil
-		end)
+		-- One shared spinner driver for every pending promise (see SpinningIcons).
+		StartSpinner(icon)
 
 		success, resultOrError = pcall(func, function(text)
 			notif.Frame.TextLabel.Text = text
 		end)
+
+		StopSpinner(icon)
 
 		task.spawn(function()
 			setthreadidentity(8)
@@ -283,16 +353,12 @@ function Sonner.promise(func, options)
 			
 
 			Animations.FadeOut(notif.ImageLabel, 0.15)
-			wax.shared.TweenService
-				:Create(notif.ImageLabel, TweenInfo.new(0.25, Enum.EasingStyle.Exponential), {
-					Size = UDim2.new(0, 0, 0, 0),
-				})
-				:Play()
+			Animations.Play(notif.ImageLabel, {
+				Size = UDim2.new(0, 0, 0, 0),
+			}, TweenInfo.new(0.25, Enum.EasingStyle.Exponential))
 			task.wait(0.15)
 
-			if coroutine.status(spinnerThread) ~= "dead" then
-				coroutine.close(spinnerThread)
-			end
+			StopSpinner(icon)
 			notif.ImageLabel.Rotation = 0
 
 			if success then
@@ -318,11 +384,9 @@ function Sonner.promise(func, options)
 			end
 
 			Animations.FadeIn(notif.ImageLabel)
-			wax.shared.TweenService
-				:Create(notif.ImageLabel, TweenInfo.new(0.25, Enum.EasingStyle.Exponential), {
-					Size = UDim2.new(0, 20, 0, 20),
-				})
-				:Play()
+			Animations.Play(notif.ImageLabel, {
+				Size = UDim2.new(0, 20, 0, 20),
+			}, TweenInfo.new(0.25, Enum.EasingStyle.Exponential))
 
 			task.delay(time, function()
 				if not table.find(Sonner.Queue, notif) then
@@ -331,11 +395,9 @@ function Sonner.promise(func, options)
 				table.remove(Sonner.Queue, table.find(Sonner.Queue, notif))
 
 				Animations.FadeOut(notif, 0.35)
-				wax.shared.TweenService
-					:Create(notif, Sonner.TweenInfo, {
-						Position = GetHiddenPosition(notif),
-					})
-					:Play()
+				Animations.Play(notif, {
+					Position = GetHiddenPosition(notif),
+				}, Sonner.TweenInfo)
 
 				task.wait(0.5)
 				notif:Destroy()

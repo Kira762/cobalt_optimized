@@ -1,5 +1,15 @@
 local DEFAULT_TIMEOUT_SECONDS = 1500
 
+--[[
+	Upper bound on pending invocations tracked per remote.
+
+	Entries keep their captured arguments alive until the timeout expires (25
+	minutes by default), so an extremely chatty remote could hold on to a lot of
+	memory in the meantime.  This is a safety valve, not a queue: it is only ever
+	reached under heavy load.
+]]
+local MAX_ENTRIES_PER_INSTANCE = 256
+
 local InvocationTracker = {}
 InvocationTracker.__index = InvocationTracker
 
@@ -36,6 +46,9 @@ function InvocationTracker.Prune(self: Tracker, now: number?)
 
 		if next(entries) == nil then
 			self.Entries[instance] = nil
+			if self.Counts then
+				self.Counts[instance] = nil
+			end
 		end
 	end
 end
@@ -48,6 +61,20 @@ function InvocationTracker.Add(self: Tracker, instance: Instance, invokeId: numb
 	if not entries then
 		entries = {}
 		self.Entries[key] = entries
+		self.Counts = self.Counts or {}
+		self.Counts[key] = 0
+	end
+
+	local counts = self.Counts
+	local count = (counts and counts[key] or 0) + 1
+	if count > MAX_ENTRIES_PER_INSTANCE then
+		-- Bounded: start the window over instead of holding everything forever.
+		table.clear(entries)
+		count = 1
+	end
+
+	if counts then
+		counts[key] = count
 	end
 
 	entries[invokeId] = {
@@ -81,6 +108,9 @@ function InvocationTracker.Consume(self: Tracker, instance: Instance, invokeId: 
 	entries[invokeId] = nil
 	if next(entries) == nil then
 		self.Entries[key] = nil
+		if self.Counts then
+			self.Counts[key] = nil
+		end
 	end
 
 	if not entry or os.clock() - entry.CreatedAt >= self.TimeoutSeconds then
@@ -92,6 +122,9 @@ end
 
 function InvocationTracker.Clear(self: Tracker)
 	table.clear(self.Entries)
+	if self.Counts then
+		table.clear(self.Counts)
+	end
 end
 
 return InvocationTracker

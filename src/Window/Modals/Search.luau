@@ -427,8 +427,26 @@ return function(props: {
 		table.insert(SearchFilterButtons, ClassNameFilterButton)
 	end
 
+	--[[
+		One Text change fires per keystroke, and each used to re-scan every
+		captured remote in both directions.  Typing is now coalesced into a
+		single refresh shortly after the user pauses; every other caller
+		(opening the search, filter buttons) still updates immediately.
+	]]
+	local SearchUpdateToken = 0
+	local SearchTypingDebounce = 0.1
+
 	SearchBox:GetPropertyChangedSignal("Text"):Connect(function()
-		Search:Update()
+		SearchUpdateToken += 1
+		local Token = SearchUpdateToken
+
+		task.delay(SearchTypingDebounce, function()
+			if Token ~= SearchUpdateToken then
+				return
+			end
+
+			Search:Update()
+		end)
 	end)
 
 	wax.shared.Connect(wax.shared.UserInputService.InputBegan:Connect(function(Input: InputObject)

@@ -1,6 +1,7 @@
 
 local Interface = require("@src/Utils/UI/Interface")
 local Constants = require("@src/Window/Constants")
+local Animations = require("@src/Window/Utils/Animations")
 
 local SettingSync = require(script.Parent.SettingSync)
 
@@ -82,18 +83,16 @@ return function(props: {
 			return
 		end
 
-		wax.shared.TweenService
-			:Create(ToggleTrack, Constants.DefaultTweenInfo, {
-				BackgroundColor3 = TargetTrackColor,
-			})
-			:Play()
+		-- Animations.Play cancels the previous toggle tween first, so rapid
+		-- toggling (and reset buttons) can never stack tweens up.
+		Animations.Play(ToggleTrack, {
+			BackgroundColor3 = TargetTrackColor,
+		}, Constants.DefaultTweenInfo)
 
-		wax.shared.TweenService
-			:Create(ToggleKnob, Constants.DefaultTweenInfo, {
-				Position = TargetKnobPosition,
-				Size = TargetKnobSize,
-			})
-			:Play()
+		Animations.Play(ToggleKnob, {
+			Position = TargetKnobPosition,
+			Size = TargetKnobSize,
+		}, Constants.DefaultTweenInfo)
 	end
 
 	function Checkbox:Reset()

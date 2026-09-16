@@ -71,6 +71,7 @@ function Ratelimiter:SetupManagerThread()
 	self.ManagerThread = task.spawn(function()
 		while not wax.shared.Unloaded and not self.IsDestroyed do
 			local CurrentTime = tick()
+			local DidWork = false
 
 			if #self.Bucket > 0 then
 				local NewBucket = {}
@@ -100,6 +101,7 @@ function Ratelimiter:SetupManagerThread()
 
 				if TaskData then
 					table.insert(self.Bucket, tick())
+					DidWork = true
 
 					task.defer(function()
 						if self.IsDestroyed then
@@ -111,7 +113,15 @@ function Ratelimiter:SetupManagerThread()
 				end
 			end
 
-			task.wait()
+			-- Stay frame-accurate while there is traffic, but back off when idle:
+			-- an unattended limiter no longer wakes the scheduler every frame
+			-- (which matters a lot on a phone), while still picking up new work
+			-- within a few frames.
+			if DidWork or self.QueueHead <= self.QueueTail then
+				task.wait()
+			else
+				task.wait(math.min(self.Burst.Time, 0.05))
+			end
 		end
 
 		if wax.shared.Unloaded and not self.IsDestroyed and self.OnUnload then

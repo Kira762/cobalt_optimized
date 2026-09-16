@@ -23,11 +23,18 @@ local AllowedClassNames =
 	CreateLookupTable({ "RemoteEvent", "RemoteFunction", "UnreliableRemoteEvent", "BindableEvent", "BindableFunction" })
 
 
-local function getcallingfunction()
+--[[
+	Caller resolution.
+
+	Function, source and line used to be resolved by three separate loops that
+	walked the same stack levels (up to eighteen debug.info calls per remote).
+	One pass returns all three, which is the single biggest win on this hot path.
+]]
+local function GetCallerInfo()
 	local BaseLevel = if wax.shared.IsUsingOthHooks then 3 else 5
 
 	for i = BaseLevel, 10 do
-		local Function, Source = debug.info(i, "fs")
+		local Function, Source, Line = debug.info(i, "fsl")
 		if not Function or not Source then
 			break
 		end
@@ -36,55 +43,33 @@ local function getcallingfunction()
 			continue
 		end
 
-		return Function
+		return Function, Source, Line
 	end
 
-	return debug.info(BaseLevel, "f")
+	return debug.info(BaseLevel, "f"), debug.info(BaseLevel, "s"), debug.info(BaseLevel, "l")
+end
+
+
+local function getcallingfunction()
+	local Function = GetCallerInfo()
+	return Function
 end
 
 
 local function getcallingline()
-	local BaseLevel = if wax.shared.IsUsingOthHooks then 3 else 5
-
-	for i = BaseLevel, 10 do
-		local Source, Line = debug.info(i, "sl")
-		if not Source then
-			break
-		end
-
-		if Source == "[C]" then
-			continue
-		end
-
-		return Line
-	end
-
-	return debug.info(BaseLevel, "l")
+	local _, _, Line = GetCallerInfo()
+	return Line
 end
 
 
 local function getcallingsource()
-	local BaseLevel = if wax.shared.IsUsingOthHooks then 3 else 5
-
-	for i = BaseLevel, 10 do
-		local Source = debug.info(i, "s")
-		if not Source then
-			break
-		end
-
-		if Source == "[C]" then
-			continue
-		end
-
-		return Source
-	end
-
-	return debug.info(BaseLevel, "s")
+	local _, Source = GetCallerInfo()
+	return Source
 end
 
 
-local function GetLog(Instance: Instance, Direction: "Outgoing" | "Incoming")
-	local DebugId = wax.shared.GetDebugId(Instance)
+local function GetLog(Instance: Instance, Direction: "Outgoing" | "Incoming", DebugId: number?)
+	DebugId = DebugId or wax.shared.GetDebugId(Instance)
 
 	local LogsInDirection = wax.shared.Logs[Direction]
 	if not LogsInDirection then
@@ -110,19 +95,25 @@ end
 
 
 local function HandleLogging(TargetInstance: Instance, Method: string, OldFunction: (...any) -> ...any, ...)
-	local Log = GetLog(TargetInstance, "Outgoing")
+	-- Resolve everything the log entry needs exactly once.
+	local DebugId = wax.shared.GetDebugId(TargetInstance)
+	local Log = GetLog(TargetInstance, "Outgoing", DebugId)
 	if not Log then
 		return OldFunction(...)
 	end
 	local Arguments = wax.shared.SafePack.Pack(select(2, ...))
 
+	local CallingScript = getcallingscript()
+	local CallingFunction, CallingSource, CallingLine = GetCallerInfo()
+	local IsExecutor = checkcaller()
+
 	local Info = {
 		Arguments = Arguments,
-		Origin = getcallingscript(),
-		Function = getcallingfunction(),
-		Line = getcallingline(),
-		Source = getcallingsource(),
-		IsExecutor = checkcaller(),
+		Origin = CallingScript,
+		Function = CallingFunction,
+		Line = CallingLine,
+		Source = CallingSource,
+		IsExecutor = IsExecutor,
 	}
 	local ShouldBlock = Log:ShouldBlock(Info)
 	Log:Call(Info)
@@ -140,15 +131,15 @@ local function HandleLogging(TargetInstance: Instance, Method: string, OldFuncti
 
 	if IsRemoteFunctionInvoke or IsBindableFunctionInvoke then
 		
-		Log = GetLog(TargetInstance, "Incoming")
+		Log = GetLog(TargetInstance, "Incoming", DebugId)
 		local RFResultInfo = {
 			Arguments = Arguments,
 			InvokeResult = nil,
-			Origin = getcallingscript(),
-			Function = getcallingfunction(),
-			Line = getcallingline(),
-			Source = getcallingsource(),
-			IsExecutor = checkcaller(),
+			Origin = CallingScript,
+			Function = CallingFunction,
+			Line = CallingLine,
+			Source = CallingSource,
+			IsExecutor = IsExecutor,
 			InvokeKind = "Request",
 		}
 

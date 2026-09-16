@@ -1,4 +1,5 @@
 local Interface = require("@src/Utils/UI/Interface")
+local Animations = require("@src/Window/Utils/Animations")
 
 local Modal = {}
 Modal.__index = Modal
@@ -11,6 +12,13 @@ export type Modal = {
 
 local DefaultTweenInfo = TweenInfo.new(0.2, Enum.EasingStyle.Exponential)
 
+-- Open/close motion for modal frames.  Scale only (never a full fade): the
+-- modal's children keep their own transparencies, so the interface looks exactly
+-- the same once the animation settles.
+local OpenScale = 0.97
+local CloseScale = 0.98
+local CloseDuration = 0.13
+
 function Modal.new(
 	Parent: GuiObject,
 	Options: {
@@ -21,6 +29,8 @@ function Modal.new(
 		OpenedModal = nil,
 		Background = nil,
 		TweenInfo = Options and Options.TweenInfo or DefaultTweenInfo,
+		BackdropTransparency = 0.5,
+		Generation = 0,
 	}, Modal)
 
 	self.Background = Interface.New("TextButton", {
@@ -38,6 +48,8 @@ function Modal.new(
 		Parent = Parent,
 	})
 
+	self.BackdropTransparency = self.Background.BackgroundTransparency
+
 	self.Background.MouseButton1Click:Connect(function()
 		self:Close()
 	end)
@@ -45,38 +57,91 @@ function Modal.new(
 	return self
 end
 
+--[[
+	Hides a modal frame instantly.  Pooled/parent-changing modals that get
+	re-opened while a close animation is still running must not be hidden by the
+	stale animation, which is what `Generation` guards against.
+]]
+local function HideAfter(Parent, Delay, IsCurrent: () -> boolean)
+	if not Animations.IsEnabled() then
+		if IsCurrent() then
+			Parent.Visible = false
+		end
+
+		return
+	end
+
+	task.delay(Delay, function()
+		if not IsCurrent() then
+			return
+		end
+
+		Parent.Visible = false
+	end)
+end
+
 function Modal:Open(Parent)
+	if self.OpenedModal == Parent and Parent.Visible then
+		self.Background.Visible = true
+		self.Background.BackgroundTransparency = self.BackdropTransparency
+		return
+	end
+
+	self.Generation += 1
+
 	self.OpenedModal = Parent
 
-	self.OpenedModal.Visible = true
+	Parent.Visible = true
 	self.Background.Visible = true
+
+	-- Backdrop fades in from transparent instead of popping in.
+	self.Background.BackgroundTransparency = 1
+	Animations.Play(self.Background, {
+		BackgroundTransparency = self.BackdropTransparency,
+	}, self.TweenInfo)
+
+	Animations.Pop(Parent, {
+		From = OpenScale,
+		To = 1,
+		Duration = self.TweenInfo.Time,
+		TweenInfo = self.TweenInfo,
+	})
 end
 
 function Modal:Close()
-	if self.OpenedModal then
-		self.OpenedModal.Visible = false
-		self.OpenedModal = nil
+	local Opened = self.OpenedModal
+	self.OpenedModal = nil
+	self.Generation += 1
+	local Generation = self.Generation
+
+	local function IsCurrent(): boolean
+		return self.Generation == Generation
 	end
 
-	self.Background.Visible = false
+	if Opened then
+		Animations.Pop(Opened, {
+			From = 1,
+			To = CloseScale,
+			Duration = CloseDuration,
+			TweenInfo = TweenInfo.new(CloseDuration, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+		})
+
+		HideAfter(Opened, CloseDuration, IsCurrent)
+	end
+
+	Animations.Play(self.Background, {
+		BackgroundTransparency = 1,
+	}, TweenInfo.new(self.TweenInfo.Time, Enum.EasingStyle.Exponential, Enum.EasingDirection.In))
+
+	HideAfter(self.Background, self.TweenInfo.Time, IsCurrent)
 end
 
 function Modal:ConnectCloseButton(Button, Image)
-	Button.MouseEnter:Connect(function()
-		wax.shared.TweenService
-			:Create(Image, self.TweenInfo, {
-				ImageTransparency = 0.25,
-			})
-			:Play()
-	end)
-
-	Button.MouseLeave:Connect(function()
-		wax.shared.TweenService
-			:Create(Image, self.TweenInfo, {
-				ImageTransparency = 0.5,
-			})
-			:Play()
-	end)
+	Animations.BindHover(Button, {
+		ImageTransparency = 0.5,
+	}, {
+		ImageTransparency = 0.25,
+	}, self.TweenInfo)
 
 	Button.MouseButton1Click:Connect(function()
 		self:Close()

@@ -2,6 +2,7 @@
 local Interface = require("@src/Utils/UI/Interface")
 local Constants = require("@src/Window/Constants")
 
+local Animations = require("@src/Window/Utils/Animations")
 local DPI = require("@src/Window/Utils/DPI")
 local Resize = require("@src/Window/Utils/Input/Resize")
 
@@ -86,6 +87,14 @@ do
 	ShowButton.MouseButton1Click:Connect(function()
 		ShowButton.Visible = false
 		MainFrame.Visible = true
+
+		-- Grow the window back out of the launcher button.
+		Animations.Pop(MainFrame, {
+			From = 0.96,
+			To = 1,
+			Duration = 0.18,
+			TweenInfo = TweenInfo.new(0.18, Enum.EasingStyle.Exponential, Enum.EasingDirection.Out),
+		})
 	end)
 end
 

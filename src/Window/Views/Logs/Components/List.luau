@@ -5,6 +5,7 @@ local Types = require("@src/Window/Types")
 
 local DirectionTabs = require(script.Parent.DirectionTabs)
 local Ratelimiter = require("@src/Utils/Ratelimiter")
+local Animations = require("@src/Window/Utils/Animations")
 
 
 return function(props: {
@@ -250,16 +251,44 @@ return function(props: {
 		Log.Button = nil
 	end
 
-	function List:RefreshLogButton(Log)
+	function List:RefreshLogButton(Log, Animate: boolean?)
 		if not (Log.Button and self.CurrentTab and self.CurrentTab.Name == Log.Type) then
 			return
 		end
 
-		Log.Button.Name.Text = Log.Instance.Name
-		Log.Button.Calls.Text = "x" .. #Log.Calls
-		UpdateLogNameSize(Log)
+		local AnimateAppearance = Animate ~= false
 
-		Log.Button.Instance.Parent = if #Log.Calls == 0 then nil else RemoteList
+		-- Writing Text always invalidates the label's text layout, so only touch
+		-- labels whose contents actually changed.
+		local InstanceName = Log.Instance.Name
+		if Log.Button.Name.Text ~= InstanceName then
+			Log.Button.Name.Text = InstanceName
+			UpdateLogNameSize(Log)
+		end
+
+		local CallCount = "x" .. #Log.Calls
+		if Log.Button.Calls.Text ~= CallCount then
+			Log.Button.Calls.Text = CallCount
+
+			-- Flash the counter so an increment is noticeable without a readable
+			-- number change going unnoticed.
+			Log.Button.Calls.TextTransparency = 0.45
+			Animations.Play(Log.Button.Calls, {
+				TextTransparency = 0,
+			}, Constants.DefaultTweenInfo)
+		end
+
+		local DesiredParent = if #Log.Calls == 0 then nil else RemoteList
+		if Log.Button.Instance.Parent ~= DesiredParent then
+			Log.Button.Instance.Parent = DesiredParent
+
+			if DesiredParent and AnimateAppearance then
+				Animations.FadeInPlace(Log.Button.Instance, {
+					Duration = 0.18,
+					MaxObjects = 8,
+				})
+			end
+		end
 	end
 
 	local function FlushLogButtonUpdates()
@@ -305,7 +334,9 @@ return function(props: {
 			end
 
 			self:EnsureLogButton(Log)
-			self:RefreshLogButton(Log)
+			-- A tab switch repopulates the whole list at once; animating every
+			-- row there would be dozens of simultaneous fades, so it is skipped.
+			self:RefreshLogButton(Log, false)
 		end
 	end
 

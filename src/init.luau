@@ -142,8 +142,24 @@ wax.shared.getrawmetatable = wax.shared.ExecutorSupport["getrawmetatable"].IsWor
 	end
 
 local RawGetDebugId = clonefunction and clonefunction(game.GetDebugId) or game.GetDebugId
+
+--[[
+	DebugId lookup.
+
+	This runs for every intercepted remote call, so the identity switch is only
+	performed when the thread is not already elevated - the result is identical,
+	but the common case costs one call instead of four.
+]]
 wax.shared.GetDebugId = function(Instance)
+	if not setthreadidentity or not getthreadidentity then
+		return RawGetDebugId(Instance)
+	end
+
 	local identity = getthreadidentity()
+	if identity == 8 then
+		return RawGetDebugId(Instance)
+	end
+
 	setthreadidentity(8)
 	local id = RawGetDebugId(Instance)
 	setthreadidentity(identity)
@@ -326,6 +342,7 @@ wax.shared.SetupLoggingConnection = function()
 	local LogQueue = {}
 	local LogQueueHead = 1
 	local LogQueueTail = 0
+	local MaxQueuedLogEntries = 256
 	wax.shared.LogThread = task.defer(function()
 		while not wax.shared.Unloaded do
 			while LogQueueHead <= LogQueueTail do
@@ -445,12 +462,14 @@ wax.shared.SetupLoggingConnection = function()
 			local Type = Notification.Type
 			local CallOrderInLog = Notification.CallIndex
 
-			local LogEntry = wax.shared.Logs[Type][wax.shared.GetDebugId(RemoteInstance)]
+			local LogEntry = Notification.Log or wax.shared.Logs[Type][wax.shared.GetDebugId(RemoteInstance)]
 			if not LogEntry then
 				continue
 			end
 
-			local CallDataFromHook = LogEntry.Calls[CallOrderInLog]
+			-- The notification carries the call itself (indices shift when a log
+			-- trims), with the index lookup kept as a fallback.
+			local CallDataFromHook = Notification.Call or LogEntry.Calls[CallOrderInLog]
 			if not CallDataFromHook then
 				continue
 			end
@@ -462,6 +481,14 @@ wax.shared.SetupLoggingConnection = function()
 				CallIndex = CallOrderInLog,
 				CallData = CallDataFromHook,
 			}
+
+			-- File writes are orders of magnitude slower than the hooks that
+			-- feed them, so the backlog is bounded: the newest entries win and
+			-- the oldest are dropped instead of growing without limit.
+			if LogQueueTail - LogQueueHead >= MaxQueuedLogEntries then
+				LogQueue[LogQueueHead] = nil
+				LogQueueHead += 1
+			end
 		end
 	end
 end

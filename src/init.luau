@@ -596,28 +596,19 @@ wax.shared.Connect(wax.shared.LocalPlayer.OnTeleport:Connect(function()
 		return
 	end
 
-	-- Relaunch from the executor's local script directory.  Teleport support is
-	-- intentionally offline as well; a missing local copy is a harmless no-op.
+	-- Relaunch through the lightweight loader. It will use a cached/local
+	-- cobalt.luau when present and otherwise download the generated bundle, so
+	-- ExecuteOnTeleport also works for one-line loadstring users.
 	wax.shared.queue_on_teleport([[
 		if getgenv().CobaltAutoExecuted then
 			return
 		end
 
-		local function cobaltRead()
-			if typeof(readfile) ~= "function" then
-				return nil
-			end
-			for _, path in { "cobalt.luau", "cobalt_optimized/cobalt.luau" } do
-				local ok, source = pcall(readfile, path)
-				if ok and type(source) == "string" and source ~= "" then
-					return source
-				end
-			end
-			return nil
-		end
-
-		local source = cobaltRead()
-		local fn = source and loadstring(source, "cobalt.luau")
+		local loaderUrl = "https://raw.githubusercontent.com/Kira762/cobalt_optimized/main/loader.luau"
+		local ok, loader = pcall(function()
+			return game:HttpGet(loaderUrl)
+		end)
+		local fn = ok and type(loader) == "string" and loadstring(loader, "@cobalt-loader.luau")
 		if fn then
 			getgenv().CobaltAutoExecuted = true
 			fn()

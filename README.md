@@ -8,8 +8,10 @@ Runtime loading is self-contained after the bundle is fetched:
 - `assets/` contains the UI PNGs used by the local asset resolver.
 - External asset/module downloads were removed. Missing local images fall back to
   the packaged Roblox asset ids and fonts use their packaged font ids.
-- `loader.luau` prefers a local/cached `cobalt.luau`, then falls back to
-  downloading the generated bundle from this repository.
+- `loader.luau` downloads the latest generated bundle from this repository and
+  refreshes the local cache, falling back to a local/cached `cobalt.luau` only
+  when the download is unavailable (set `getgenv().CobaltPreferLocal = true`
+  to keep a deliberately local build).
 - Teleport relaunch reuses the lightweight loader so one-line loadstring users
   do not need to copy the large bundle by hand.
 
@@ -38,9 +40,9 @@ Run the lightweight remote loader:
 loadstring(game:HttpGet("https://raw.githubusercontent.com/Kira762/cobalt_optimized/main/loader.luau"))()
 ```
 
-The loader prefers `cobalt.luau` from the executor's script directory when it is
-already present, then downloads the generated bundle from GitHub and caches it
-when `writefile` is available. You can still read `cobalt.luau` directly with
+The loader downloads the generated bundle from GitHub first and caches it as
+`cobalt.luau` when `writefile` is available, so a stale cache can never pin you
+to an old build. The local copy is only used when the download fails. You can still read `cobalt.luau` directly with
 the executor's local file API if you want a fully local setup.
 
 The bundle does not need the source tree at runtime, but the local assets are

@@ -3,9 +3,16 @@
 -- Preferred usage:
 --   loadstring(game:HttpGet("https://raw.githubusercontent.com/Kira762/cobalt_optimized/main/loader.luau"))()
 --
--- The loader still uses a local cobalt.luau when one exists, but it now falls
--- back to downloading the generated bundle from GitHub so users do not need to
--- copy or paste the large bundle by hand.
+-- Load order:
+--   1. the latest generated bundle from GitHub (and refresh the local cache);
+--   2. a local/cached cobalt.luau when the download is unavailable.
+--
+-- Remote-first matters: the loader caches the bundle to cobalt.luau, and an
+-- older local-first order pinned users to whatever build they downloaded
+-- first, so already-fixed errors (e.g. "[Cobalt].cobalt:95: attempt to call a
+-- nil value") kept reappearing from the stale cache.  Set
+-- `getgenv().CobaltPreferLocal = true` before running the loader to keep using
+-- a deliberately local build.
 
 ------------------------------------------------------------------------
 -- helpers
@@ -47,6 +54,14 @@ end
 local function TryWriteCache(Source)
 	if SafeTypeof(writefile) ~= "function" then
 		return
+	end
+
+	-- Skip the write when the cache already holds this exact bundle.
+	if SafeTypeof(readfile) == "function" then
+		local Ok, Existing = pcall(readfile, "cobalt.luau")
+		if Ok and Existing == Source then
+			return
+		end
 	end
 
 	pcall(function()
@@ -178,12 +193,23 @@ end
 -- load
 ------------------------------------------------------------------------
 
-local Source = TryRead(LocalCandidates)
-if not Source then
-	Source = TryListFilesDiscovery()
+local PreferLocal = false
+if SafeTypeof(getgenv) == "function" then
+	local Ok, Env = pcall(getgenv)
+	PreferLocal = Ok and type(Env) == "table" and Env.CobaltPreferLocal == true
 end
-if not Source then
+
+local Source
+if PreferLocal then
+	Source = TryRead(LocalCandidates) or TryListFilesDiscovery() or TryRemoteFetch()
+else
 	Source = TryRemoteFetch()
+	if not Source then
+		Source = TryRead(LocalCandidates) or TryListFilesDiscovery()
+		if Source then
+			warn("[Cobalt] remote bundle unavailable; using a local copy that may be out of date")
+		end
+	end
 end
 
 if not Source then
@@ -191,7 +217,7 @@ if not Source then
 	local Lines = {
 		"[Cobalt] cobalt.luau could not be loaded.",
 		"",
-		"The loader tried local files first, then tried to download:",
+		"The loader tried to download the bundle, then searched local files:",
 		"  " .. COBALT_BUNDLE_URL,
 		"",
 		"If your executor blocks game:HttpGet, place cobalt.luau in your executor's script folder as a fallback.",

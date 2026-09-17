@@ -57,7 +57,9 @@ return {
 	]]
 	AnimationsEnabled = Setting.new({
 		Key = "AnimationsEnabled",
-		Default = false,
+		-- Motion is on by default: the interface reads as "broken" when every
+		-- transition is instant.  Low-end devices can still switch it off.
+		Default = true,
 		Schema = Schema.boolean(),
 		UI = {
 			Type = "Checkbox",
@@ -160,9 +162,11 @@ return {
 	}),
 	AutoIgnoreSpammyEvents = Setting.new({
 		Key = "AutoIgnoreSpammyEvents",
-		-- Protect the game by default; the user can turn this off when a full
-		-- high-frequency trace is intentional.
-		Default = true,
+		-- Off by default: silently hiding remotes makes the inspector look
+		-- empty.  Hard capture valves still protect the frame budget when it
+		-- is off; turning this on additionally ignores remotes that sustain
+		-- event spam across several one-second windows.
+		Default = false,
 		Schema = Schema.boolean(),
 		UI = {
 			Type = "Checkbox",

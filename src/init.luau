@@ -100,7 +100,23 @@ end
 
 wax.shared.LocalPlayer = wax.shared.Players.LocalPlayer
 
+--[[
+	`QueryDescendants` is a native engine call and is dramatically faster than
+	walking `GetDescendants()` in Lua, but a few executors ship without it, so
+	the manual scan is kept as the compatibility path.
+]]
 local function FindFirstDescendantOfClass(Root, ClassName)
+	local QueryDescendants = (Root :: any).QueryDescendants
+	if typeof(QueryDescendants) == "function" then
+		local Success, Matches = pcall(function()
+			return Root:QueryDescendants(ClassName)
+		end)
+
+		if Success and typeof(Matches) == "table" then
+			return Matches[1]
+		end
+	end
+
 	for _, Descendant in Root:GetDescendants() do
 		if Descendant:IsA(ClassName) then
 			return Descendant

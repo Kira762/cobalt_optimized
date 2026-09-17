@@ -186,15 +186,32 @@ end
 
 local SpamCallCountThreshold = 120
 local SpamTimeWindowSeconds = 1
-local HardCaptureLimitPerRemote = 120
-local HardCaptureLimitGlobal = 600
+
+--[[
+	Hard capture valves.
+
+	These are pure frame-time / memory protection: when they trip the capture
+	is dropped, nothing else.  An earlier revision also called `Log:Ignore()`
+	here, and because the *global* valve is shared by every remote, one spammy
+	event marked every other remote as ignored for the whole session - the
+	inspector then showed an empty list while the game kept running.  Dropping
+	captures keeps the UI truthful; ignoring remotes is an explicit, opt-in
+	behaviour (Settings -> Auto-ignore High-frequency Calls) that only engages
+	after a remote overflows its *own* budget for several consecutive windows.
+]]
+local HardCaptureLimitPerRemote = 500
+local HardCaptureLimitGlobal = 2500
 local GlobalCaptureWindowStart = 0
 local GlobalCaptureCount = 0
-local AutoIgnoreSpammyEvents = true
+local AutoIgnoreSpammyEvents = false
+
+-- Windows in a row a remote must overflow its own budget before the opt-in
+-- auto-ignore engages.  A single busy frame never marks a remote as ignored.
+local SustainedOverflowWindows = 2
 
 do
 	local Success, Value = pcall(function()
-		return wax.shared.SaveManager:GetState("AutoIgnoreSpammyEvents", true)
+		return wax.shared.SaveManager:GetState("AutoIgnoreSpammyEvents", false)
 	end)
 	if Success then
 		AutoIgnoreSpammyEvents = Value == true
@@ -211,6 +228,10 @@ end
 
 local function RejectCapture(LogObject, Now: number): boolean
 	if Now - LogObject.SpamWindowStart >= SpamTimeWindowSeconds then
+		-- Roll the overflow streak over: a window that ended in overflow keeps
+		-- the streak alive, a quiet one resets it.
+		LogObject.OverflowStreak = LogObject.OverflowedThisWindow and (LogObject.OverflowStreak or 0) + 1 or 0
+		LogObject.OverflowedThisWindow = false
 		LogObject.SpamWindowStart = Now
 		LogObject.SpamCallCount = 0
 	end
@@ -220,9 +241,25 @@ local function RejectCapture(LogObject, Now: number): boolean
 		GlobalCaptureCount = 0
 	end
 
-	if LogObject.SpamCallCount >= HardCaptureLimitPerRemote or GlobalCaptureCount >= HardCaptureLimitGlobal then
+	-- Global valve: protect the frame budget only.  The capture is dropped and
+	-- the remote stays visible; ignoring an unrelated remote here is what used
+	-- to empty the whole list.
+	if GlobalCaptureCount >= HardCaptureLimitGlobal then
 		LogObject.SuppressedCalls += 1
-		if ShouldAutoIgnore() and not LogObject.Ignored then
+		return true
+	end
+
+	if LogObject.SpamCallCount >= HardCaptureLimitPerRemote then
+		LogObject.SuppressedCalls += 1
+		LogObject.OverflowedThisWindow = true
+
+		-- Opt-in auto-ignore: only this remote, only after it sustained the
+		-- overflow across consecutive windows.
+		if
+			ShouldAutoIgnore()
+			and not LogObject.Ignored
+			and (LogObject.OverflowStreak or 0) + 1 >= SustainedOverflowWindows
+		then
 			LogObject:Ignore()
 			local Sonner = wax.shared.Sonner
 			if Sonner then
@@ -497,6 +534,8 @@ function Log.new(Instance, Type, Index, CallingScript)
 		SpamWindowStart = 0,
 		SpamCallCount = 0,
 		SuppressedCalls = 0,
+		OverflowStreak = 0,
+		OverflowedThisWindow = false,
 		Ignored = false,
 		Blocked = false,
 		Button = nil,
@@ -720,6 +759,8 @@ function Log:ClearCalls()
 	self.SpamWindowStart = os.clock()
 	self.SpamCallCount = 0
 	self.SuppressedCalls = 0
+	self.OverflowStreak = 0
+	self.OverflowedThisWindow = false
 end
 
 function Log:Ignore()

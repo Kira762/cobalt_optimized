@@ -638,7 +638,20 @@ return function(Options: Options?)
 		end
 	end
 
+	-- Native `QueryDescendants` handles the whole class list in one engine
+	-- call; the Lua scan only runs on executors that lack it.
 	local function GetDescendantsByClassNames(Root, ClassNames)
+		local QueryDescendants = (Root :: any).QueryDescendants
+		if typeof(QueryDescendants) == "function" then
+			local Success, Matches = pcall(function()
+				return Root:QueryDescendants(table.concat(ClassNames, ", "))
+			end)
+
+			if Success and typeof(Matches) == "table" then
+				return Matches
+			end
+		end
+
 		local Matches = {}
 		for _, Descendant in Root:GetDescendants() do
 			for _, ClassName in ClassNames do

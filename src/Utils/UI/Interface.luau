@@ -1,8 +1,8 @@
 local Interface = {
-	-- Borders are decorative, but every UIStroke is another rendered object and
-	-- another property update when rows are recycled. Keep one switch here so
-	-- built-in and plugin-created nested UI use the same low-cost style.
-	DecorativeOutlinesEnabled = false,
+	-- Decorative outlines give the interface its depth (window edge, buttons,
+	-- dropdowns, dialogs).  Pooled call rows deliberately do not add strokes,
+	-- so enabling this costs a handful of static objects, not one per row.
+	DecorativeOutlinesEnabled = true,
 }
 local Icons = require(script.Parent.Assets.Icons)
 local AssetManager = require(script.Parent.Assets.Manager)

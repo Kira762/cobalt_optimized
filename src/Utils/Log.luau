@@ -102,11 +102,17 @@ end
 --[[
 	Device-tiered budget lookup.
 
-	`src/init.luau` publishes `wax.shared.DeviceProfile` before this module is
-	required, so the tier presets are already final here.  The actor environment
-	inlines this same file into a bare state that has no DeviceProfile, so every
-	read still needs a literal fallback - the values below are the "high" tier
-	presets and match `DeviceProfile.MaxPendingNotifications` /
+	`src/init.luau` publishes `wax.shared.DeviceProfile` (line 33) long before it
+	requires this module (line 570), so the tier presets are already final here.
+
+	This is deliberately *not* `require("@src/Utils/DeviceProfile")`: tools/bundle.py
+	inlines this whole file into the generated actor environment, which runs as a
+	standalone chunk in another state.  That chunk has no wax `require` and no
+	DeviceProfile, so a require here is a hard error at actor start
+	("Expected ':' not '.' calling member function require").  Every other
+	require that ends up inlined there is guarded by `wax.shared.X or require(...)`;
+	this module simply stays require-free and falls back to the "high" tier
+	presets, which match `DeviceProfile.MaxPendingNotifications` /
 	`DeviceProfile.MaxNotificationsPerHeartbeat`.
 ]]
 local function ProfileValue(Key: string, Default: number): number
@@ -123,7 +129,8 @@ end
 -- The producer is on a remote hook, while the consumer is the UI heartbeat.
 -- Keep the hand-off bounded and coalesce updates for the same remote.  A noisy
 -- remote therefore costs one small notification per frame, not one table per
--- packet.
+-- packet.  The caps come from the device tier preset, captured once at module
+-- load.
 local MaxPendingNotifications = ProfileValue("MaxPendingNotifications", 256)
 local MaxNotificationsPerHeartbeat = ProfileValue("MaxNotificationsPerHeartbeat", 96)
 wax.shared.LogNotificationQueue = {

@@ -319,6 +319,39 @@ local ActorEnvFn, ActorEnvErr = loadstring(ActorEnvRef.Value, "actor-environment
 assert(ActorEnvFn, "REGRESSION: generated actor environment does not compile: " .. tostring(ActorEnvErr))
 print("actor environment compile check    : OK (" .. #ActorEnvRef.Value .. " bytes)")
 
+-- The actor environment is a standalone chunk in another state: it has no wax
+-- `require`, so the only requires that may appear in it are the guarded
+-- `wax.shared.X or require(...)` form, where the shared value is always set
+-- first and the require never actually runs.  An unguarded require - e.g. a
+-- `require("@src/Utils/DeviceProfile")` added to src/Utils/Log.luau, which
+-- bundle.py inlines here - kills the actor at start with Roblox's
+-- "Expected ':' not '.' calling member function require".
+local UnguardedRequires = {}
+local ActorLineNo = 0
+local InBlockComment = false
+for ActorLine in string.gmatch(ActorEnvRef.Value .. "\n", "(.-)\n") do
+    ActorLineNo = ActorLineNo + 1
+
+    -- Prose only: skip comments so a sentence mentioning require() is not a hit.
+    local Trimmed = ActorLine:gsub("^%s+", "")
+    if InBlockComment then
+        if Trimmed:find("]]", 1, true) then
+            InBlockComment = false
+        end
+    elseif Trimmed:sub(1, 4) == "--[[" then
+        InBlockComment = not Trimmed:find("]]", 5, true)
+    elseif Trimmed:sub(1, 2) ~= "--" and ActorLine:find("require(", 1, true)
+        and not ActorLine:match("wax%.shared%.%w+ or require%(") then
+        table.insert(UnguardedRequires, "actor environment line " .. ActorLineNo .. ": " .. Trimmed)
+    end
+end
+if #UnguardedRequires > 0 then
+    print("RESULT: FAIL - the actor environment calls require() outside a wax.shared guard:")
+    for _, line in ipairs(UnguardedRequires) do print("  actor " .. line) end
+    error("aborting module check", 0)
+end
+print("actor environment require guard    : OK")
+
 if #nilCalls > 0 then
     print("RESULT: FAIL - " .. #nilCalls .. " module(s) call an identifier that does not exist:")
     for _, f in ipairs(nilCalls) do print("  nil " .. f) end

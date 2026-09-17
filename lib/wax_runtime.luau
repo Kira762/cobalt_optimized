@@ -309,6 +309,43 @@ for RefId, Closure in next, ClosureBindings do
     end
 end
 
+-- Raw error lines reported by the runtime are absolute bundle lines.  A
+-- function defined in one closure can throw while called from a different
+-- script (module functions run in the caller's stack), so the line usually
+-- falls inside the *callee's* closure.  Map the line to the closure that owns
+-- it so the name and line in the formatted error describe the real owner
+-- instead of the script that happened to re-raise the error.
+local ClosureOwnerRanges = nil
+local function FindClosureOwner(Line)
+    if not ClosureOwnerRanges then
+        local Sorted = {}
+        for RefId, Offset in next, LineOffsets do
+            table_insert(Sorted, { RefId = RefId, Offset = Offset })
+        end
+        table.sort(Sorted, function(A, B)
+            return A.Offset < B.Offset
+        end)
+
+        ClosureOwnerRanges = Sorted
+        for Index, Entry in ipairs(Sorted) do
+            local Next = Sorted[Index + 1]
+            Entry.End = Next and Next.Offset or math.huge
+        end
+    end
+
+    for _, Entry in ipairs(ClosureOwnerRanges) do
+        if Line < Entry.Offset then
+            break
+        end
+        if Line < Entry.End then
+            return Entry
+        end
+    end
+
+    return nil
+end
+
+
 local function LoadScript(scriptRef)
     local ScriptClassName = scriptRef.ClassName
 
@@ -323,17 +360,20 @@ local function LoadScript(scriptRef)
     local function FormatError(originalErrorMessage)
         originalErrorMessage = tostring(originalErrorMessage)
 
-        -- A nested module already translated its own error.  That prefix names
-        -- the module that actually failed and the line inside it, so translating
-        -- it again here would strip that away and blame a line in the *caller*
-        -- (e.g. `[Cobalt].Utils.Log:106` became `[Cobalt].cobalt:95`).  Keep the
-        -- deepest attribution instead.
-        local VirtualNamePrefix = "[" .. EnvName .. "]"
-        if string_sub(originalErrorMessage, 1, #VirtualNamePrefix) == VirtualNamePrefix then
+        local VirtualFullName = scriptRef:GetFullName()
+
+        -- A nested LoadScript re-raises its own formatted report (the failing
+        -- module's virtual name plus its translated line) through require().
+        -- Such messages already start with the virtual root, so pass them
+        -- through untouched.  Re-mapping them here would apply this script's
+        -- line offset to another script's line and re-label the error with
+        -- this script's name, pointing users at unrelated (often blank) lines.
+        -- `+` matters: without it the line field matches a single character, so
+        -- any report at line 10 or above (`...Constants:21: ...`) fell through and
+        -- got re-mapped with the *caller's* offset all over again.
+        if string.match(originalErrorMessage, "^%[" .. EnvName .. "%]%.[^:]*:[%d?*]+: ") then
             return originalErrorMessage
         end
-
-        local VirtualFullName = scriptRef:GetFullName()
 
         
         local OriginalErrorLine, BaseErrorMessage = string_match(originalErrorMessage, "[^:]+:(%d+): (.+)")
@@ -346,13 +386,24 @@ local function LoadScript(scriptRef)
 
         local RefId = ScriptClosureRefIds[scriptRef]
         local LineOffset = LineOffsets[RefId]
+        local OwnerName = VirtualFullName
+
+        
+        local Owner = FindClosureOwner(OriginalErrorLine)
+        if Owner and Owner.RefId ~= RefId then
+            local OwnerRef = RefBindings[Owner.RefId]
+            if OwnerRef then
+                OwnerName = OwnerRef:GetFullName()
+                LineOffset = Owner.Offset
+            end
+        end
 
         local RealErrorLine = OriginalErrorLine - LineOffset + 1
         if RealErrorLine < 0 then
             RealErrorLine = "?"
         end
 
-        return VirtualFullName .. ":" .. RealErrorLine .. ": " .. BaseErrorMessage
+        return OwnerName .. ":" .. RealErrorLine .. ": " .. BaseErrorMessage
     end
 
     

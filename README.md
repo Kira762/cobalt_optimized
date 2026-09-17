@@ -29,7 +29,10 @@ src/                 # editable Luau modules
 lib/                 # bundle inputs and the virtual module tree
 tools/bundle.py      # regenerates closures and serialized actor/HTML values
 tools/modulecheck.py # emits the Luau module-load harness
-verify.sh            # structural verification
+tools/logpolicy.py   # emits/runs the Log capture-policy unit test
+tools/build_assets.py# regenerates assets/ artwork from the lucide sheets
+tools/gen_icons.py   # regenerates Icons.luau from the generated atlas
+verify.sh            # structural + execution + policy verification
 ```
 
 ## Run locally
@@ -49,21 +52,39 @@ The bundle does not need the source tree at runtime, but the local assets are
 used when the executor supports `getcustomasset`. If they are unavailable the
 interface still loads without decorative icons.
 
-## Performance safeguards
+## Capture safeguards
 
-The hot capture path now rejects work before deep-cloning arguments:
+The hot capture path rejects work before deep-cloning arguments, and the
+rejection policy is pinned by `tools/logpolicy.py`:
 
-- at most 120 captures per remote per one-second window;
-- at most 600 captures across all remotes per one-second window;
+- a per-remote valve (500 captures / one-second window) and a global valve
+  (2500 / window) *drop* excess captures and count them in
+  `Log.SuppressedCalls` - they never mark a remote as ignored, so a burst can
+  no longer empty the inspector;
+- `Auto-ignore High-frequency Calls` is opt-in (off by default). When enabled,
+  only a remote that overflows its *own* per-remote valve for two consecutive
+  windows is ignored, and a toast explains why;
 - a bounded, per-remote-coalesced notification queue;
 - bounded GUI render jobs so stale call rows cannot grow without limit;
-- per-remote call retention remains configurable and defaults to a finite cap;
-- animations are off by default and decorative `UIStroke` outlines are skipped;
-- the Cobalt window is centered and ignores the Roblox top inset.
+- per-remote call retention remains configurable (Settings -> Capture) and
+  defaults to a finite cap.
 
-The high-frequency auto-ignore setting is enabled by default. Turn it off only
-when a complete high-volume trace is intentional; the hard capture budgets
-remain in place so tracing cannot freeze the game.
+`./verify.sh` runs the policy test whenever `LUAU` points at a Luau CLI.
+
+## Interface
+
+The window keeps the upstream dark theme but ships complete artwork and
+motion instead of placeholders:
+
+- the lucide icon atlas, class markers and the Cobalt logo are real local
+  PNGs (`assets/`), with packaged Roblox asset ids as an offline fallback;
+- interface animations are on by default (Settings -> Interface Animations
+  switches them off); tweens are de-duplicated per object/property so hovering
+  or recycling rows never stacks tweens;
+- decorative outlines are back on static chrome (window edge, menus, dialogs,
+  dropdowns, toasts) while pooled call rows stay cheap: a row's blocked /
+  highlighted state is a single recycled `UIStroke` plus a background tint;
+- the window is centered and ignores the Roblox top inset.
 
 ## Build and verify
 

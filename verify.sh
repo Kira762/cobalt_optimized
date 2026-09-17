@@ -57,19 +57,26 @@ allowed = {
     "https://raw.githubusercontent.com/Kira762/cobalt_optimized/main/loader.luau",
 }
 violations = []
+# Only *executable* links matter: a URL inside a Luau string literal is a
+# runtime fetch, while the same URL in a comment, a doc page or a maintainer
+# script is attribution.  Non-Luau files are never executed by the game.
+QUOTE_CHARS = '"' + chr(39) + chr(96)
+LINK_IN_LITERAL = re.compile("[" + QUOTE_CHARS + "]" + "\s*(https?://[^\s" + QUOTE_CHARS + "]+)")
 for path in pathlib.Path('.').rglob('*'):
     if path.is_dir() or '.git' in path.parts:
+        continue
+    if path.suffix not in ('.luau', '.lua'):
         continue
     try:
         text = path.read_text()
     except UnicodeDecodeError:
         continue
-    for match in re.finditer(r'https?://[^\s"]+', text):
-        url = match.group(0)
+    for match in LINK_IN_LITERAL.finditer(text):
+        url = match.group(1)
         if url not in allowed:
-            line = text.count('\n', 0, match.start()) + 1
+            line = text.count(chr(10), 0, match.start()) + 1
             violations.append(f"{path}:{line}: unexpected runtime URL {url}")
-    if path.suffix == '.luau' and re.search(r'\brequest\s*\(', text):
+    if re.search(r"\brequest\s*\(", text):
         violations.append(f"{path}: unexpected request() usage")
 
 if violations:
@@ -81,6 +88,7 @@ PY
 if [ -z "${LUAU:-}" ]; then
     echo
     echo "== 5. skipped: set LUAU=/path/to/luau to execute the bundle =="
+    echo "== 6. skipped: set LUAU=/path/to/luau to run the Log policy unit test =="
     exit 0
 fi
 
@@ -89,4 +97,8 @@ echo "== 5. execute the self-contained bundle (no readfile, Roblox require) =="
 OUT="$(mktemp -t cobalt_modulecheck.XXXXXX.luau)"
 trap 'rm -f "$OUT"' EXIT
 python3 tools/modulecheck.py cobalt.luau "$OUT"
-"$LUAU" "$OUT" | grep -vE '^  env ' 
+"$LUAU" "$OUT" | grep -vE '^  env '
+
+echo
+echo "== 6. Log capture-policy unit test =="
+python3 tools/logpolicy.py --run

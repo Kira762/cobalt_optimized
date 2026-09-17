@@ -1,4 +1,50 @@
--- Repository-local lucide icon atlas.
+#!/usr/bin/env python3
+"""Regenerate src/Utils/UI/Assets/Icons.luau to match assets/ui-icons.png."""
+import pathlib
+import re
+import sys
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+
+LUCIDE = pathlib.Path(__import__("os").environ.get("LUCIDE_DIR", "/tmp/lucide_direct"))
+REPO = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else "/home/user/cobalt_optimized")
+
+src = (LUCIDE / "source.lua").read_text()
+i = src.index("local icons = {{")
+j = src.index("},{", i)
+names = src[i + len("local icons = {{") : j].split('","')
+names[0] = names[0].lstrip('"')
+names[-1] = names[-1].rstrip('"')
+index_of = {n: k + 1 for k, n in enumerate(names)}
+reg_start = src.index("{[48]={{", j) + len("{[48]=")
+depth = 0
+k = reg_start
+while True:
+    c = src[k]
+    if c == "{":
+        depth += 1
+    elif c == "}":
+        depth -= 1
+        if depth == 0:
+            break
+    k += 1
+entries = re.findall(r"\{(\d+),\{(\d+),(\d+)\},\{(\d+),(\d+)\}\}", src[reg_start : k + 1])
+
+atlas_map = {}
+for line in (REPO / "assets/_icon_atlas_map.txt").read_text().splitlines():
+    pos, name = line.split("\t")
+    atlas_map[name] = int(pos)
+
+ordered = sorted(atlas_map.items(), key=lambda kv: kv[1])
+
+cell_lines = []
+fb_lines = []
+for name, pos in ordered:
+    cell_lines.append(f'\t["{name}"] = {pos},')
+    sheet, w, h, x, y = (int(v) for v in entries[index_of[name] - 1])
+    fb_lines.append(f'\t["{name}"] = {{ {sheet}, {x}, {y} }},')
+
+body = '''-- Repository-local lucide icon atlas.
 --
 -- Cobalt used to evaluate a remote Luau module that downloaded two sprite
 -- sheets while the window was starting up.  Icons are decorative, so the
@@ -23,95 +69,13 @@ local AtlasPaths = { "assets/ui-icons.png", "Cobalt/Assets/ui-icons.png" }
 
 -- Icon name -> 1-based cell inside the local atlas.
 local IconCells: { [string]: number } = {
-	["align-vertical-distribute-center"] = 1,
-	["ban"] = 2,
-	["blocks"] = 3,
-	["bug"] = 4,
-	["check"] = 5,
-	["chevron-down"] = 6,
-	["circle-alert"] = 7,
-	["circle-fading-arrow-up"] = 8,
-	["code"] = 9,
-	["copy"] = 10,
-	["ellipsis"] = 11,
-	["eye"] = 12,
-	["file"] = 13,
-	["file-clock"] = 14,
-	["file-search"] = 15,
-	["file-text"] = 16,
-	["forward"] = 17,
-	["gamepad-2"] = 18,
-	["globe"] = 19,
-	["list-filter"] = 20,
-	["lock"] = 21,
-	["lock-open"] = 22,
-	["minus"] = 23,
-	["network"] = 24,
-	["package-search"] = 25,
-	["parentheses"] = 26,
-	["pencil"] = 27,
-	["play"] = 28,
-	["plus"] = 29,
-	["scroll-text"] = 30,
-	["search"] = 31,
-	["settings"] = 32,
-	["shield-alert"] = 33,
-	["terminal"] = 34,
-	["trash"] = 35,
-	["triangle-alert"] = 36,
-	["x"] = 37,
-	["radio-tower"] = 38,
-	["satellite"] = 39,
-	["square-function"] = 40,
-	["link-2"] = 41,
-	["braces"] = 42,
+__CELLS__
 }
 
 -- Offline fallback geometry inside the publicly uploaded lucide sprite
 -- sheets (Roblox asset ids, no HTTP request needed): name -> { sheet, x, y }.
 local SheetCells: { [string]: { number } } = {
-	["align-vertical-distribute-center"] = { 1, 150, 25 },
-	["ban"] = { 1, 150, 225 },
-	["blocks"] = { 1, 200, 250 },
-	["bug"] = { 1, 0, 525 },
-	["check"] = { 1, 400, 225 },
-	["chevron-down"] = { 1, 175, 450 },
-	["circle-alert"] = { 1, 400, 250 },
-	["circle-fading-arrow-up"] = { 1, 525, 150 },
-	["code"] = { 1, 650, 100 },
-	["copy"] = { 1, 775, 0 },
-	["ellipsis"] = { 1, 150, 675 },
-	["eye"] = { 1, 700, 150 },
-	["file"] = { 1, 825, 75 },
-	["file-clock"] = { 1, 50, 800 },
-	["file-search"] = { 1, 300, 575 },
-	["file-text"] = { 1, 125, 750 },
-	["forward"] = { 1, 200, 725 },
-	["gamepad-2"] = { 1, 850, 100 },
-	["globe"] = { 1, 50, 900 },
-	["list-filter"] = { 1, 75, 975 },
-	["lock"] = { 1, 375, 700 },
-	["lock-open"] = { 1, 400, 675 },
-	["minus"] = { 1, 650, 500 },
-	["network"] = { 1, 875, 325 },
-	["package-search"] = { 1, 225, 975 },
-	["parentheses"] = { 1, 925, 325 },
-	["pencil"] = { 1, 575, 675 },
-	["play"] = { 1, 500, 775 },
-	["plus"] = { 1, 325, 950 },
-	["scroll-text"] = { 1, 450, 950 },
-	["search"] = { 1, 850, 575 },
-	["settings"] = { 1, 525, 900 },
-	["shield-alert"] = { 1, 900, 550 },
-	["terminal"] = { 1, 875, 975 },
-	["trash"] = { 2, 25, 175 },
-	["triangle-alert"] = { 2, 75, 150 },
-	["x"] = { 2, 400, 50 },
-	["radio-tower"] = { 1, 375, 925 },
-	["satellite"] = { 1, 550, 825 },
-	["square-function"] = { 1, 925, 675 },
-	["link-2"] = { 1, 325, 725 },
-	["braces"] = { 1, 525, 0 },
+__SHEETS__
 }
 
 local SheetUrls = {
@@ -228,3 +192,8 @@ function Icons.SetIcon(imageInstance: ImageLabel | ImageButton, IconName: string
 end
 
 return Icons
+'''
+body = body.replace("__CELLS__", "\n".join(cell_lines)).replace("__SHEETS__", "\n".join(fb_lines))
+target = REPO / "src/Utils/UI/Assets/Icons.luau"
+target.write_text(body)
+print(f"wrote {target} with {len(ordered)} icons")

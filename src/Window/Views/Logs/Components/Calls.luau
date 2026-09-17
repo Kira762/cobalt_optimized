@@ -371,9 +371,25 @@ return function(props: {
 			Constants.MainUICorner,
 		})
 
-		-- Row highlighting uses the background instead of a UIStroke. This keeps
-		-- pooled call rows to the minimum number of rendered objects.
-		self.CallFrameData[CallFrame] = {}
+		--[[
+			Row state is communicated two ways: the background tint (cheap, and
+			what hover animates) plus a single persistent outline that marks
+			blocked / highlighted calls.  One stroke per pooled row is created
+			once and recycled with the row, so a page of calls still costs a
+			single extra object each while reading instantly as "blocked".
+		]]
+		local HighlightStroke = Interface.New("UIStroke", {
+			Name = "HighlightStroke",
+			ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+			Thickness = 1,
+			Transparency = 1,
+
+			Parent = CallFrame,
+		})
+
+		self.CallFrameData[CallFrame] = {
+			HighlightStroke = HighlightStroke,
+		}
 
 		local function SetRowHighlight(Data, Active: boolean)
 			if not Data then
@@ -386,6 +402,13 @@ return function(props: {
 			Animations.Play(CallFrame, {
 				BackgroundColor3 = TargetColor,
 			}, Constants.DefaultTweenInfo)
+
+			local Stroke = Data.HighlightStroke
+			if Stroke and not Data.IsBlockedCall and not Data.IsHighlightedCall then
+				Animations.Play(Stroke, {
+					Transparency = if Active then 0.55 else 1,
+				}, Constants.DefaultTweenInfo)
+			end
 		end
 
 		CallFrame.MouseEnter:Connect(function()
@@ -503,6 +526,18 @@ return function(props: {
 			else Color3.fromRGB(25, 25, 25)
 		CallFrame.BackgroundColor3 = Data.BaseBackgroundColor
 		CallFrame.LayoutOrder = CallInfo.Order
+
+		local HighlightStroke = Data.HighlightStroke
+		if HighlightStroke then
+			HighlightStroke.Color = if IsBlockedCall
+				then Color3.fromRGB(222, 82, 82)
+				elseif IsHighlightedCall then Color3.fromRGB(230, 170, 65)
+				else Color3.fromRGB(75, 75, 75)
+			HighlightStroke.Transparency = if IsBlockedCall
+				then 0.5
+				elseif IsHighlightedCall then 0.35
+				else 1
+		end
 
 		local InitialDataView = if CallInfo.Type == "Incoming" and CallInfo.InvokeResult
 			then "InvokeResult"

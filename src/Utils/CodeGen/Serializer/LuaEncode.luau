@@ -1,3 +1,7 @@
+-- LuaEncode - Fast table serialization library for pure Luau/Lua 5.1+
+-- MIT License | Copyright (c) 2022-2025 Chad Hyatt <chad@hyatt.page>
+-- https://github.com/chadhyatt/LuaEncode
+
 
 
 

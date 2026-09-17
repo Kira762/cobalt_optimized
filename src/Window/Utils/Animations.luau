@@ -234,9 +234,11 @@ function Animations.Cancel(object, ResetScale: boolean?)
 end
 
 function Animations.IsEnabled(): boolean
-	-- Instant transitions are the safe default for a remote-spy UI: they avoid
-	-- creating a tween for every hover and every newly visible row.
-	return GetBooleanSetting("AnimationsEnabled", false) == true
+	-- Motion is the default (it is what makes the interface read as alive);
+	-- the de-duplicating tween layer keeps it cheap, and the setting can still
+	-- switch everything to instant transitions on low-end devices.  The
+	-- fallback default mirrors Settings.Registry.AnimationsEnabled.
+	return GetBooleanSetting("AnimationsEnabled", true) == true
 end
 
 function Animations.SetEnabled(Enabled: boolean)

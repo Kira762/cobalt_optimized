@@ -102,9 +102,12 @@ end
 -- The producer is on a remote hook, while the consumer is the UI heartbeat.
 -- Keep the hand-off bounded and coalesce updates for the same remote.  A noisy
 -- remote therefore costs one small notification per frame, not one table per
--- packet.
-local MaxPendingNotifications = ProfileValue("MaxPendingNotifications", 256)
-local MaxNotificationsPerHeartbeat = ProfileValue("MaxNotificationsPerHeartbeat", 96)
+-- packet.  The caps come from the device tier preset, captured once at module
+-- load (boot finalizes the tier before this module is required, and the
+-- DeviceProfile module self-detects if it is loaded elsewhere).
+local DeviceProfile = require("@src/Utils/DeviceProfile")
+local MaxPendingNotifications = DeviceProfile.MaxPendingNotifications or 256
+local MaxNotificationsPerHeartbeat = DeviceProfile.MaxNotificationsPerHeartbeat or 96
 wax.shared.LogNotificationQueue = {
 	Items = {},
 	Head = 1,

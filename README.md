@@ -82,8 +82,10 @@ bundle's module-load harness as well. The harness intentionally stubs Roblox
 APIs; failures that require a live executor are reported separately from bundle
 and module-structure errors. It fails the build when a module calls an
 identifier that no environment provides, when `Utils.Log` does not load, when a
-nested module error loses its deepest module/line attribution, or when the
-generated actor environment does not compile.
+nested module error loses its deepest module/line attribution, when the
+generated actor environment does not compile, or when that actor environment
+calls `require()` outside a `wax.shared.X or require(...)` guard (the actor chunk
+runs standalone and has no wax `require`).
 
 ## Improved maintenance prompt
 

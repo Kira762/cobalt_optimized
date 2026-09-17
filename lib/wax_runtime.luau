@@ -6,6 +6,7 @@ local string, task, setmetatable, error, next, table, unpack, coroutine, script,
 
 local table_insert = table.insert
 local table_remove = table.remove
+local table_sort = table.sort
 local table_freeze = table.freeze or function(t) return t end 
 
 local coroutine_wrap = coroutine.wrap
@@ -322,9 +323,27 @@ local function FindClosureOwner(Line)
         for RefId, Offset in next, LineOffsets do
             table_insert(Sorted, { RefId = RefId, Offset = Offset })
         end
-        table.sort(Sorted, function(A, B)
+        local function CompareClosureOffsets(A, B)
             return A.Offset < B.Offset
-        end)
+        end
+
+        if table_sort then
+            table_sort(Sorted, CompareClosureOffsets)
+        else
+            -- Some executor sandboxes expose a partial table library.  Error
+            -- formatting runs while another error is already being reported, so
+            -- keep it dependency-light instead of masking the original failure
+            -- with `attempt to call a nil value` from table.sort.
+            for Index = 2, #Sorted do
+                local Entry = Sorted[Index]
+                local InsertAt = Index - 1
+                while InsertAt >= 1 and CompareClosureOffsets(Entry, Sorted[InsertAt]) do
+                    Sorted[InsertAt + 1] = Sorted[InsertAt]
+                    InsertAt -= 1
+                end
+                Sorted[InsertAt + 1] = Entry
+            end
+        end
 
         ClosureOwnerRanges = Sorted
         for Index, Entry in ipairs(Sorted) do

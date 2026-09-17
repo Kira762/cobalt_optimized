@@ -99,8 +99,19 @@ if not wax.shared.Players.LocalPlayer then
 end
 
 wax.shared.LocalPlayer = wax.shared.Players.LocalPlayer
+
+local function FindFirstDescendantOfClass(Root, ClassName)
+	for _, Descendant in Root:GetDescendants() do
+		if Descendant:IsA(ClassName) then
+			return Descendant
+		end
+	end
+
+	return nil
+end
+
 local ContendingPlayerScripts =
-	cloneref(wax.shared.LocalPlayer:QueryDescendants("PlayerScripts")[1] or wax.shared.LocalPlayer)
+	cloneref(FindFirstDescendantOfClass(wax.shared.LocalPlayer, "PlayerScripts") or wax.shared.LocalPlayer)
 if ContendingPlayerScripts:IsA("PlayerScripts") then
 	wax.shared.PlayerScripts = ContendingPlayerScripts
 else

@@ -364,8 +364,10 @@ return function(ComponentProps: {
 		end
 
 		
-		for _, Button in self.Footer.UI:QueryDescendants("ImageButton") do
-			Button:Destroy()
+		for _, Descendant in self.Footer.UI:GetDescendants() do
+			if Descendant:IsA("ImageButton") then
+				Descendant:Destroy()
+			end
 		end
 
 		local ButtonIndex = 0

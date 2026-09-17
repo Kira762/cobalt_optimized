@@ -638,8 +638,22 @@ return function(Options: Options?)
 		end
 	end
 
+	local function GetDescendantsByClassNames(Root, ClassNames)
+		local Matches = {}
+		for _, Descendant in Root:GetDescendants() do
+			for _, ClassName in ClassNames do
+				if Descendant:IsA(ClassName) then
+					table.insert(Matches, Descendant)
+					break
+				end
+			end
+		end
+
+		return Matches
+	end
+
 	local Categories = {
-		game:QueryDescendants(table.concat(ClassesToSearch, ", ")),
+		GetDescendantsByClassNames(game, ClassesToSearch),
 	}
 	if wax.shared.ExecutorSupport["getnilinstances"].IsWorking then
 		table.insert(Categories, getnilinstances())

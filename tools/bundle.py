@@ -267,6 +267,58 @@ def sync_actor_environment(object_tree: str) -> str:
     if settings_old in embedded and "AutoIgnoreSpammyEvents = { Value = Data.AutoIgnoreSpammyEvents }" not in embedded:
         embedded = embedded.replace(settings_old, settings_new, 1)
 
+    # Keep the generated actor script compatible with standard Roblox Instances.
+    # The actor script is stored as a serialized StringValue in ObjectTree, so
+    # changing src/Spy/Hooks/Luau/Actors/Environment.luau does not update this
+    # runtime value unless we patch the generated text here.
+    player_scripts_old = (
+        "wax.shared.LocalPlayer = wax.shared.Players.LocalPlayer\n"
+        "local ContendingPlayerScripts =\n"
+        "\tcloneref(wax.shared.LocalPlayer:QueryDescendants(\"PlayerScripts\")[1] or wax.shared.LocalPlayer)\n"
+        "if ContendingPlayerScripts:IsA(\"PlayerScripts\") then"
+    )
+    player_scripts_new = (
+        "wax.shared.LocalPlayer = wax.shared.Players.LocalPlayer\n\n"
+        "local function FindFirstDescendantOfClass(Root, ClassName)\n"
+        "\tfor _, Descendant in Root:GetDescendants() do\n"
+        "\t\tif Descendant:IsA(ClassName) then\n"
+        "\t\t\treturn Descendant\n"
+        "\t\tend\n"
+        "\tend\n\n"
+        "\treturn nil\n"
+        "end\n\n"
+        "local ContendingPlayerScripts =\n"
+        "\tcloneref(FindFirstDescendantOfClass(wax.shared.LocalPlayer, \"PlayerScripts\") or wax.shared.LocalPlayer)\n"
+        "if ContendingPlayerScripts:IsA(\"PlayerScripts\") then"
+    )
+    if player_scripts_old in embedded:
+        embedded = embedded.replace(player_scripts_old, player_scripts_new, 1)
+
+    categories_old = (
+        "\t\tlocal Categories = {\n"
+        "\t\t\tgame:QueryDescendants(table.concat(ClassesToSearch, \", \")),\n"
+        "\t\t}\n"
+    )
+    categories_new = (
+        "\t\tlocal function GetDescendantsByClassNames(Root, ClassNames)\n"
+        "\t\t\tlocal Matches = {}\n"
+        "\t\t\tfor _, Descendant in Root:GetDescendants() do\n"
+        "\t\t\t\tfor _, ClassName in ClassNames do\n"
+        "\t\t\t\t\tif Descendant:IsA(ClassName) then\n"
+        "\t\t\t\t\t\ttable.insert(Matches, Descendant)\n"
+        "\t\t\t\t\t\tbreak\n"
+        "\t\t\t\t\tend\n"
+        "\t\t\t\tend\n"
+        "\t\t\tend\n\n"
+        "\t\t\treturn Matches\n"
+        "\t\tend\n\n"
+        "\t\tlocal Categories = {\n"
+        "\t\t\tGetDescendantsByClassNames(game, ClassesToSearch),\n"
+        "\t\t}\n"
+    )
+    if categories_old in embedded:
+        embedded = embedded.replace(categories_old, categories_new, 1)
+
     log_start = embedded.find("do\n\tlocal Log = {}\n")
     log_end = embedded.find("\nend\n--#endregion", log_start)
     if log_start < 0 or log_end < 0:

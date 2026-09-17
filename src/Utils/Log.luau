@@ -99,15 +99,40 @@ local function GetMaxCallsPerRemote(): number
 	return CachedCallCap
 end
 
+--[[
+	Device-tiered budget lookup.
+
+	`src/init.luau` publishes `wax.shared.DeviceProfile` (line 33) long before it
+	requires this module (line 570), so the tier presets are already final here.
+
+	This is deliberately *not* `require("@src/Utils/DeviceProfile")`: tools/bundle.py
+	inlines this whole file into the generated actor environment, which runs as a
+	standalone chunk in another state.  That chunk has no wax `require` and no
+	DeviceProfile, so a require here is a hard error at actor start
+	("Expected ':' not '.' calling member function require").  Every other
+	require that ends up inlined there is guarded by `wax.shared.X or require(...)`;
+	this module simply stays require-free and falls back to the "high" tier
+	presets, which match `DeviceProfile.MaxPendingNotifications` /
+	`DeviceProfile.MaxNotificationsPerHeartbeat`.
+]]
+local function ProfileValue(Key: string, Default: number): number
+	local Profile = wax.shared.DeviceProfile
+	local Value = Profile and Profile[Key]
+
+	if type(Value) == "number" then
+		return Value
+	end
+
+	return Default
+end
+
 -- The producer is on a remote hook, while the consumer is the UI heartbeat.
 -- Keep the hand-off bounded and coalesce updates for the same remote.  A noisy
 -- remote therefore costs one small notification per frame, not one table per
 -- packet.  The caps come from the device tier preset, captured once at module
--- load (boot finalizes the tier before this module is required, and the
--- DeviceProfile module self-detects if it is loaded elsewhere).
-local DeviceProfile = require("@src/Utils/DeviceProfile")
-local MaxPendingNotifications = DeviceProfile.MaxPendingNotifications or 256
-local MaxNotificationsPerHeartbeat = DeviceProfile.MaxNotificationsPerHeartbeat or 96
+-- load.
+local MaxPendingNotifications = ProfileValue("MaxPendingNotifications", 256)
+local MaxNotificationsPerHeartbeat = ProfileValue("MaxNotificationsPerHeartbeat", 96)
 wax.shared.LogNotificationQueue = {
 	Items = {},
 	Head = 1,

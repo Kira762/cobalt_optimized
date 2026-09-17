@@ -71,10 +71,21 @@ python3 tools/bundle.py --check
 ./verify.sh
 ```
 
+`tools/bundle.py` regenerates the closures and `LineOffsets` from `src/`, keeps
+the serialized session template and actor environment in sync, and re-inlines
+`lib/config.luau` + `lib/wax_runtime.luau` as the bundle tail, so the runtime
+(`LoadScript`, `FormatError`, the virtual instance tree) cannot drift from
+`lib/`.
+
 If a Luau CLI is available, set `LUAU` before running `verify.sh` to execute the
 bundle's module-load harness as well. The harness intentionally stubs Roblox
 APIs; failures that require a live executor are reported separately from bundle
-and module-structure errors.
+and module-structure errors. It fails the build when a module calls an
+identifier that no environment provides, when `Utils.Log` does not load, when a
+nested module error loses its deepest module/line attribution, when the
+generated actor environment does not compile, or when that actor environment
+calls `require()` outside a `wax.shared.X or require(...)` guard (the actor chunk
+runs standalone and has no wax `require`).
 
 ## Improved maintenance prompt
 

@@ -368,7 +368,10 @@ local function LoadScript(scriptRef)
         -- through untouched.  Re-mapping them here would apply this script's
         -- line offset to another script's line and re-label the error with
         -- this script's name, pointing users at unrelated (often blank) lines.
-        if string.match(originalErrorMessage, "^%[" .. EnvName .. "%]%.[^:]*:[%d?*]: ") then
+        -- `+` matters: without it the line field matches a single character, so
+        -- any report at line 10 or above (`...Constants:21: ...`) fell through and
+        -- got re-mapped with the *caller's* offset all over again.
+        if string.match(originalErrorMessage, "^%[" .. EnvName .. "%]%.[^:]*:[%d?*]+: ") then
             return originalErrorMessage
         end
 

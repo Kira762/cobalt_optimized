@@ -210,7 +210,10 @@ return function(props: {
 
 			LogList:EnsureLogButton(Log)
 			LogList:QueueLogButtonUpdate(Log)
-			LogCalls:HandleCallAdded(Log, CallIndex, Notification.Call)
+			-- Suppressed lets the row renderer drop entrance motion for rows
+			-- that are already a burst behind (several fires were folded into
+			-- this one notification).
+			LogCalls:HandleCallAdded(Log, CallIndex, Notification.Call, Notification.Suppressed)
 		end
 	end))
 

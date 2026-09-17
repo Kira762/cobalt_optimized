@@ -89,6 +89,7 @@ if [ -z "${LUAU:-}" ]; then
     echo
     echo "== 5. skipped: set LUAU=/path/to/luau to execute the bundle =="
     echo "== 6. skipped: set LUAU=/path/to/luau to run the Log policy unit test =="
+    echo "== 7. skipped: set LUAU=/path/to/luau to run the hot-path micro-benchmark =="
     exit 0
 fi
 
@@ -102,3 +103,7 @@ python3 tools/modulecheck.py cobalt.luau "$OUT"
 echo
 echo "== 6. Log capture-policy unit test =="
 python3 tools/logpolicy.py --run
+
+echo
+echo "== 7. hot-path micro-benchmark =="
+python3 tools/hotpath_bench.py --run

@@ -56,17 +56,39 @@ export type Options = {
 	them: both cost an executor call (DebugId also switches thread identity) and
 	the incoming path resolves them once per invocation instead of once per
 	connection entry.
+
+	`Origin` may also be a resolver function - that is what the hot paths pass.
+	ShouldIgnore only asks for the origin when its verdict depends on it, and
+	the origin is otherwise needed just once, when the log entry is first
+	created, so a getcallingscript() runs only when one of those two moments
+	arrives instead of unconditionally on every fire.
 ]]
 local function GetLog(
 	Instance: InstancesToHook,
 	Function: (...any) -> ...any,
 	DebugId: number?,
-	Origin: Instance?
+	Origin: Instance? | (() -> Instance?)
 )
 	DebugId = DebugId or wax.shared.GetDebugId(Instance)
-	Origin = Origin or getcallingscript()
 
-	if wax.shared.ShouldIgnore(Instance, Origin) or LogConnectionFunctions[Function] then
+	local OriginResolved = false
+	local ResolvedOrigin = nil
+	local function ResolveOrigin()
+		if not OriginResolved then
+			if type(Origin) == "function" then
+				ResolvedOrigin = Origin()
+			elseif Origin ~= nil then
+				ResolvedOrigin = Origin
+			else
+				ResolvedOrigin = getcallingscript()
+			end
+			OriginResolved = true
+		end
+
+		return ResolvedOrigin
+	end
+
+	if wax.shared.ShouldIgnore(Instance, ResolveOrigin) or LogConnectionFunctions[Function] then
 		return nil
 	end
 
@@ -77,7 +99,7 @@ local function GetLog(
 
 	local Log = IncomingLogs[DebugId]
 	if not Log then
-		Log = wax.shared.NewLog(Instance, "Incoming", Origin, DebugId)
+		Log = wax.shared.NewLog(Instance, "Incoming", ResolveOrigin(), DebugId)
 	end
 
 	return Log
@@ -103,7 +125,7 @@ local function LogRemote(
 	Function: (...any) -> ...any,
 	Info: {
 		DebugId: number?,
-		IgnoreOrigin: Instance?,
+		IgnoreOrigin: Instance? | (() -> Instance?),
 		Arguments: { [number]: any, n: number },
 		Origin: Instance,
 		Function: (...any) -> ...any,
@@ -168,10 +190,11 @@ local function CreateConnectionFunction(Instance: InstancesToHook, Method: Metho
 
 	-- getconnections() is the single most expensive executor call on the
 	-- incoming path, and a remote's connection set rarely changes mid-burst,
-	-- so it is refreshed at most once per expiry window per remote.  Between
-	-- refreshes the cached entries are reused as-is; a connection added
-	-- inside the window is picked up by the next refresh.
-	local ConnectionCacheExpiry = 0.2
+	-- so it is refreshed at most twice a second per remote while the remote
+	-- actually fires.  Between refreshes the cached entries are reused
+	-- as-is; a connection added inside the window is picked up by the next
+	-- refresh, and an idle remote pays nothing at all.
+	local ConnectionCacheExpiry = 0.5
 	local CachedConnections = nil
 	local CachedConnectionsAt = 0
 
@@ -261,8 +284,19 @@ local function CreateConnectionFunction(Instance: InstancesToHook, Method: Metho
 		local Arguments = wax.shared.SafePack.PackFast(...)
 		local TargetLog, TargetCallIndex
 
-		-- Resolved once for the whole invocation (used to be one per entry).
-		local CallingScript = getcallingscript()
+		-- The calling script used to be resolved eagerly once per invocation.
+		-- It now resolves at most once, and only if ShouldIgnore's
+		-- player-module check or a first-time log creation actually needs it.
+		local CallingScript = nil
+		local CallingScriptResolved = false
+		local function ResolveCallingScript()
+			if not CallingScriptResolved then
+				CallingScript = getcallingscript()
+				CallingScriptResolved = true
+			end
+
+			return CallingScript
+		end
 
 
 		if CachedConnectionInfo.HasValidConnections then
@@ -274,7 +308,7 @@ local function CreateConnectionFunction(Instance: InstancesToHook, Method: Metho
 					Line = nil,
 					IsExecutor = Entry.IsExecutor,
 					DebugId = DebugId,
-					IgnoreOrigin = CallingScript,
+					IgnoreOrigin = ResolveCallingScript,
 				}))
 			end
 
@@ -286,7 +320,7 @@ local function CreateConnectionFunction(Instance: InstancesToHook, Method: Metho
 				Line = nil,
 				IsExecutor = false,
 				DebugId = DebugId,
-				IgnoreOrigin = CallingScript,
+				IgnoreOrigin = ResolveCallingScript,
 			}))
 		end
 

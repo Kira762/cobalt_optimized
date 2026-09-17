@@ -20,6 +20,11 @@ body never executes.
 LineOffsets is regenerated in the same pass so that FormatError() can translate
 an absolute line number in the bundle back to a line inside the offending module.
 
+The bundle tail (everything from `local Aliases = {` on) is likewise rebuilt
+from lib/config.luau + lib/wax_runtime.luau, and the serialized session template
+and actor environment are re-synced from their sources, so no part of the bundle
+can drift from the files you edit.
+
 Usage:  python3 tools/bundle.py [--check]
   --check   regenerate in memory and fail if cobalt.luau on disk is stale
 """
@@ -37,11 +42,15 @@ SESSION_TEMPLATE = ROOT / "src" / "Utils" / "CodeGen" / "Templates" / "SessionHT
 SESSION_MARKER = '"SessionHTMLView",\n'
 ACTOR_LOG_SOURCE = ROOT / "src" / "Utils" / "Log.luau"
 ACTOR_ENVIRONMENT_MARKER = '"Environment",\n'
+CONFIG_SOURCE = ROOT / "lib" / "config.luau"
+WAX_RUNTIME_SOURCE = ROOT / "lib" / "wax_runtime.luau"
 
 CLOSURE_START = "local ClosureBindings = {"
 OBJECT_TREE_START = "local ObjectTree = {"
 LINE_OFFSETS_START = "local LineOffsets = {"
 LINE_OFFSETS_END = "\n}\n"
+RUNTIME_START = "\nlocal Aliases = {"
+CONFIG_LAST_LOCAL = "local EnvName ="
 
 
 def read_ref_map() -> dict[int, str]:
@@ -274,6 +283,28 @@ def sync_actor_environment(object_tree: str) -> str:
     return replace_serialized_value(object_tree, ACTOR_ENVIRONMENT_MARKER, embedded, chunk_size=1_000_000_000)
 
 
+def sync_runtime(cobalt: str) -> str:
+    """Rebuild the bundle tail from lib/config.luau + lib/wax_runtime.luau.
+
+    Everything from `local Aliases = {` to end of file is the wax runtime, and
+    `lib/` is its source of truth.  Regenerating it here means an edit to
+    LoadScript()/FormatError() cannot be left behind in the bundle, and
+    `--check` reports the drift instead of silently shipping the old runtime.
+
+    config.luau is a module that returns a table; the bundle inlines only its
+    locals (Aliases, WaxVersion, EnvName), so copy up to the last `local`.
+    """
+    index = cobalt.rindex(RUNTIME_START)
+
+    config = CONFIG_SOURCE.read_text().replace("\r\n", "\n").split("\n")
+    locals_ = [i for i, line in enumerate(config) if line.startswith(CONFIG_LAST_LOCAL)]
+    if not locals_:
+        raise AssertionError(f"{CONFIG_LAST_LOCAL!r} not found in {CONFIG_SOURCE.name}")
+    runtime = WAX_RUNTIME_SOURCE.read_text().replace("\r\n", "\n").split("\n")
+
+    return cobalt[: index + 1] + "\n".join(config[: locals_[-1] + 1] + [""] + runtime)
+
+
 def build_closures(ref_map: dict[int, str], closure_start_line: int) -> tuple[str, dict[int, int]]:
     """Return the ClosureBindings block plus {ref_id: 0-based index of first body line}.
 
@@ -375,6 +406,7 @@ def main() -> int:
     current = COBALT.read_text()
     synced = sync_actor_environment(current)
     synced = sync_session_template(synced)
+    synced = sync_runtime(synced)
     new = bundle(synced)
     verify(new)
 

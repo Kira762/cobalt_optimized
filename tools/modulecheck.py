@@ -33,10 +33,14 @@ def bracket(s: str) -> str:
 
 # Exposes the bundle internals just before it starts running scripts, so the
 # harness can drive LoadScript() itself instead of only watching script #1.
+# SharedEnvironment is the raw table behind wax.shared: the harness seeds the
+# few services src/init.luau would publish so that module bodies which read
+# them at load time (Utils.Log's Heartbeat consumer) can be exercised too.
 EPILOGUE_MARKER = "for _, ScriptRef in next, ScriptsToRun do"
 EPILOGUE = (
     "getgenv().__CobaltInternals = { LoadScript = LoadScript, "
-    "RefBindings = RefBindings, ScriptClosures = ScriptClosures }\n\n"
+    "RefBindings = RefBindings, ScriptClosures = ScriptClosures, "
+    "Shared = SharedEnvironment }\n\n"
 )
 
 STUBS = r'''
@@ -51,6 +55,21 @@ end
 local function NewInstance(cls)
     return setmetatable({ __class = cls, Name = cls }, InstanceMT)
 end
+
+-- A do-nothing RBXScriptSignal.  Modules that wire a Heartbeat consumer at load
+-- time must still be loadable here, otherwise the harness cannot tell a missing
+-- executor API apart from a module that never runs at all.
+local FakeConnection = { Enabled = true }
+FakeConnection.__index = FakeConnection
+function FakeConnection.Disconnect() end
+local FakeSignal = {
+    Connect = function() return FakeConnection end,
+    ConnectParallel = function() return FakeConnection end,
+    Once = function() return FakeConnection end,
+    Wait = function() return 0 end,
+    Fire = function() end,
+}
+
 local Services = {}
 game = {
     GetService = function(_, name)
@@ -58,6 +77,14 @@ game = {
         return Services[name]
     end,
 }
+Services.RunService = setmetatable({ __class = "RunService" }, {
+    __index = function(_, k)
+        if k == "Heartbeat" or k == "RenderStepped" or k == "Stepped" then
+            return FakeSignal
+        end
+        return nil
+    end,
+})
 Services.HttpService = setmetatable({ __class = "HttpService" }, {
     __index = function(_, k)
         if k == "GenerateGUID" then return function() return "GUID-STUB" end end
@@ -162,8 +189,30 @@ if not I then
     error("aborting module check", 0)
 end
 
+local function FindModuleRef(FullName)
+    for refId = 1, 10000 do
+        local ref = I.RefBindings[refId]
+        if ref and ref.ClassName == "ModuleScript" and I.ScriptClosures[ref] then
+            local okName, fullName = pcall(function() return ref:GetFullName() end)
+            if okName and fullName == FullName then
+                return ref
+            end
+        end
+    end
+    return nil
+end
+
+-- src/init.luau publishes these before any consumer module loads, so seed them
+-- the same way.  Utils.Connect is the real module (it publishes Connect and
+-- Disconnect); RunService is a test double for the Roblox service.
+local ConnectRef = FindModuleRef("[Cobalt].cobalt.Utils.Connect")
+assert(ConnectRef, "setup: Utils.Connect module not found")
+local okConnect, connectErr = pcall(I.LoadScript, ConnectRef)
+assert(okConnect, "setup: Utils.Connect failed to load: " .. tostring(connectErr))
+I.Shared.RunService = game:GetService("RunService")
+
 local okCount, failCount = 0, 0
-local failures, kinds, uninvoked = {}, {}, {}
+local failures, kinds, uninvoked, nilCalls = {}, {}, {}, {}
 for refId = 1, 10000 do
     local ref = I.RefBindings[refId]
     if ref and ref.ClassName == "ModuleScript" and I.ScriptClosures[ref] then
@@ -176,7 +225,17 @@ for refId = 1, 10000 do
             end
         else
             failCount = failCount + 1
-            table.insert(failures, refId .. " " .. tostring(ref:GetFullName()) .. " -> " .. tostring(res))
+            local entry = refId .. " " .. tostring(ref:GetFullName()) .. " -> " .. tostring(res)
+            table.insert(failures, entry)
+
+            -- A missing Roblox/executor API in this stub env surfaces as
+            -- "attempt to index nil with 'X'".  "attempt to call a nil value"
+            -- is different: something was called that no environment provides,
+            -- which means the module references an identifier that does not
+            -- exist (e.g. Log's former bare `ProfileValue(...)` call).
+            if tostring(res):find("attempt to call a nil value", 1, true) then
+                table.insert(nilCalls, entry)
+            end
         end
     end
 end
@@ -200,17 +259,7 @@ end
 -- interface-scale list, menu entries without Icon) call GetIcon/SetIcon with
 -- nil. Once the icon module loads this must be a safe no-op - a nil cache
 -- *write* aborts the whole Window load with "table index is nil".
-local IconsRef = nil
-for refId = 1, 10000 do
-    local ref = I.RefBindings[refId]
-    if ref and ref.ClassName == "ModuleScript" and I.ScriptClosures[ref] then
-        local okName, fullName = pcall(function() return ref:GetFullName() end)
-        if okName and fullName == "[Cobalt].cobalt.Utils.UI.Assets.Icons" then
-            IconsRef = ref
-            break
-        end
-    end
-end
+local IconsRef = FindModuleRef("[Cobalt].cobalt.Utils.UI.Assets.Icons")
 assert(IconsRef, "regression setup: icons module not found")
 local okIcons, Icons = pcall(I.LoadScript, IconsRef)
 assert(okIcons, "regression setup: icons module failed to load: " .. tostring(Icons))
@@ -226,6 +275,56 @@ local okKnown, knownIcon = pcall(Icons.GetIcon, "chevron-down")
 assert(okKnown, "REGRESSION: GetIcon(valid) errored with unusable icon module: " .. tostring(knownIcon))
 assert(knownIcon == nil, "REGRESSION: GetIcon(valid) must return nil when the icon module is unusable")
 print("icon nil-name regression check     : OK")
+
+-- Regression: src/Utils/Log.luau sized its notification queue with a bare
+-- `ProfileValue(...)` call that no environment defines.  It aborted the module
+-- body, and the whole boot died with a line number that pointed at init.luau:
+--   [Cobalt].cobalt:95: attempt to call a nil value
+-- The module must load and hand back its table in a state with no Roblox APIs.
+local LogRef = FindModuleRef("[Cobalt].cobalt.Utils.Log")
+assert(LogRef, "regression setup: Utils.Log module not found")
+local okLog, LogModule = pcall(I.LoadScript, LogRef)
+assert(okLog, "REGRESSION: Utils.Log failed to load: " .. tostring(LogModule))
+assert(type(LogModule) == "table" and type(LogModule.new) == "function",
+    "REGRESSION: Utils.Log did not return its module table")
+print("Utils.Log load regression check    : OK")
+
+-- Regression: FormatError() re-translated messages that a nested module had
+-- already translated, so a failure two requires down surfaced as a line inside
+-- the *caller* - that is how `Utils.Log:106` reached the user as
+-- `[Cobalt].cobalt:95`.  The deepest module and line must survive.
+local NestedRef = FindModuleRef("[Cobalt].cobalt.Spy.Hooks.RakNet.PacketProcessor")
+local okNested, nestedErr = nil, nil
+if NestedRef then
+    okNested, nestedErr = pcall(I.LoadScript, NestedRef)
+end
+if NestedRef and not okNested and tostring(nestedErr):find("AccessModifierType", 1, true) then
+    assert(tostring(nestedErr):find("[Cobalt].cobalt.Utils.Hook.RakNet.Constants:", 1, true),
+        "REGRESSION: nested error lost its deepest attribution: " .. tostring(nestedErr))
+    print("nested error attribution check     : OK")
+end
+
+-- The actor environment is a generated chunk: bundle.py inlines src/Utils/Log.luau
+-- into a serialized string that the bundle itself never compiles, so a syntax
+-- error there would only appear once an actor starts.  Compile it here.
+local ActorEnvRef = nil
+for refId = 1, 10000 do
+    local ref = I.RefBindings[refId]
+    if ref and ref.ClassName == "StringValue" and ref.Name == "Environment" then
+        ActorEnvRef = ref
+    end
+end
+assert(ActorEnvRef, "generated actor Environment source not found")
+local ActorEnvFn, ActorEnvErr = loadstring(ActorEnvRef.Value, "actor-environment")
+assert(ActorEnvFn, "REGRESSION: generated actor environment does not compile: " .. tostring(ActorEnvErr))
+print("actor environment compile check    : OK (" .. #ActorEnvRef.Value .. " bytes)")
+
+if #nilCalls > 0 then
+    print("RESULT: FAIL - " .. #nilCalls .. " module(s) call an identifier that does not exist:")
+    for _, f in ipairs(nilCalls) do print("  nil " .. f) end
+    error("aborting module check", 0)
+end
+
 print("RESULT: OK - module bodies execute under the self-contained bundle configuration")
 if #failures > 0 then
     print("(the " .. #failures .. " errors below are missing executor APIs in this stub env, not load failures)")

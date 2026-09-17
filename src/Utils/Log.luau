@@ -99,6 +99,27 @@ local function GetMaxCallsPerRemote(): number
 	return CachedCallCap
 end
 
+--[[
+	Device-tiered budget lookup.
+
+	`src/init.luau` publishes `wax.shared.DeviceProfile` before this module is
+	required, so the tier presets are already final here.  The actor environment
+	inlines this same file into a bare state that has no DeviceProfile, so every
+	read still needs a literal fallback - the values below are the "high" tier
+	presets and match `DeviceProfile.MaxPendingNotifications` /
+	`DeviceProfile.MaxNotificationsPerHeartbeat`.
+]]
+local function ProfileValue(Key: string, Default: number): number
+	local Profile = wax.shared.DeviceProfile
+	local Value = Profile and Profile[Key]
+
+	if type(Value) == "number" then
+		return Value
+	end
+
+	return Default
+end
+
 -- The producer is on a remote hook, while the consumer is the UI heartbeat.
 -- Keep the hand-off bounded and coalesce updates for the same remote.  A noisy
 -- remote therefore costs one small notification per frame, not one table per

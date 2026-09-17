@@ -323,6 +323,16 @@ local function LoadScript(scriptRef)
     local function FormatError(originalErrorMessage)
         originalErrorMessage = tostring(originalErrorMessage)
 
+        -- A nested module already translated its own error.  That prefix names
+        -- the module that actually failed and the line inside it, so translating
+        -- it again here would strip that away and blame a line in the *caller*
+        -- (e.g. `[Cobalt].Utils.Log:106` became `[Cobalt].cobalt:95`).  Keep the
+        -- deepest attribution instead.
+        local VirtualNamePrefix = "[" .. EnvName .. "]"
+        if string_sub(originalErrorMessage, 1, #VirtualNamePrefix) == VirtualNamePrefix then
+            return originalErrorMessage
+        end
+
         local VirtualFullName = scriptRef:GetFullName()
 
         

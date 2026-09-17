@@ -28,7 +28,9 @@ local AllowedClassNames =
 
 	Function, source and line used to be resolved by three separate loops that
 	walked the same stack levels (up to eighteen debug.info calls per remote).
-	One pass returns all three, which is the single biggest win on this hot path.
+	One pass returns all three, which is the single biggest win on this hot
+	path; the fallback is one combined debug.info call too, because each
+	debug.info crosses into the executor.
 ]]
 local function GetCallerInfo()
 	local BaseLevel = if wax.shared.IsUsingOthHooks then 3 else 5
@@ -46,25 +48,30 @@ local function GetCallerInfo()
 		return Function, Source, Line
 	end
 
-	return debug.info(BaseLevel, "f"), debug.info(BaseLevel, "s"), debug.info(BaseLevel, "l")
+	return debug.info(BaseLevel, "fsl")
 end
 
 
-local function getcallingfunction()
-	local Function = GetCallerInfo()
-	return Function
-end
+--[[
+	Lazy calling-script resolution.
 
+	ShouldIgnore reads the calling script only when its verdict depends on it
+	(the player-module check), and a cached verdict never does, so hooks hand
+	it a resolver instead of paying for a getcallingscript() on every
+	intercepted call.  A resolver answers at most once per hook invocation.
+]]
+local function CreateCallingScriptResolver()
+	local Resolved = false
+	local CallingScript = nil
 
-local function getcallingline()
-	local _, _, Line = GetCallerInfo()
-	return Line
-end
+	return function()
+		if not Resolved then
+			CallingScript = getcallingscript()
+			Resolved = true
+		end
 
-
-local function getcallingsource()
-	local _, Source = GetCallerInfo()
-	return Source
+		return CallingScript
+	end
 end
 
 
@@ -217,7 +224,10 @@ wax.shared.NamecallHook = wax.shared.Hooking.HookMetaMethod(game, "__namecall", 
 		and not rawequal(self, wax.shared.Communicator)
 		and not rawequal(self, wax.shared.ActorCommunicator)
 		and (NamecallMethods[Method] and NamecallMethods[Method][self.ClassName])
-		and not wax.shared.ShouldIgnore(self, getcallingscript())
+		-- The resolver keeps ignored remotes completely free of
+		-- getcallingscript(); a fire that is logged resolves once inside
+		-- HandleLogging for the entry itself.
+		and not wax.shared.ShouldIgnore(self, CreateCallingScriptResolver())
 	then
 		return HandleLogging(cloneref(self), Method, wax.shared.NamecallHook, ...)
 	end
@@ -276,7 +286,7 @@ for _, Function in next, FunctionsToHook do
 			typeof(self) == "Instance"
 			and AllowedClassNames[self.ClassName]
 			and not rawequal(self, wax.shared.Communicator)
-			and not wax.shared.ShouldIgnore(self, getcallingscript())
+			and not wax.shared.ShouldIgnore(self, CreateCallingScriptResolver())
 		then
 			return HandleLogging(cloneref(self), Method, wax.shared.Hooks[Function], ...)
 		end

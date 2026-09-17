@@ -277,6 +277,10 @@ end
 	depends on the calling script, so those results are recomputed per call.
 	The cache is dropped through `InvalidateShouldIgnoreCache`, which
 	SettingSync.Save invokes whenever a setting is written.
+
+	`Origin` may be an Instance, nil, or a resolver function returning the
+	calling script.  Hooks pass resolvers so the (executor-crossing)
+	getcallingscript() is only spent when a verdict truly depends on it.
 ]]
 local IgnoredInstanceCache = setmetatable({}, { __mode = "k" })
 local NotIgnoredInstanceCache = setmetatable({}, { __mode = "k" })
@@ -310,6 +314,12 @@ wax.shared.ShouldIgnore = function(Instance, Origin)
 
 	if not Ignored and wax.shared.Settings.IgnorePlayerModule.Value then
 		OriginDependent = true
+		-- Hooks pass a resolver instead of a script so getcallingscript() only
+		-- runs when the verdict actually needs the caller (see "Lazy
+		-- calling-script resolution" in the interceptors).
+		if type(Origin) == "function" then
+			Origin = Origin()
+		end
 		Ignored = wax.shared.IsPlayerModule(Origin, Instance)
 	end
 
@@ -3577,777 +3587,29 @@ wax.shared.ShouldIgnore = function(Instance, Origin)
 		end
 	end
 
+	-- Hooks pass a resolver instead of a script: getcallingscript() only
+	-- runs when the player-module check is even enabled (same contract as the
+	-- main-state ShouldIgnore).
+	if wax.shared.Settings.IgnorePlayerModule.Value and type(Origin) == "function" then
+		Origin = Origin()
+	end
+
 	return wax.shared.Settings.IgnoredRemotesDropdown.Value[Instance.ClassName] == true
 		or (wax.shared.Settings.IgnorePlayerModule.Value and wax.shared.IsPlayerModule(Origin, Instance))
 end
 
 
 
+--#region @include region Log
+-- Inlined here by tools/bundle.py from src/Utils/Log.luau - the single
+-- source of truth for the capture path in both the main state and actors.
+-- tools/bundle.py replaces this placeholder when it packs the actor
+-- environment, so edit src/Utils/Log.luau instead of pasting code here.
 do
 	local Log = {}
-	Log.__index = Log
-
-	local PendingCallDecisions = setmetatable({}, { __mode = "k" })
-
-	-- `tostring(table)` is used as the pending-decision key and is needed twice per
-	-- call (ShouldBlock + Call).  Remembering the key per info table halves that
-	-- work and keeps both lookups on the same interned string.
-	local CallDecisionKeys = setmetatable({}, { __mode = "k" })
-
-	-- clonefunction() allocates a brand new closure every time it runs, and the
-	-- same calling scripts are cloned over and over.  Clones are cached against the
-	-- original closure (weak keys: once the game drops the original, the clone goes
-	-- with it).
-	local FunctionClones = setmetatable({}, { __mode = "k" })
-
-	local function GetDecisionKey(RawInfo): string
-		local Key = CallDecisionKeys[RawInfo]
-		if not Key then
-			Key = tostring(RawInfo)
-			CallDecisionKeys[RawInfo] = Key
-		end
-
-		return Key
-	end
-
-	local function CloneFunction(Function)
-		local Cached = FunctionClones[Function]
-		if Cached then
-			return Cached
-		end
-
-		if not clonefunction then
-			return Function
-		end
-
-		local Clone = clonefunction(Function)
-		FunctionClones[Function] = Clone
-		return Clone
-	end
-
-	--[[
-		Call retention limit.
-
-		Every captured call keeps a deep-cloned copy of its arguments alive for the
-		rest of the session.  On a chatty game (and especially on a phone, where the
-		OS is quick to kill apps that grow) that is unbounded memory growth, so each
-		remote keeps at most `MaxCallsPerRemote` calls and drops the oldest ones.
-		The limit is configurable in Settings (Capture -> Calls Kept Per Remote).
-
-		`MaxCallsPerRemote` is cached: reading it through SaveManager validates the
-		whole schema, which must not happen once per intercepted call.
-	]]
-	local DefaultMaxCallsPerRemote = 500
-	local CallCapSlack = 32
-	local CachedCallCap = nil
-
-	local function GetSettingBoolean(Key: string, Default: boolean): boolean
-		local Controls = wax.shared.Settings
-		local Control = Controls and Controls[Key]
-		if Control and Control.Value ~= nil then
-			return Control.Value == true
-		end
-
-		local SaveManager = wax.shared.SaveManager
-		local Success, Value = pcall(function()
-			return SaveManager:GetState(Key, Default)
-		end)
-
-		return if Success and Value ~= nil then Value == true else Default
-	end
-
-	local function GetMaxCallsPerRemote(): number
-		local Controls = wax.shared.Settings
-		local Control = Controls and Controls["MaxCallsPerRemote"]
-
-		if Control and Control.Value ~= nil then
-			local Value = tonumber(Control.Value)
-			if Value and Value >= 1 then
-				CachedCallCap = math.floor(Value)
-				return CachedCallCap
-			end
-		end
-
-		if CachedCallCap then
-			return CachedCallCap
-		end
-
-		local SaveManager = wax.shared.SaveManager
-		local Success, Value = pcall(function()
-			return SaveManager:GetState("MaxCallsPerRemote", DefaultMaxCallsPerRemote)
-		end)
-
-		CachedCallCap = math.floor(tonumber(Success and Value or DefaultMaxCallsPerRemote) or DefaultMaxCallsPerRemote)
-		if CachedCallCap < 1 then
-			CachedCallCap = DefaultMaxCallsPerRemote
-		end
-
-		return CachedCallCap
-	end
-
-	-- The producer is on a remote hook, while the consumer is the UI heartbeat.
-	-- Keep the hand-off bounded and coalesce updates for the same remote.  A noisy
-	-- remote therefore costs one small notification per frame, not one table per
-	-- packet.
-	local MaxPendingNotifications = 256
-	local MaxNotificationsPerHeartbeat = 96
-	wax.shared.LogNotificationQueue = {
-		Items = {},
-		Head = 1,
-		Tail = 0,
-		PendingByLog = setmetatable({}, { __mode = "k" }),
-		Dropped = 0,
-	}
-
-	local function QueueNotification(LogObject, CallIndex: number, Call)
-		local Queue = wax.shared.LogNotificationQueue
-		local Existing = Queue.PendingByLog[LogObject]
-		if Existing then
-			Existing.CallIndex = CallIndex
-			Existing.Call = Call or LogObject.Calls[CallIndex]
-			Existing.Suppressed = (Existing.Suppressed or 0) + 1
-			return
-		end
-
-		local Pending = Queue.Tail - Queue.Head + 1
-		while Pending >= MaxPendingNotifications do
-			local Oldest = Queue.Items[Queue.Head]
-			Queue.Items[Queue.Head] = nil
-			Queue.Head += 1
-			Pending -= 1
-			Queue.Dropped += 1
-			if Oldest and Oldest.Log then
-				Queue.PendingByLog[Oldest.Log] = nil
-			end
-		end
-
-		if Queue.Head > Queue.Tail then
-			table.clear(Queue.Items)
-			Queue.Head = 1
-			Queue.Tail = 0
-		end
-
-		local Notification = {
-			Instance = LogObject.Instance,
-			Type = LogObject.Type,
-			LogIndex = LogObject.Index,
-			CallIndex = CallIndex,
-			-- Direct references avoid another DebugId lookup on the UI thread.
-			Log = LogObject,
-			Call = Call or LogObject.Calls[CallIndex],
-			Suppressed = 0,
-		}
-		Queue.Tail += 1
-		Queue.Items[Queue.Tail] = Notification
-		Queue.PendingByLog[LogObject] = Notification
-	end
-
-	local SpamCallCountThreshold = 120
-	local SpamTimeWindowSeconds = 1
-	local HardCaptureLimitPerRemote = 120
-	local HardCaptureLimitGlobal = 600
-	local GlobalCaptureWindowStart = 0
-	local GlobalCaptureCount = 0
-	local AutoIgnoreSpammyEvents = true
-
-	do
-		local Success, Value = pcall(function()
-			return wax.shared.SaveManager:GetState("AutoIgnoreSpammyEvents", true)
-		end)
-		if Success then
-			AutoIgnoreSpammyEvents = Value == true
-		end
-	end
-
-	local function ShouldAutoIgnore(): boolean
-		local Control = wax.shared.Settings and wax.shared.Settings.AutoIgnoreSpammyEvents
-		if Control and Control.Value ~= nil then
-			return Control.Value == true
-		end
-		return AutoIgnoreSpammyEvents
-	end
-
-	local function RejectCapture(LogObject, Now: number): boolean
-		if Now - LogObject.SpamWindowStart >= SpamTimeWindowSeconds then
-			LogObject.SpamWindowStart = Now
-			LogObject.SpamCallCount = 0
-		end
-
-		if Now - GlobalCaptureWindowStart >= SpamTimeWindowSeconds then
-			GlobalCaptureWindowStart = Now
-			GlobalCaptureCount = 0
-		end
-
-		if LogObject.SpamCallCount >= HardCaptureLimitPerRemote or GlobalCaptureCount >= HardCaptureLimitGlobal then
-			LogObject.SuppressedCalls += 1
-			if ShouldAutoIgnore() and not LogObject.Ignored then
-				LogObject:Ignore()
-				local Sonner = wax.shared.Sonner
-				if Sonner then
-					local InstanceName = LogObject.Instance and LogObject.Instance.Name or "remote"
-					pcall(Sonner.info, Sonner, `Ignored {InstanceName} ({LogObject.Type}) after sustained event spam.`)
-				end
-			end
-			return true
-		end
-
-		LogObject.SpamCallCount += 1
-		GlobalCaptureCount += 1
-		return false
-	end
-
-	if not wax.shared.IS_ACTOR then
-		wax.shared.Connect(wax.shared.RunService.Heartbeat:Connect(function()
-			local Queue = wax.shared.LogNotificationQueue
-			if Queue.Head > Queue.Tail then
-				return
-			end
-
-			local Batch = table.create(math.min(MaxNotificationsPerHeartbeat, Queue.Tail - Queue.Head + 1))
-			local BatchSize = 0
-			while Queue.Head <= Queue.Tail and BatchSize < MaxNotificationsPerHeartbeat do
-				local Notification = Queue.Items[Queue.Head]
-				Queue.Items[Queue.Head] = nil
-				Queue.Head += 1
-				if Notification then
-					Queue.PendingByLog[Notification.Log] = nil
-					BatchSize += 1
-					Batch[BatchSize] = Notification
-				end
-			end
-
-			if Queue.Head > Queue.Tail then
-				table.clear(Queue.Items)
-				Queue.Head = 1
-				Queue.Tail = 0
-			end
-
-			if BatchSize > 0 then
-				local Communicator = wax.shared.Communicator
-				if Communicator then
-					Communicator:Fire(Batch)
-				end
-				table.clear(Batch)
-			end
-		end))
-	end
-
-
-	local FunctionToMetatadata, FixTable
-	do
-		if wax.shared.IS_ACTOR then
-			local FunctionMetadataCache = setmetatable({}, { __mode = "k" })
-
-			local function CreateTraversalState(Refs)
-				return {
-					CyclicRefs = Refs or {},
-					TableIds = setmetatable({}, { __mode = "k" }),
-					Functions = setmetatable({}, { __mode = "k" }),
-					NextId = 0,
-				}
-			end
-
-			local function GenerateId(State)
-				State.NextId += 1
-				return State.NextId
-			end
-
-			FixTable = function(Table, State)
-				if not Table then
-					return nil
-				end
-
-				if not State or not State.CyclicRefs then
-					State = CreateTraversalState(State)
-				end
-
-				local CyclicRefs = State.CyclicRefs
-				local TableId = State.TableIds[Table]
-				if not TableId then
-					TableId = GenerateId(State)
-					State.TableIds[Table] = TableId
-				end
-
-				local OutputTable = {}
-				CyclicRefs[TableId] = OutputTable
-
-				local ContainsCyclicRef = false
-
-				for Key, Value in next, Table do
-					if type(Value) == "table" then
-						local ExistingId = State.TableIds[Value]
-						if ExistingId then
-							ContainsCyclicRef = true
-
-							OutputTable[Key] = {
-								__CyclicRef = true,
-								__Id = ExistingId,
-							}
-							continue
-						end
-
-						if getmetatable(Value) then
-							OutputTable[Key] =
-								"Cobalt: Impossible to bridge table with metatable from actor Environment to main Environment"
-							continue
-						end
-
-						local Result, _, ContainsCyclic = FixTable(Value, State)
-						if not Result then
-							continue
-						end
-
-						OutputTable[Key] = Result
-						ContainsCyclicRef = ContainsCyclicRef or ContainsCyclic
-					elseif type(Value) == "function" then
-						OutputTable[Key] = FunctionToMetatadata(Value, State)
-					else
-						OutputTable[Key] = Value
-					end
-				end
-
-				return OutputTable, CyclicRefs, ContainsCyclicRef
-			end
-
-			FunctionToMetatadata = function(Function, State)
-				if not Function then
-					return nil
-				end
-
-				if not State or not State.CyclicRefs then
-					State = CreateTraversalState()
-				end
-
-				local CachedMetadata = FunctionMetadataCache[Function]
-				if CachedMetadata then
-					return CachedMetadata
-				end
-
-				local Metadata = {
-					Address = tostring(Function),
-					Name = debug.info(Function, "n"),
-					Source = debug.info(Function, "s"),
-					IsC = iscclosure(Function),
-				}
-
-				if State.Functions[Function] then
-					Metadata["Recursive"] = true
-					Metadata["Validation"] = Data.Token
-					Metadata["__Function"] = true
-
-					return Metadata
-				end
-
-				State.Functions[Function] = true
-
-				if not iscclosure(Function) then
-					Metadata["Upvalues"] = debug.getupvalues and #debug.getupvalues(Function) or 0
-					Metadata["Constants"] = debug.getconstants and #debug.getconstants(Function) or 0
-					Metadata["Protos"] = debug.getprotos and #debug.getprotos(Function) or 0
-
-					if getfunctionhash then
-						Metadata["FunctionHash"] = getfunctionhash(Function)
-					end
-				end
-
-				
-				Metadata["Validation"] = Data.Token
-				Metadata["__Function"] = true
-
-				FunctionMetadataCache[Function] = Metadata
-
-				return Metadata
-			end
-		end
-	end
-
-
-	function DeepClone(OriginalValue, ValueCopies)
-		if wax.shared.IS_ACTOR then
-			return OriginalValue
-		end
-
-		local OriginalType = type(OriginalValue)
-		if OriginalType ~= "table" then
-			if OriginalType == "string" or OriginalType == "number" or OriginalType == "boolean" or OriginalValue == nil then
-				return OriginalValue
-			end
-
-			local RobloxType = typeof(OriginalValue)
-			if RobloxType == "Instance" then
-				return cloneref(OriginalValue)
-		
-			elseif RobloxType == "userdata" then
-				if getmetatable(OriginalValue) then
-					return newproxy(true)
-				else
-					return newproxy()
-				end
-
-			elseif RobloxType == "function" then
-				return CloneFunction(OriginalValue)
-			end
-
-			return OriginalValue
-		end
-
-		
-		if ValueCopies then
-			local CachedValue = ValueCopies[OriginalValue]
-			if CachedValue then
-				return CachedValue
-			end
-		else
-			ValueCopies = {}
-		end
-
-		
-		local ShallowCopy = {}
-		ValueCopies[OriginalValue] = ShallowCopy
-
-		for Key, Value in next, OriginalValue do
-			local ValueType = type(Value)
-
-			if ValueType == "table" then
-				ShallowCopy[Key] = DeepClone(Value, ValueCopies)
-
-			elseif ValueType == "userdata" then
-				local ValueRobloxType = typeof(Value)
-
-				if ValueRobloxType == "Instance" then
-					ShallowCopy[Key] = cloneref(Value)
-
-				elseif ValueRobloxType == "userdata" then
-					if getmetatable(Value) then
-						ShallowCopy[Key] = newproxy(true)
-					else
-						ShallowCopy[Key] = newproxy()
-					end
-
-				else
-					ShallowCopy[Key] = Value
-				end
-
-			elseif ValueType == "function" then
-				ShallowCopy[Key] = CloneFunction(Value)
-		
-			else
-				ShallowCopy[Key] = Value
-			end
-		end
-
-		return ShallowCopy
-	end
-
-	if wax.shared.IS_ACTOR then
-		wax.shared.SerializeActorInfo = function(Info)
-			return FixTable(DeepClone(Info))
-		end
-	end
-
-	function Log.new(Instance, Type, Index, CallingScript)
-		local NewLog = setmetatable({
-			Instance = Instance,
-			Type = Type,
-			Index = Index,
-			Calls = {},
-			GameCalls = {},
-			SpamWindowStart = 0,
-			SpamCallCount = 0,
-			SuppressedCalls = 0,
-			Ignored = false,
-			Blocked = false,
-			Button = nil,
-		}, Log)
-
-		return NewLog
-	end
-
-	function Log:IsOverSpamThreshold()
-		-- Kept for plugins that query the old API.  Capture admission is enforced
-		-- centrally in `Log:Call`, even when the optional auto-ignore setting is off.
-		return self.SpamCallCount >= SpamCallCountThreshold
-	end
-
-	local function RunInterceptors(Interceptors: { (...any) -> ...any }, Info: any, Log): boolean
-		for _, Callback in Interceptors do
-			local Ok, Result = pcall(Callback, Info, Log.Instance, Log.Type)
-			if not Ok then
-				warn(`[Cobalt Plugin Interceptor] Error: {Result}`)
-			elseif Result == false then
-				return true
-			end
-		end
-
-		return false
-	end
-
-	function Log:ShouldBlock(RawInfo, PendingCallDecisionsKey): boolean
-		PendingCallDecisionsKey = PendingCallDecisionsKey or GetDecisionKey(RawInfo)
-
-		local Decision = PendingCallDecisions[PendingCallDecisionsKey]
-		if Decision then
-			return Decision.ShouldBlock
-		end
-
-		local FilterAction
-		local CallFilters = wax.shared.CallFilters
-		do
-			if CallFilters then
-				FilterAction = CallFilters:Resolve(self.Instance, self.Type, RawInfo)
-			end
-		end
-
-		local ShouldBlock = RawInfo.Blocked == true or self.Blocked or FilterAction == "Block"
-		if ShouldBlock then
-			RawInfo.Blocked = true
-		end
-
-		PendingCallDecisions[PendingCallDecisionsKey] = {
-			FilterAction = FilterAction,
-			ShouldBlock = ShouldBlock,
-		}
-		return ShouldBlock
-	end
-
-	--[[
-		Keeps at most `MaxCalls` entries by dropping the oldest ones.
-
-		Call indices are the log's public currency (call lists, notifications, the
-		file logger), so both the call array and the executor-call index list are
-		rebuilt together and stay consistent.
-	]]
-	function Log:TrimCalls(MaxCalls: number)
-		local Calls = self.Calls
-		local Total = #Calls
-		local RemoveCount = Total - MaxCalls
-		if RemoveCount <= 0 then
-			return 0
-		end
-
-		local Trimmed = table.create(Total - RemoveCount)
-		for Index = RemoveCount + 1, Total do
-			Trimmed[Index - RemoveCount] = Calls[Index]
-		end
-		self.Calls = Trimmed
-
-		local GameCalls = self.GameCalls
-		local WriteIndex = 1
-		for ReadIndex = 1, #GameCalls do
-			local Shifted = GameCalls[ReadIndex] - RemoveCount
-			if Shifted >= 1 then
-				GameCalls[WriteIndex] = Shifted
-				WriteIndex += 1
-			end
-		end
-
-		for Index = WriteIndex, #GameCalls do
-			GameCalls[Index] = nil
-		end
-
-		return RemoveCount
-	end
-
-	function Log:Call(RawInfo): number?
-		local PendingCallDecisionsKey = GetDecisionKey(RawInfo)
-
-		local ShouldBlock = self:ShouldBlock(RawInfo, PendingCallDecisionsKey)
-		local Decision = PendingCallDecisions[PendingCallDecisionsKey]
-		PendingCallDecisions[PendingCallDecisionsKey] = nil
-
-		local ShouldCapture = not self.Ignored and Decision.FilterAction ~= "Ignore"
-		do
-			if ShouldBlock then
-				ShouldCapture = GetSettingBoolean("LogBlockedRemotes", false)
-			end
-
-			if RawInfo.Omit then
-				ShouldCapture = false
-			end
-		end
-
-		if not ShouldCapture then
-			return nil
-		end
-
-		-- Do this before DeepClone.  Cloning arguments is the expensive part of a
-		-- capture, and a hard per-remote/global budget prevents one spammy event
-		-- from consuming the frame and memory budgets of the whole game.
-		if RejectCapture(self, os.clock()) then
-			return nil
-		end
-
-		local Info = DeepClone(RawInfo)
-		Info.CreationTime = tick()
-
-		
-		if wax.shared.IS_ACTOR then
-			if self.Instance == wax.shared.Communicator then
-				return nil
-			end
-
-			Info["Actor"] = CurrentActor
-
-			
-			local OldArguments = Info.Arguments
-			Info.Arguments = {
-				Data = OldArguments,
-				n = OldArguments.n,
-			}
-
-			if Info.InvokeResult then
-				local OldInvokeResult = Info.InvokeResult
-				Info.InvokeResult = {
-					Data = OldInvokeResult,
-					n = OldInvokeResult.n,
-				}
-			end
-
-			local FixedInfo, CyclicRefs, ContainsCyclicRef = FixTable(Info)
-
-			
-			local identity = getthreadidentity()
-			setthreadidentity(8)
-			wax.shared.Communicator.Fire(
-				wax.shared.Communicator,
-				"ActorCall",
-				self.Instance,
-				self.Type,
-				FixedInfo,
-				CyclicRefs,
-				ContainsCyclicRef
-			)
-			setthreadidentity(identity)
-			return nil
-		end
-
-		
-		local PluginManager = wax.shared.CobaltPluginManager
-		if PluginManager and PluginManager.HasInterceptors then
-			
-			local InstanceIntercept = PluginManager.Registry.Interceptors.Instance[self.Instance]
-			if InstanceIntercept then
-				if InstanceIntercept[self.Type] and RunInterceptors(InstanceIntercept[self.Type], Info, self) then
-					return nil
-				end
-				if InstanceIntercept["All"] and RunInterceptors(InstanceIntercept["All"], Info, self) then
-					return nil
-				end
-			end
-
-			
-			local GlobalByType = PluginManager.Registry.Interceptors.Global[self.Type]
-			if GlobalByType and RunInterceptors(GlobalByType, Info, self) then
-				return nil
-			end
-
-			local GlobalAll = PluginManager.Registry.Interceptors.Global["All"]
-			if GlobalAll and RunInterceptors(GlobalAll, Info, self) then
-				return nil
-			end
-		end
-
-		
-		local Index = #self.Calls + 1
-		self.Calls[Index] = Info
-		if not Info.IsExecutor then
-			table.insert(self.GameCalls, Index)
-		end
-
-		-- Trim with a little slack so the rebuild cost is amortised over many calls
-		-- instead of running on every single one at the cap.
-		local CallCap = GetMaxCallsPerRemote()
-		if Index > CallCap + CallCapSlack then
-			self:TrimCalls(CallCap)
-			Index = #self.Calls
-		end
-
-		QueueNotification(self, Index, Info)
-		return Index
-	end
-
-	function Log:ClearCalls()
-		table.clear(self.Calls)
-		table.clear(self.GameCalls)
-		local Pending = wax.shared.LogNotificationQueue.PendingByLog[self]
-		if Pending then
-			Pending.Call = nil
-			Pending.CallIndex = nil
-			wax.shared.LogNotificationQueue.PendingByLog[self] = nil
-		end
-		self.SpamWindowStart = os.clock()
-		self.SpamCallCount = 0
-		self.SuppressedCalls = 0
-	end
-
-	function Log:Ignore()
-		self.Ignored = not self.Ignored
-
-		if not wax.shared.IS_ACTOR then
-			if wax.shared.ActorCommunicator then
-				pcall(wax.shared.ActorCommunicator.Fire, wax.shared.ActorCommunicator, "MainIgnore", self.Instance, self.Type)
-			end
-
-			local IgnoredRemoteList = wax.shared.Settings["IgnoredRemotes"]
-			if IgnoredRemoteList then
-				if self.Ignored then
-					IgnoredRemoteList:AddToList(self)
-				else
-					IgnoredRemoteList:RemoveFromList(self)
-				end
-			end
-		end
-	end
-
-	local ClassesConnectionsToggle = {
-		RemoteEvent = "OnClientEvent",
-		UnreliableRemoteEvent = "OnClientEvent",
-		BindableEvent = "Event",
-	}
-
-	function Log:SetConnectionsEnabled(enabled: boolean)
-		if not self.Instance or not ClassesConnectionsToggle[self.Instance.ClassName] then
-			return
-		end
-
-		local ConnectionName = ClassesConnectionsToggle[self.Instance.ClassName]
-		if self.Type ~= "Incoming" or not ConnectionName then
-			return
-		end
-
-		local LoggingFunctions = wax.shared.IncomingLogConnectionFunctions
-		for _, Connection in pairs(getconnections(self.Instance[ConnectionName])) do
-			if LoggingFunctions and LoggingFunctions[Connection.Function] then
-				continue
-			end
-
-			if enabled then
-				Connection:Enable()
-			else
-				Connection:Disable()
-			end
-		end
-	end
-
-	function Log:Block()
-		if not wax.shared.IS_ACTOR and wax.shared.ActorCommunicator then
-			pcall(wax.shared.ActorCommunicator.Fire, wax.shared.ActorCommunicator, "MainBlock", self.Instance, self.Type)
-		end
-
-		self.Blocked = not self.Blocked
-		self:SetConnectionsEnabled(not self.Blocked)
-	end
-
-	function Log:SetButton(Instance, Name, Calls)
-		self.Button = {
-			Instance = Instance,
-			Name = Name,
-			Calls = Calls,
-		}
-	end
-
 	wax.shared.Log = Log
 end
+--#endregion
 
 
 
@@ -4405,10 +3667,37 @@ do
 	}
 
 	
-	local function GetLog(Instance: InstancesToHook, Function: (...any) -> ...any)
-		local DebugId = wax.shared.GetDebugId(Instance)
+	-- Mirrors the main-state interceptor: `DebugId` and `Origin` are resolved
+	-- once per invocation instead of once per connection entry, and `Origin`
+	-- may be a resolver function so a getcallingscript() only runs when
+	-- ShouldIgnore's player-module check or a first-time log creation asks
+	-- for it.
+	local function GetLog(
+		Instance: InstancesToHook,
+		Function: (...any) -> ...any,
+		DebugId: number?,
+		Origin: Instance? | (() -> Instance?)
+	)
+		DebugId = DebugId or wax.shared.GetDebugId(Instance)
 
-		if wax.shared.ShouldIgnore(Instance, getcallingscript()) or LogConnectionFunctions[Function] then
+		local OriginResolved = false
+		local ResolvedOrigin = nil
+		local function ResolveOrigin()
+			if not OriginResolved then
+				if type(Origin) == "function" then
+					ResolvedOrigin = Origin()
+				elseif Origin ~= nil then
+					ResolvedOrigin = Origin
+				else
+					ResolvedOrigin = getcallingscript()
+				end
+				OriginResolved = true
+			end
+
+			return ResolvedOrigin
+		end
+
+		if wax.shared.ShouldIgnore(Instance, ResolveOrigin) or LogConnectionFunctions[Function] then
 			return nil
 		end
 
@@ -4419,7 +3708,7 @@ do
 
 		local Log = IncomingLogs[DebugId]
 		if not Log then
-			Log = wax.shared.NewLog(Instance, "Incoming", getcallingscript(), DebugId)
+			Log = wax.shared.NewLog(Instance, "Incoming", ResolveOrigin(), DebugId)
 		end
 
 		return Log
@@ -4444,6 +3733,8 @@ do
 		Instance: InstancesToHook,
 		Function: (...any) -> ...any,
 		Info: {
+			DebugId: number?,
+			IgnoreOrigin: Instance? | (() -> Instance?),
 			Arguments: { [number]: any, n: number },
 			Origin: Instance,
 			Function: (...any) -> ...any,
@@ -4452,7 +3743,7 @@ do
 			Blocked: boolean?,
 		}
 	)
-		local Log = GetLog(Instance, Function)
+		local Log = GetLog(Instance, Function, Info.DebugId, Info.IgnoreOrigin)
 		if not Log then
 			return false, nil
 		end
@@ -4506,80 +3797,114 @@ do
 		local CachedConnectionInfo = nil
 		local CachedConnectionCount = -1
 
+		-- getconnections() is the single most expensive executor call on the
+		-- incoming path, and a remote's connection set rarely changes mid-burst,
+		-- so it is refreshed at most twice a second per remote while the remote
+		-- actually fires.  Between refreshes the cached entries are reused
+		-- as-is; a connection added inside the window is picked up by the next
+		-- refresh, and an idle remote pays nothing at all.  (Same window as the
+		-- main-state interceptor.)
+		local ConnectionCacheExpiry = 0.5
+		local CachedConnections = nil
+		local CachedConnectionsAt = 0
+
 		local DebugId = wax.shared.GetDebugId(Instance)
 
+		local function BuildConnectionInformation(Connections)
+			local Information = {
+				HasValidConnections = false,
+				HasForeignLuaConnections = false,
+				Entries = {},
+			}
+
+			for _, Connection in Connections do
+				-- Skip connections that are in a foreign state
+				if Connection.ForeignState then
+					-- Check if the connection is a LuaConnection
+					if Connection.LuaConnection then
+						Information.HasForeignLuaConnections = true
+					end
+
+					continue
+				end
+
+				-- Skip Cobalt's own connection functions
+				local Function = typeof(Connection.Function) == "function" and (Connection.Function) or (nil)
+				if IsCobaltConnectionFunction(Function) then
+					continue
+				end
+
+				Information.HasValidConnections = true
+
+				-- Resolve the originating script from the thread or environment
+				local Thread = Connection.Thread
+				local Origin = nil
+
+				if Thread and getscriptfromthread then
+					Origin = getscriptfromthread(Thread)
+				end
+
+				if not Origin and Function then
+					-- The environment script fallback: getcallingscript is not
+					-- usable here (this runs inside our own observer).
+
+					local Script = rawget(getfenv(Function), "script")
+					if typeof(Script) == "Instance" then
+						Origin = Script
+					end
+				end
+
+				table.insert(Information.Entries, {
+					Function = Function,
+					Origin = Origin,
+					IsExecutor = Function and isexecutorclosure(Function) or false,
+				})
+			end
+
+			return Information
+		end
+
 		local ConnectionFunction = function(...)
-			
+			-- If this log is ignored, don't process the event
 			local ExistingLog = wax.shared.Logs.Incoming[DebugId]
 			if ExistingLog and ExistingLog.Ignored then
 				return
 			end
 
-			local Signal = (Instance :: any)[Method]
-			local Connections = getconnections(Signal)
-			local ConnectionCount = #Connections
+			-- Refresh the connection listing at most once per expiry window;
+			-- every other fire of this remote reuses the cached entries without
+			-- paying for a getconnections() round-trip.
+			local Now = os.clock()
+			if not CachedConnections or Now - CachedConnectionsAt >= ConnectionCacheExpiry then
+				local Signal = (Instance :: any)[Method]
+				CachedConnections = getconnections(Signal)
+				CachedConnectionsAt = Now
 
-			
-			if ConnectionCount ~= CachedConnectionCount then
-				CachedConnectionCount = ConnectionCount
-
-				local Information = {
-					HasValidConnections = false,
-					HasForeignLuaConnections = false,
-					Entries = {},
-				}
-
-				for _, Connection in Connections do
-					
-					if Connection.ForeignState then
-						
-						if Connection.LuaConnection then
-							Information.HasForeignLuaConnections = true
-						end
-
-						continue
-					end
-
-					
-					local Function = typeof(Connection.Function) == "function" and (Connection.Function) or (nil)
-					if IsCobaltConnectionFunction(Function) then
-						continue
-					end
-
-					Information.HasValidConnections = true
-
-					
-					local Thread = Connection.Thread
-					local Origin = nil
-
-					if Thread and getscriptfromthread then
-						Origin = getscriptfromthread(Thread)
-					end
-
-					if not Origin and Function then
-						
-						
-
-						local Script = rawget(getfenv(Function), "script")
-						if typeof(Script) == "Instance" then
-							Origin = Script
-						end
-					end
-
-					table.insert(Information.Entries, {
-						Function = Function,
-						Origin = Origin,
-						IsExecutor = Function and isexecutorclosure(Function) or false,
-					})
+				-- Rebuild the connection info if the count changed
+				local ConnectionCount = #CachedConnections
+				if ConnectionCount ~= CachedConnectionCount then
+					CachedConnectionCount = ConnectionCount
+					CachedConnectionInfo = BuildConnectionInformation(CachedConnections)
 				end
-
-				CachedConnectionInfo = Information
 			end
 
 			local Arguments = wax.shared.SafePack.Pack(...)
 			local TargetLog, TargetCallIndex
 
-			
+			-- The calling script resolves at most once per invocation, and only
+			-- when ShouldIgnore's player-module check or a first-time log
+			-- creation actually needs it (same contract as the main state).
+			local CallingScript = nil
+			local CallingScriptResolved = false
+			local function ResolveCallingScript()
+				if not CallingScriptResolved then
+					CallingScript = getcallingscript()
+					CallingScriptResolved = true
+				end
+
+				return CallingScript
+			end
+
 			if CachedConnectionInfo.HasValidConnections then
 				for _, Entry in CachedConnectionInfo.Entries do
 					TargetLog, TargetCallIndex = select(2, LogRemote(Instance, Entry.Function, {
@@ -4588,6 +3913,8 @@ do
 						Function = Entry.Function,
 						Line = nil,
 						IsExecutor = Entry.IsExecutor,
+						DebugId = DebugId,
+						IgnoreOrigin = ResolveCallingScript,
 					}))
 				end
 
@@ -4598,6 +3925,8 @@ do
 					Function = nil,
 					Line = nil,
 					IsExecutor = false,
+					DebugId = DebugId,
+					IgnoreOrigin = ResolveCallingScript,
 				}))
 			end
 
@@ -5023,11 +4352,15 @@ if Data.Outgoing then
 			CreateLookupTable({ "RemoteEvent", "RemoteFunction", "UnreliableRemoteEvent", "BindableEvent", "BindableFunction" })
 
 		
-		local function getcallingfunction()
+		-- Caller resolution: one stack pass returns function, source and line
+		-- (this path used to walk the same levels three times), and the
+		-- fallback stays a single combined debug.info call.  Mirrors the
+		-- main-state interceptor.
+		local function GetCallerInfo()
 			local BaseLevel = if wax.shared.IsUsingOthHooks then 3 else 5
 
 			for i = BaseLevel, 10 do
-				local Function, Source = debug.info(i, "fs")
+				local Function, Source, Line = debug.info(i, "fsl")
 				if not Function or not Source then
 					break
 				end
@@ -5036,55 +4369,36 @@ if Data.Outgoing then
 					continue
 				end
 
-				return Function
+				return Function, Source, Line
 			end
 
-			return debug.info(BaseLevel, "f")
+			return debug.info(BaseLevel, "fsl")
 		end
 
-		
-		local function getcallingline()
-			local BaseLevel = if wax.shared.IsUsingOthHooks then 3 else 5
 
-			for i = BaseLevel, 10 do
-				local Source, Line = debug.info(i, "sl")
-				if not Source then
-					break
+		-- Lazy calling-script resolution for the hook guards: ShouldIgnore
+		-- only asks for the calling script when its verdict depends on it, so
+		-- the guarded fires stop paying a getcallingscript() up front.
+		local function CreateCallingScriptResolver()
+			local Resolved = false
+			local CallingScript = nil
+
+			return function()
+				if not Resolved then
+					CallingScript = getcallingscript()
+					Resolved = true
 				end
 
-				if Source == "[C]" then
-					continue
-				end
-
-				return Line
+				return CallingScript
 			end
-
-			return debug.info(BaseLevel, "l")
 		end
 
-		
-		local function getcallingsource()
-			local BaseLevel = if wax.shared.IsUsingOthHooks then 3 else 5
 
-			for i = BaseLevel, 10 do
-				local Source = debug.info(i, "s")
-				if not Source then
-					break
-				end
-
-				if Source == "[C]" then
-					continue
-				end
-
-				return Source
-			end
-
-			return debug.info(BaseLevel, "s")
-		end
-
-		
-		local function GetLog(Instance: Instance, Direction: "Outgoing" | "Incoming")
-			local DebugId = wax.shared.GetDebugId(Instance)
+		-- `DebugId` and `Origin` are resolved once per invocation by the
+		-- caller instead of again per GetLog (a RemoteFunction invoke asks
+		-- twice: once for the Outgoing log, once for the Incoming one).
+		local function GetLog(Instance: Instance, Direction: "Outgoing" | "Incoming", DebugId: number?, Origin: Instance?)
+			DebugId = DebugId or wax.shared.GetDebugId(Instance)
 
 			local LogsInDirection = wax.shared.Logs[Direction]
 			if not LogsInDirection then
@@ -5093,7 +4407,11 @@ if Data.Outgoing then
 
 			local Log = LogsInDirection[DebugId]
 			if not Log then
-				Log = wax.shared.NewLog(Instance, Direction, getcallingscript(), DebugId)
+				if Origin == nil then
+					-- Only a first-time log creation needs the calling script.
+					Origin = getcallingscript()
+				end
+				Log = wax.shared.NewLog(Instance, Direction, Origin, DebugId)
 			end
 
 			return Log
@@ -5110,19 +4428,27 @@ if Data.Outgoing then
 
 		
 		local function HandleLogging(TargetInstance: Instance, Method: string, OldFunction: (...any) -> ...any, ...)
-			local Log = GetLog(TargetInstance, "Outgoing")
+			-- Resolve everything the log entries need exactly once (used to be
+			-- a getcallingscript, three stack walks and two checkcaller calls
+			-- per invoke; the RemoteFunction flow now reuses all of it).
+			local DebugId = wax.shared.GetDebugId(TargetInstance)
+			local Log = GetLog(TargetInstance, "Outgoing", DebugId)
 			if not Log then
 				return OldFunction(...)
 			end
 			local Arguments = wax.shared.SafePack.Pack(select(2, ...))
 
+			local CallingScript = getcallingscript()
+			local CallingFunction, CallingSource, CallingLine = GetCallerInfo()
+			local IsExecutor = checkcaller()
+
 			local Info = {
 				Arguments = Arguments,
-				Origin = getcallingscript(),
-				Function = getcallingfunction(),
-				Line = getcallingline(),
-				Source = getcallingsource(),
-				IsExecutor = checkcaller(),
+				Origin = CallingScript,
+				Function = CallingFunction,
+				Line = CallingLine,
+				Source = CallingSource,
+				IsExecutor = IsExecutor,
 			}
 			local ShouldBlock = Log:ShouldBlock(Info)
 			Log:Call(Info)
@@ -5139,16 +4465,16 @@ if Data.Outgoing then
 			)
 
 			if IsRemoteFunctionInvoke or IsBindableFunctionInvoke then
-				
-				Log = GetLog(TargetInstance, "Incoming")
+
+				Log = GetLog(TargetInstance, "Incoming", DebugId)
 				local RFResultInfo = {
 					Arguments = Arguments,
 					InvokeResult = nil,
-					Origin = getcallingscript(),
-					Function = getcallingfunction(),
-					Line = getcallingline(),
-					Source = getcallingsource(),
-					IsExecutor = checkcaller(),
+					Origin = CallingScript,
+					Function = CallingFunction,
+					Line = CallingLine,
+					Source = CallingSource,
+					IsExecutor = IsExecutor,
 					InvokeKind = "Request",
 				}
 
@@ -5214,7 +4540,7 @@ if Data.Outgoing then
 				and not rawequal(self, wax.shared.Communicator)
 				and not rawequal(self, wax.shared.ActorCommunicator)
 				and (NamecallMethods[Method] and NamecallMethods[Method][self.ClassName])
-				and not wax.shared.ShouldIgnore(self, getcallingscript())
+				and not wax.shared.ShouldIgnore(self, CreateCallingScriptResolver())
 			then
 				return HandleLogging(cloneref(self), Method, wax.shared.NamecallHook, ...)
 			end
@@ -5273,7 +4599,7 @@ if Data.Outgoing then
 					typeof(self) == "Instance"
 					and AllowedClassNames[self.ClassName]
 					and not rawequal(self, wax.shared.Communicator)
-					and not wax.shared.ShouldIgnore(self, getcallingscript())
+					and not wax.shared.ShouldIgnore(self, CreateCallingScriptResolver())
 				then
 					return HandleLogging(cloneref(self), Method, wax.shared.Hooks[Function], ...)
 				end
@@ -5397,17 +4723,39 @@ export type Options = {
 	them: both cost an executor call (DebugId also switches thread identity) and
 	the incoming path resolves them once per invocation instead of once per
 	connection entry.
+
+	`Origin` may also be a resolver function - that is what the hot paths pass.
+	ShouldIgnore only asks for the origin when its verdict depends on it, and
+	the origin is otherwise needed just once, when the log entry is first
+	created, so a getcallingscript() runs only when one of those two moments
+	arrives instead of unconditionally on every fire.
 ]]
 local function GetLog(
 	Instance: InstancesToHook,
 	Function: (...any) -> ...any,
 	DebugId: number?,
-	Origin: Instance?
+	Origin: Instance? | (() -> Instance?)
 )
 	DebugId = DebugId or wax.shared.GetDebugId(Instance)
-	Origin = Origin or getcallingscript()
 
-	if wax.shared.ShouldIgnore(Instance, Origin) or LogConnectionFunctions[Function] then
+	local OriginResolved = false
+	local ResolvedOrigin = nil
+	local function ResolveOrigin()
+		if not OriginResolved then
+			if type(Origin) == "function" then
+				ResolvedOrigin = Origin()
+			elseif Origin ~= nil then
+				ResolvedOrigin = Origin
+			else
+				ResolvedOrigin = getcallingscript()
+			end
+			OriginResolved = true
+		end
+
+		return ResolvedOrigin
+	end
+
+	if wax.shared.ShouldIgnore(Instance, ResolveOrigin) or LogConnectionFunctions[Function] then
 		return nil
 	end
 
@@ -5418,7 +4766,7 @@ local function GetLog(
 
 	local Log = IncomingLogs[DebugId]
 	if not Log then
-		Log = wax.shared.NewLog(Instance, "Incoming", Origin, DebugId)
+		Log = wax.shared.NewLog(Instance, "Incoming", ResolveOrigin(), DebugId)
 	end
 
 	return Log
@@ -5444,7 +4792,7 @@ local function LogRemote(
 	Function: (...any) -> ...any,
 	Info: {
 		DebugId: number?,
-		IgnoreOrigin: Instance?,
+		IgnoreOrigin: Instance? | (() -> Instance?),
 		Arguments: { [number]: any, n: number },
 		Origin: Instance,
 		Function: (...any) -> ...any,
@@ -5509,10 +4857,11 @@ local function CreateConnectionFunction(Instance: InstancesToHook, Method: Metho
 
 	-- getconnections() is the single most expensive executor call on the
 	-- incoming path, and a remote's connection set rarely changes mid-burst,
-	-- so it is refreshed at most once per expiry window per remote.  Between
-	-- refreshes the cached entries are reused as-is; a connection added
-	-- inside the window is picked up by the next refresh.
-	local ConnectionCacheExpiry = 0.2
+	-- so it is refreshed at most twice a second per remote while the remote
+	-- actually fires.  Between refreshes the cached entries are reused
+	-- as-is; a connection added inside the window is picked up by the next
+	-- refresh, and an idle remote pays nothing at all.
+	local ConnectionCacheExpiry = 0.5
 	local CachedConnections = nil
 	local CachedConnectionsAt = 0
 
@@ -5602,8 +4951,19 @@ local function CreateConnectionFunction(Instance: InstancesToHook, Method: Metho
 		local Arguments = wax.shared.SafePack.PackFast(...)
 		local TargetLog, TargetCallIndex
 
-		-- Resolved once for the whole invocation (used to be one per entry).
-		local CallingScript = getcallingscript()
+		-- The calling script used to be resolved eagerly once per invocation.
+		-- It now resolves at most once, and only if ShouldIgnore's
+		-- player-module check or a first-time log creation actually needs it.
+		local CallingScript = nil
+		local CallingScriptResolved = false
+		local function ResolveCallingScript()
+			if not CallingScriptResolved then
+				CallingScript = getcallingscript()
+				CallingScriptResolved = true
+			end
+
+			return CallingScript
+		end
 
 
 		if CachedConnectionInfo.HasValidConnections then
@@ -5615,7 +4975,7 @@ local function CreateConnectionFunction(Instance: InstancesToHook, Method: Metho
 					Line = nil,
 					IsExecutor = Entry.IsExecutor,
 					DebugId = DebugId,
-					IgnoreOrigin = CallingScript,
+					IgnoreOrigin = ResolveCallingScript,
 				}))
 			end
 
@@ -5627,7 +4987,7 @@ local function CreateConnectionFunction(Instance: InstancesToHook, Method: Metho
 				Line = nil,
 				IsExecutor = false,
 				DebugId = DebugId,
-				IgnoreOrigin = CallingScript,
+				IgnoreOrigin = ResolveCallingScript,
 			}))
 		end
 
@@ -6051,7 +5411,9 @@ local AllowedClassNames =
 
 	Function, source and line used to be resolved by three separate loops that
 	walked the same stack levels (up to eighteen debug.info calls per remote).
-	One pass returns all three, which is the single biggest win on this hot path.
+	One pass returns all three, which is the single biggest win on this hot
+	path; the fallback is one combined debug.info call too, because each
+	debug.info crosses into the executor.
 ]]
 local function GetCallerInfo()
 	local BaseLevel = if wax.shared.IsUsingOthHooks then 3 else 5
@@ -6069,25 +5431,30 @@ local function GetCallerInfo()
 		return Function, Source, Line
 	end
 
-	return debug.info(BaseLevel, "f"), debug.info(BaseLevel, "s"), debug.info(BaseLevel, "l")
+	return debug.info(BaseLevel, "fsl")
 end
 
 
-local function getcallingfunction()
-	local Function = GetCallerInfo()
-	return Function
-end
+--[[
+	Lazy calling-script resolution.
 
+	ShouldIgnore reads the calling script only when its verdict depends on it
+	(the player-module check), and a cached verdict never does, so hooks hand
+	it a resolver instead of paying for a getcallingscript() on every
+	intercepted call.  A resolver answers at most once per hook invocation.
+]]
+local function CreateCallingScriptResolver()
+	local Resolved = false
+	local CallingScript = nil
 
-local function getcallingline()
-	local _, _, Line = GetCallerInfo()
-	return Line
-end
+	return function()
+		if not Resolved then
+			CallingScript = getcallingscript()
+			Resolved = true
+		end
 
-
-local function getcallingsource()
-	local _, Source = GetCallerInfo()
-	return Source
+		return CallingScript
+	end
 end
 
 
@@ -6240,7 +5607,10 @@ wax.shared.NamecallHook = wax.shared.Hooking.HookMetaMethod(game, "__namecall", 
 		and not rawequal(self, wax.shared.Communicator)
 		and not rawequal(self, wax.shared.ActorCommunicator)
 		and (NamecallMethods[Method] and NamecallMethods[Method][self.ClassName])
-		and not wax.shared.ShouldIgnore(self, getcallingscript())
+		-- The resolver keeps ignored remotes completely free of
+		-- getcallingscript(); a fire that is logged resolves once inside
+		-- HandleLogging for the entry itself.
+		and not wax.shared.ShouldIgnore(self, CreateCallingScriptResolver())
 	then
 		return HandleLogging(cloneref(self), Method, wax.shared.NamecallHook, ...)
 	end
@@ -6299,7 +5669,7 @@ for _, Function in next, FunctionsToHook do
 			typeof(self) == "Instance"
 			and AllowedClassNames[self.ClassName]
 			and not rawequal(self, wax.shared.Communicator)
-			and not wax.shared.ShouldIgnore(self, getcallingscript())
+			and not wax.shared.ShouldIgnore(self, CreateCallingScriptResolver())
 		then
 			return HandleLogging(cloneref(self), Method, wax.shared.Hooks[Function], ...)
 		end
@@ -14042,54 +13412,48 @@ do
 end
 
 
-function DeepClone(OriginalValue, ValueCopies)
-	if wax.shared.IS_ACTOR then
-		return OriginalValue
-	end
+--[[
+	Clone bounds.
 
-	local OriginalType = type(OriginalValue)
-	if OriginalType ~= "table" then
-		if OriginalType == "string" or OriginalType == "number" or OriginalType == "boolean" or OriginalValue == nil then
-			return OriginalValue
-		end
+	A game can hand a remote arbitrarily deep or wide tables, and an unbounded
+	recursive clone of one runs inside the hook that intercepted the call -
+	multi-second frame hitches on the game being inspected.  The clone
+	therefore stops descending once a capture has copied MaxCloneFields fields
+	or nested MaxCloneDepth tables deep, and keeps the original reference for
+	anything past the bound instead.
 
-		local RobloxType = typeof(OriginalValue)
-		if RobloxType == "Instance" then
-			return cloneref(OriginalValue)
-	
-		elseif RobloxType == "userdata" then
-			if getmetatable(OriginalValue) then
-				return newproxy(true)
-			else
-				return newproxy()
-			end
+	Bounded nodes stay visible (the argument preview/session serializer sees a
+	real table and renders it) and replay codegen still receives a table; the
+	trade-off is that a huge payload's contents can keep mutating after
+	capture, which is already the semantics for Instances and is a far better
+	deal than freezing the game.  Both bounds are far above genuine argument
+	sizes, so normal captures clone exactly as before.
+]]
+local MaxCloneDepth = 8
+local MaxCloneFields = 4000
 
-		elseif RobloxType == "function" then
-			return CloneFunction(OriginalValue)
-		end
-
-		return OriginalValue
-	end
-
-	
-	if ValueCopies then
-		local CachedValue = ValueCopies[OriginalValue]
-		if CachedValue then
-			return CachedValue
-		end
-	else
-		ValueCopies = {}
-	end
-
-	
+local function CloneTable(OriginalValue: { [any]: any }, ValueCopies: { [any]: any }, CloneState: { Fields: number }, Depth: number)
 	local ShallowCopy = {}
 	ValueCopies[OriginalValue] = ShallowCopy
 
 	for Key, Value in next, OriginalValue do
+		-- Every visited field is work paid inside the hook, regardless of type.
+		CloneState.Fields += 1
 		local ValueType = type(Value)
 
 		if ValueType == "table" then
-			ShallowCopy[Key] = DeepClone(Value, ValueCopies)
+			if Depth >= MaxCloneDepth or CloneState.Fields > MaxCloneFields then
+				-- Beyond the bound the capture shares the game's table (see the
+				-- "Clone bounds" note above); cloning resumes nowhere below.
+				ShallowCopy[Key] = Value
+			else
+				local CachedValue = ValueCopies[Value]
+				if CachedValue then
+					ShallowCopy[Key] = CachedValue
+				else
+					ShallowCopy[Key] = CloneTable(Value, ValueCopies, CloneState, Depth + 1)
+				end
+			end
 
 		elseif ValueType == "userdata" then
 			local ValueRobloxType = typeof(Value)
@@ -14110,13 +13474,51 @@ function DeepClone(OriginalValue, ValueCopies)
 
 		elseif ValueType == "function" then
 			ShallowCopy[Key] = CloneFunction(Value)
-	
+
 		else
 			ShallowCopy[Key] = Value
 		end
 	end
 
 	return ShallowCopy
+end
+
+function DeepClone(OriginalValue, ValueCopies)
+	if wax.shared.IS_ACTOR then
+		return OriginalValue
+	end
+
+	local OriginalType = type(OriginalValue)
+	if OriginalType ~= "table" then
+		if OriginalType == "string" or OriginalType == "number" or OriginalType == "boolean" or OriginalValue == nil then
+			return OriginalValue
+		end
+
+		local RobloxType = typeof(OriginalValue)
+		if RobloxType == "Instance" then
+			return cloneref(OriginalValue)
+
+		elseif RobloxType == "userdata" then
+			if getmetatable(OriginalValue) then
+				return newproxy(true)
+			else
+				return newproxy()
+			end
+
+		elseif RobloxType == "function" then
+			return CloneFunction(OriginalValue)
+		end
+
+		return OriginalValue
+	end
+
+	ValueCopies = ValueCopies or {}
+	local CachedValue = ValueCopies[OriginalValue]
+	if CachedValue then
+		return CachedValue
+	end
+
+	return CloneTable(OriginalValue, ValueCopies, { Fields = 0 }, 0)
 end
 
 if wax.shared.IS_ACTOR then
@@ -26923,7 +26325,10 @@ return function(props: {
 
 			LogList:EnsureLogButton(Log)
 			LogList:QueueLogButtonUpdate(Log)
-			LogCalls:HandleCallAdded(Log, CallIndex, Notification.Call)
+			-- Suppressed lets the row renderer drop entrance motion for rows
+			-- that are already a burst behind (several fires were folded into
+			-- this one notification).
+			LogCalls:HandleCallAdded(Log, CallIndex, Notification.Call, Notification.Suppressed)
 		end
 	end))
 
@@ -26954,6 +26359,22 @@ local RowStaggerMax = 0.18
 
 -- How much work one call frame may do before yielding the frame back.
 local ArgumentBuildSliceSeconds = (DeviceProfile.ArgumentBuildSliceMs or 4) / 1000
+
+-- Bounding box for live row renders (tiered: 40/24/12).
+local MaxCallFrameQueue = DeviceProfile.MaxCallFrameQueue or 40
+
+--[[
+	Adaptive motion cutoff for live rows.
+
+	A full page render gets the staggered entrance (the user actually watches
+	that one), but rows pushed by a live remote stop animating long before
+	their queue could saturate: once the renderer backs up past a quarter of
+	its budget, entrance tweens become invisible cost, so the row simply
+	appears.  Coalesced notifications (several fires folded into one row
+	push) skip the animation outright - nobody can read motion that is
+	already a burst behind.
+]]
+local MaxAnimatedRowBacklog = math.max(math.floor(MaxCallFrameQueue / 4), 4)
 
 
 return function(props: {
@@ -27644,8 +27065,9 @@ return function(props: {
 			Max = 2,
 		},
 		-- Rendering is best-effort.  Never let a spammy remote build an
-		-- unbounded backlog of GUI jobs behind the current page.
-		MaxQueue = 40,
+		-- unbounded backlog of GUI jobs behind the current page; the cap
+		-- follows the device tier instead of being a fixed constant.
+		MaxQueue = MaxCallFrameQueue,
 		DropOldest = true,
 		ShouldProcess = IsCallFrameJobCurrent,
 		MainCallback = function(Data)
@@ -27905,7 +27327,7 @@ return function(props: {
 		self:ShowCalls(Log, Page)
 	end
 
-	function Calls:HandleCallAdded(Log, CallIndex: number, CallRef)
+	function Calls:HandleCallAdded(Log, CallIndex: number, CallRef, Suppressed: number?)
 		if LogsPage.State.CurrentLog ~= Log then
 			return
 		end
@@ -27932,13 +27354,19 @@ return function(props: {
 			return
 		end
 
+		-- Adaptive motion: a bursting remote (fires coalesced into this
+		-- notification) or a renderer that is already behind gets the row
+		-- instantly, because its entrance tween would never be readable.
+		local PendingRows = CreateCallFrameLimiter.QueueTail - CreateCallFrameLimiter.QueueHead + 1
+		local AnimateRow = (Suppressed or 0) == 0 and PendingRows <= MaxAnimatedRowBacklog
+
 		local Data = setmetatable({
 			Instance = Log.Instance,
 			Type = Log.Type,
 			Order = VisibleIndex,
 			RenderGeneration = self.CurrentCallFrameRenderGeneration,
 			PreviewCache = GetPreviewCache(Call),
-			Animate = true,
+			Animate = AnimateRow,
 		}, {
 			__index = Call,
 		})
@@ -29206,7 +28634,7 @@ local ObjectTree = {
                                                 5,
                                                 {
                                                     "Environment",
-                                                    Value = "--[[\n\n    Wax Environment replicated for actor env\n\n\tNOTE: the @include regions are autogenerated by the build system, do not modify them in this file.\n\tTo modify the code, modify the source files where the export regions are defined.\n]]\n\nif getgenv().CobaltInitialized == true then\n\treturn\nend\n\ngetgenv().CobaltInitialized = true\n\ntype ActorData = {\n\tToken: string,\n\tIncomingConnections: boolean,\n\tIncomingCallbacks: boolean,\n\tHookIncomingConnections: boolean,\n\tOutgoing: boolean,\n\n\tIgnorePlayerModule: boolean,\n\tLogBlockedRemotes: boolean,\n\tAutoIgnoreSpammyEvents: boolean,\n\tIgnoredRemotesDropdown: { [string]: boolean },\n\n\tExecutorSupport: { [string]: { IsWorking: boolean } },\n}\n\nlocal Data: ActorData = COBALT_ACTOR_DATA\n\nlocal ChannelId, CurrentActor = ...\nif typeof(CurrentActor) == \"Instance\" then\n\tCurrentActor = cloneref(CurrentActor)\nend\n\nlocal function ResolveCurrentActor(Origin)\n\tif Origin and getluastate then\n\t\tlocal Success, LuaStateProxy = pcall(getluastate, Origin)\n\n\t\t-- Best effort to find origin actor\n\t\tif Success then\n\t\t\tlocal Actors = LuaStateProxy:GetActors()\n\t\t\tfor _, Actor in Actors do\n\t\t\t\tif Origin:IsDescendantOf(Actor) then\n\t\t\t\t\treturn cloneref(Actor)\n\t\t\t\tend\n\t\t\tend\n\n\t\t\tif #Actors == 1 then\n\t\t\t\treturn cloneref(Actors[1])\n\t\t\tend\n\t\tend\n\tend\n\n\t-- A LuaState can have several actors assigned to it if the worker limit gets reached\n\t-- Therefore to resolve the actual origin we use get_current_actor\n\tlocal ResolvedActor = get_current_actor and get_current_actor()\n\tif typeof(ResolvedActor) == \"Instance\" then\n\t\treturn cloneref(ResolvedActor)\n\tend\n\n\t-- Probably accurate, but maybe not\n\treturn CurrentActor\nend\n\nlocal RelayChannel = get_comm_channel(ChannelId)\n\nlocal wax = {shared = {}}\nwax.shared.IS_ACTOR = true\nwax.shared.CobaltVerificationToken = Data.Token\nlocal OnUnload\ndo\n\twax.shared.Hooks = {}\n\n\twax.shared.Settings = {\n\t\tIgnorePlayerModule = { Value = Data.IgnorePlayerModule },\n\t\tLogBlockedRemotes = { Value = Data.LogBlockedRemotes },\n\t\tAutoIgnoreSpammyEvents = { Value = Data.AutoIgnoreSpammyEvents },\n\t\tIgnoredRemotesDropdown = { Value = Data.IgnoredRemotesDropdown },\n\t\tLogRobloxInternalEvents = { Value = Data.LogRobloxInternalEvents },\n\t}\n\n\twax.shared.SaveManager = {\n\t\tGetState = function(Idx, Default)\n\t\t\treturn (wax.shared.Settings[Idx] and wax.shared.Settings[Idx].Value) or Data[Idx] or Default\n\t\tend,\n\t}\n\n\twax.shared.Log = {}\n\tdo\n\t\twax.shared.Logs = {\n\t\t\tOutgoing = {},\n\t\t\tIncoming = {},\n\t\t}\n\n\t\twax.shared.NewLog = function(Instance, Type, CallingScript, DebugId)\n\t\t\tlocal NewLog = wax.shared.Log.new(Instance, Type, 0, CallingScript)\n\t\t\twax.shared.Logs[Type][DebugId] = NewLog\n\t\t\treturn NewLog\n\t\tend\n\tend\n\n\twax.shared.ExecutorSupport = Data.ExecutorSupport\n\twax.shared.Communicator = RelayChannel\n\twax.shared.ExecutorName = string.split(identifyexecutor(), \" \")[1]\n\n\t--// Services \\\\--\n\tfor _, Service in pairs({\n\t\t\"Players\",\n\t\t\"HttpService\",\n\t\t\"RobloxReplicatedStorage\",\n\t}) do\n\t\twax.shared[Service] = cloneref(game:GetService(Service))\n\tend\n\n\twax.shared.trampoline_call = trampoline_call or (syn and syn.trampoline_call)\n\n\t--// Event Reference \\\\--\n\n\tlocal InstanceSerializer = {}\n\tdo\n\t\t--#region @include region IsEqualToInstance\n\t\t--[[\n\t\t    Checks if two instances are equal.\n\n\t\t    @param Object: The first instance.\n\t\t    @param ToCompareTo: The second instance.\n\t\t    @return Whether the instances are equal.\n\t\t]]\n\t\tlocal function IsEqualToInstance(Object, ToCompareTo)\n\t\t\tif typeof(Object) ~= \"Instance\" or typeof(ToCompareTo) ~= \"Instance\" then return false end\n\n\t\t\tif rawequal(Object, ToCompareTo) then\n\t\t\t\treturn true\n\t\t\tend\n\n\t\t\tif wax.shared.ExecutorSupport[\"compareinstances\"].IsWorking then\n\t\t\t\treturn compareinstances(Object, ToCompareTo)\n\t\t\tend\n\n\t\t\tlocal ObjectDebugId, ToCompareToDebugId, ShouldCompareDebugIds = nil, nil, false\n\t\t\tdo\n\t\t\t\tlocal Success, ObjectDebugIdResult = pcall(wax.shared.GetDebugId, Object)\n\t\t\t\tlocal Success2, ToCompareToDebugIdResult = pcall(wax.shared.GetDebugId, ToCompareTo)\n\n\t\t\t\tif Success and Success2 then\n\t\t\t\t\tObjectDebugId = ObjectDebugIdResult\n\t\t\t\t\tToCompareToDebugId = ToCompareToDebugIdResult\n\t\t\t\t\tShouldCompareDebugIds = true\n\t\t\t\tend\n\t\t\tend\n\n\t\t\tif ShouldCompareDebugIds then\n\t\t\t\treturn ObjectDebugId == ToCompareToDebugId\n\t\t\tend\n\n\t\t\treturn false\n\t\tend\n\t\t--#endregion\n\n\t\tInstanceSerializer.IsEqualToInstance = IsEqualToInstance\n\tend\n\twax.shared.InstanceSerializer = InstanceSerializer\n\n\tlocal Formatter = {}\n\tdo\n\t\t--#region @include region FormatLuaLiteral\n\t\t--// Populate CleanTable \\\\--\n\t\tFormatter.CleanTable = { ['\"'] = '\\\\\"', [\"\\\\\"] = \"\\\\\\\\\" }\n\t\tdo\n\t\t\tfor i = 0, 31 do\n\t\t\t\tFormatter.CleanTable[string.char(i)] = \"\\\\\" .. string.format(\"%03d\", i)\n\t\t\tend\n\t\t\tfor i = 127, 255 do\n\t\t\t\tFormatter.CleanTable[string.char(i)] = \"\\\\\" .. string.format(\"%03d\", i)\n\t\t\tend\n\t\tend\n\n\t\t--// Indent Template \\\\--\n\t\tlocal IndentTemplate = string.rep(\" \", 4)\n\n\t\t--[[\n\t\t    Formats a Lua string to be used in a Lua code block.\n\n\t\t    @param str: The string to format.\n\t\t    @return The formatted string.\n\t\t]]\n\t\tfunction Formatter.FormatLuaString(str)\n\t\t\treturn string.gsub(str, '[\"\\\\\\0-\\31\\127-\\255]', Formatter.CleanTable)\n\t\tend\n\n\t\t--[[\n\t\t    Formats a Lua literal to be used in a Lua code block.\n\n\t\t    @param Value: The value to format.\n\t\t    @return The formatted string.\n\t\t]]\n\t\tfunction Formatter.FormatLuaLiteral(Value): string?\n\t\t\tlocal ValueType = type(Value)\n\t\t\tif ValueType == \"string\" then\n\t\t\t\treturn `\"{Formatter.FormatLuaString(Value)}\"`\n\t\t\telseif ValueType == \"number\" or ValueType == \"boolean\" then\n\t\t\t\treturn tostring(Value)\n\t\t\tend\n\n\t\t\treturn nil\n\t\tend\n\t\t--#endregion\n\tend\n\n\t--#region @include region FindEventReferenceInTable\n\t\t--[[\n\t\t\tFinds an event reference in a table, used to search upvalues which are tables.\n\n\t\t\t@param Table: The table to search.\n\t\t\t@param Instance: The instance to search for.\n\t\t\t@param Visited: The visited table.\n\t\t\t@return The event reference.\n\t\t]]\n\t\tlocal function FindEventReferenceInTable(\n\t\t\tTable: { [any]: any },\n\t\t\tInstance: Instance,\n\t\t\tVisited: { [any]: boolean }?\n\t\t): { any }?\n\t\t\tlocal Seen = Visited or {}\n\t\t\tif Seen[Table] then\n\t\t\t\treturn nil\n\t\t\tend\n\n\t\t\tSeen[Table] = true\n\n\t\t\tfor Key, Value in next, Table do\n\t\t\t\tif\n\t\t\t\t\ttypeof(Value) == \"Instance\"\n\t\t\t\t\tand InstanceSerializer.IsEqualToInstance(Value, Instance)\n\t\t\t\t\tand Formatter.FormatLuaLiteral(Key)\n\t\t\t\tthen\n\t\t\t\t\treturn { Key }\n\t\t\t\tend\n\n\t\t\t\tif type(Value) == \"table\" and Formatter.FormatLuaLiteral(Key) then\n\t\t\t\t\tlocal ChildPath = FindEventReferenceInTable(Value, Instance, Seen)\n\t\t\t\t\tif ChildPath then\n\t\t\t\t\t\ttable.insert(ChildPath, 1, Key)\n\t\t\t\t\t\treturn ChildPath\n\t\t\t\t\tend\n\t\t\t\tend\n\t\t\tend\n\n\t\t\treturn nil\n\t\tend\n\t--#endregion\n\n\t--// Unload \\\\--\n\tlocal RelayConnection\n\tRelayConnection = RelayChannel.Event:Connect(function(Type, ...)\n\t\tif Type == \"Unload\" then\n\t\t\tRelayConnection:Disconnect()\n\t\t\twax.shared.Unloaded = true\n\t\t\tfor _, Connection in wax.shared.Connections do\n\t\t\t\tConnection:Disconnect()\n\t\t\tend\n\t\t\ttable.clear(wax.shared.Connections)\n\n\t\t\tif OnUnload then\n\t\t\t\tOnUnload()\n\t\t\tend\n\t\telseif Type == \"MainBlock\" then\n\t\t\tlocal Instance, EventType = ...\n\t\t\tlocal Log = wax.shared.Logs[EventType][wax.shared.GetDebugId(Instance)]\n\t\t\tif Log then\n\t\t\t\tLog:Block()\n\t\t\tend\n\t\telseif Type == \"MainIgnore\" then\n\t\t\tlocal Instance, EventType = ...\n\t\t\tlocal Log = wax.shared.Logs[EventType][wax.shared.GetDebugId(Instance)]\n\t\t\tif Log then\n\t\t\t\tLog:Ignore()\n\t\t\tend\n\t\telseif Type == \"MainSettingsSync\" then\n\t\t\tlocal Setting, Value = ...\n\t\t\tif wax.shared.Settings[Setting] then\n\t\t\t\twax.shared.Settings[Setting].Value = Value\n\t\t\tend\n\t\telseif Type == \"MainCallFiltersSync\" then\n\t\t\twax.shared.CallFilters:ReplaceAll(..., true)\n\t\telseif Type == \"InspectIncomingConnections\" then\n\t\t\tlocal Instance, Method, LogIndex, CallIndex = ...\n\t\t\tlocal Success, Signal = pcall(function()\n\t\t\t\treturn Instance[Method]\n\t\t\tend)\n\t\t\tif not Success or typeof(Signal) ~= \"RBXScriptSignal\" then\n\t\t\t\treturn\n\t\t\tend\n\n\t\t\tfor _, Connection in getconnections(Signal) do\n\t\t\t\tif Connection.ForeignState then\n\t\t\t\t\tcontinue\n\t\t\t\tend\n\n\t\t\t\tlocal Function = typeof(Connection.Function) == \"function\" and Connection.Function or nil\n\n\t\t\t\tlocal Origin\n\t\t\t\tlocal Thread = Connection.Thread\n\t\t\t\tif Thread and getscriptfromthread then\n\t\t\t\t\tOrigin = getscriptfromthread(Thread)\n\t\t\t\tend\n\t\t\t\tif not Origin and Function then\n\t\t\t\t\tlocal Script = rawget(getfenv(Function), \"script\")\n\t\t\t\t\tif typeof(Script) == \"Instance\" then\n\t\t\t\t\t\tOrigin = Script\n\t\t\t\t\tend\n\t\t\t\tend\n\n\t\t\t\tlocal FixedInfo, CyclicRefs, ContainsCyclicRef = wax.shared.SerializeActorInfo({\n\t\t\t\t\tOrigin = Origin,\n\t\t\t\t\tFunction = Function,\n\t\t\t\t\tLine = nil,\n\t\t\t\t\tIsExecutor = Function and isexecutorclosure(Function) or false,\n\t\t\t\t\tIsActor = true,\n\t\t\t\t\tActor = ResolveCurrentActor(Origin),\n\t\t\t\t})\n\n\t\t\t\tRelayChannel:Fire(\n\t\t\t\t\t\"IncomingConnectionMetadata\",\n\t\t\t\t\tInstance,\n\t\t\t\t\tLogIndex,\n\t\t\t\t\tCallIndex,\n\t\t\t\t\tFixedInfo,\n\t\t\t\t\tCyclicRefs,\n\t\t\t\t\tContainsCyclicRef\n\t\t\t\t)\n\t\t\tend\n\t\telseif Type == \"ResolveEventReference\" then\n\t\t\tlocal Hash, Instance, IsExecutor, RequestId = ...\n\t\t\tlocal Retrieved = nil\n\n\t\t\tif filtergc then\n\t\t\t\tRetrieved = filtergc(\"function\", {\n\t\t\t\t\tHash = Hash,\n\t\t\t\t\tIgnoreExecutor = not IsExecutor,\n\t\t\t\t}, true)\n\t\t\telse\n\t\t\t\tfor _, Func in getgc() do\n\t\t\t\t\tif typeof(Func) ~= \"function\" then\n\t\t\t\t\t\tcontinue\n\t\t\t\t\tend\n\n\t\t\t\t\tif IsExecutor and not isexecutorclosure(Func) then\n\t\t\t\t\t\tcontinue\n\t\t\t\t\tend\n\n\t\t\t\t\tif getfunctionhash(Func) == Hash then\n\t\t\t\t\t\tRetrieved = Func\n\t\t\t\t\t\tbreak\n\t\t\t\t\tend\n\t\t\t\tend\n\t\t\tend\n\n\t\t\tif not Retrieved then\n\t\t\t\tRelayChannel:Fire(\"ResolveEventReferenceResponse\", RequestId, nil)\n\t\t\t\treturn\n\t\t\tend\n\n\t\t\tlocal UpvaluePath = FindEventReferenceInTable(debug.getupvalues(Retrieved), Instance)\n\n\t\t\tif not UpvaluePath then\n\t\t\t\tRelayChannel:Fire(\"ResolveEventReferenceResponse\", RequestId, nil)\n\t\t\t\treturn\n\t\t\tend\n\n\t\t\tlocal UpvalueIndex = table.remove(UpvaluePath, 1)\n\t\t\tRelayChannel:Fire(\"ResolveEventReferenceResponse\", RequestId, {\n\t\t\t\tHash = Hash,\n\t\t\t\tIndex = UpvalueIndex,\n\t\t\t\tPath = UpvaluePath,\n\t\t\t})\n\t\tend\n\tend)\n\n\twax.shared.Unloaded = false\nend\n\n--#region @include \"Src/Utils/Connect.luau\" as \"wax.shared.Connect\"\ndo\n\tlocal Connections = {}\n\n\tlocal function Connect(Connection)\n\t\ttable.insert(Connections, Connection)\n\t\treturn Connection\n\tend\n\n\tlocal function Disconnect(Connection)\n\t\tConnection:Disconnect()\n\n\t\tlocal Index = table.find(Connections, Connection)\n\t\tif Index then\n\t\t\ttable.remove(Connections, Index)\n\t\tend\n\n\t\treturn true\n\tend\n\n\twax.shared.Connections = Connections\n\twax.shared.Connect = Connect\n\twax.shared.Disconnect = Disconnect\n\n\twax.shared.Connect = Connect\nend\n--#endregion\n\n--#region @include region PlayerScripts\nwax.shared.LocalPlayer = wax.shared.Players.LocalPlayer\n\nlocal function FindFirstDescendantOfClass(Root, ClassName)\n\tfor _, Descendant in Root:GetDescendants() do\n\t\tif Descendant:IsA(ClassName) then\n\t\t\treturn Descendant\n\t\tend\n\tend\n\n\treturn nil\nend\n\nlocal ContendingPlayerScripts =\n\tcloneref(FindFirstDescendantOfClass(wax.shared.LocalPlayer, \"PlayerScripts\") or wax.shared.LocalPlayer)\nif ContendingPlayerScripts:IsA(\"PlayerScripts\") then\n\twax.shared.PlayerScripts = ContendingPlayerScripts\nelse\n\twax.shared.PlayerScripts = nil\n\n\tlocal ChildAddedConnection\n\tChildAddedConnection = wax.shared.Connect(wax.shared.LocalPlayer.ChildAdded:Connect(function(Child)\n\t\tif Child:IsA(\"PlayerScripts\") then\n\t\t\twax.shared.PlayerScripts = cloneref(Child)\n\t\t\twax.shared.Disconnect(ChildAddedConnection)\n\t\tend\n\tend))\nend\n--#endregion\n\n--#region @include region ExecutorHelpers\nwax.shared.restorefunction = function(Function: (...any) -> ...any, Silent: boolean?)\n\tlocal Original = wax.shared.Hooks[Function]\n\n\tif Silent and not Original then\n\t\treturn\n\tend\n\n\tassert(Original, \"Function not hooked\")\n\n\tif restorefunction and isfunctionhooked(Function) then\n\t\trestorefunction(Function)\n\telse\n\t\twax.shared.Hooking.HookFunction(Function, Original)\n\tend\n\n\twax.shared.Hooks[Function] = nil\nend\nwax.shared.getrawmetatable = wax.shared.ExecutorSupport[\"getrawmetatable\"].IsWorking\n\t\tand (getrawmetatable or debug.getmetatable)\n\tor function()\n\t\treturn setmetatable({}, {\n\t\t\t__index = function()\n\t\t\t\treturn function() end\n\t\t\tend,\n\t\t})\n\tend\n\nlocal RawGetDebugId = clonefunction and clonefunction(game.GetDebugId) or game.GetDebugId\nwax.shared.GetDebugId = function(Instance)\n\tlocal identity = getthreadidentity()\n\tsetthreadidentity(8)\n\tlocal id = RawGetDebugId(Instance)\n\tsetthreadidentity(identity)\n\treturn id\nend\n\nwax.shared.newcclosure = wax.shared.ExecutorName == \"AWP\"\n\t\tand function(f, name)\n\t\t\tlocal env = getfenv(f)\n\t\t\tlocal x = setmetatable({\n\t\t\t\t__F = f,\n\t\t\t}, {\n\t\t\t\t__index = env,\n\t\t\t\t__newindex = env,\n\t\t\t})\n\n\t\t\tlocal nf = function(...)\n\t\t\t\treturn __F(...)\n\t\t\tend\n\n\t\t\tsetfenv(nf, x) -- set func env (env of nf gets deoptimized)\n\t\t\treturn newcclosure(nf, name)\n\t\tend\n\tor newcclosure\n--#endregion\n\n--#region @include \"Src/Utils/Hook/Luau.luau\" as \"wax.shared.Hooking\"\ndo\n\tlocal Hooking = {}\n\n\tHooking.HookFunction = function(Original, Replacement, Filter)\n\t\tif\n\t\t\twax.shared.IsUsingOthHooks\n\t\t\tand iscclosure(Original)\n\t\tthen\n\t\t\treturn oth.hook(Original, Replacement, Filter)\n\t\tend\n\n\t\tif islclosure(Replacement) then\n\t\t\tReplacement = wax.shared.newcclosure(Replacement)\n\t\tend\n\n\t\tif not wax.shared.ExecutorSupport[\"hookfunction\"].IsWorking then\n\t\t\treturn Original\n\t\tend\n\n\t\treturn hookfunction(Original, Replacement, Filter)\n\tend\n\n\tHooking.HookMetaMethod = function(object, method, hook, filter)\n\t\tlocal Metatable = wax.shared.getrawmetatable(object)\n\t\tlocal originalMethod = rawget(Metatable, method)\n\n\t\tassert(typeof(originalMethod) == \"function\", `{method} is not a function in the metatable of {object}`)\n\n\t\tif wax.shared.IsUsingOthHooks then\n\t\t\treturn oth.hook(originalMethod, hook, filter)\n\t\tend\n\n\t\tif islclosure(hook) then\n\t\t\thook = wax.shared.newcclosure(hook)\n\t\tend\n\n\t\tif\n\t\t\tnot wax.shared.ExecutorSupport[\"hookmetamethod\"].IsWorking\n\t\t\tand wax.shared.ExecutorSupport[\"getrawmetatable\"].IsWorking\n\t\tthen\n\t\t\tsetreadonly(Metatable, false)\n\t\t\trawset(Metatable, method, hook)\n\t\t\tsetreadonly(Metatable, true)\n\n\t\t\treturn originalMethod\n\t\tend\n\n\t\tif not wax.shared.ExecutorSupport[\"hookmetamethod\"].IsWorking then\n\t\t\tif method == \"__index\" then\n\t\t\t\tlocal _, Metamethod = xpcall(function()\n\t\t\t\t\treturn object[tostring(math.random())]\n\t\t\t\tend, function(err)\n\t\t\t\t\treturn debug.info(2, \"f\")\n\t\t\t\tend)\n\n\t\t\t\treturn Metamethod\n\t\t\telseif method == \"__newindex\" then\n\t\t\t\tlocal _, Metamethod = xpcall(function()\n\t\t\t\t\tobject[tostring(math.random())] = true\n\t\t\t\tend, function(err)\n\t\t\t\t\treturn debug.info(2, \"f\")\n\t\t\t\tend)\n\n\t\t\t\treturn Metamethod\n\t\t\telseif method == \"__namecall\" then\n\t\t\t\tlocal _, Metamethod = xpcall(function()\n\t\t\t\t\tobject:Mustard()\n\t\t\t\tend, function(err)\n\t\t\t\t\treturn debug.info(2, \"f\")\n\t\t\t\tend)\n\n\t\t\t\treturn Metamethod\n\t\t\tend\n\n\t\t\treturn nil\n\t\tend\n\n\t\tif filter then\n\t\t\treturn hookmetamethod(object, method, hook, true, filter)\n\t\tend\n\t\t\n\t\treturn hookmetamethod(object, method, hook)\n\tend\n\n\twax.shared.Hooking = Hooking\nend\n--#endregion\n\n--#region @include \"Src/Utils/SafePack.luau\" as \"wax.shared.SafePack\"\ndo\n\t--[[\n\t    SafePack\n\t    Author: centerepic\n\t]]\n\n\tlocal TableProxy = {}\n\n\tlocal UNPACK_CHUNK = 7997\n\tlocal SAFE_LIMIT = 12000\n\n\tfunction TableProxy.Pack(...)\n\t    return { n = select(\"#\", ...), ... }\n\tend\n\n\tfunction TableProxy.Unpack(Tbl, I, J)\n\t    I = I or 1\n\t    J = J or Tbl.n or #Tbl\n\n\t    if J - I + 1 > SAFE_LIMIT then\n\t        J = I + SAFE_LIMIT - 1\n\t    end\n\n\t    if J < I then\n\t        return\n\t    end\n\n\t    if J - I + 1 <= UNPACK_CHUNK then\n\t        return table.unpack(Tbl, I, J)\n\t    end\n\n\t    return Tbl[I], TableProxy.Unpack(Tbl, I + 1, J)\n\tend\n\n\twax.shared.SafePack = TableProxy\nend\n--#endregion\n\n--#region @include \"Src/Utils/Validation/Schema.luau\" as \"wax.shared.ValidationSchema\"\ndo\n\t--// Types \\\\--\n\ttype SchemaKind = \"Any\" | \"Type\" | \"Literal\" | \"Enum\" | \"Array\" | \"Object\" | \"Union\"\n\ttype Refinement = {\n\t\tPredicate: (any) -> boolean,\n\t\tMessage: string,\n\t}\n\ttype SchemaNode = {\n\t\tKind: SchemaKind,\n\t\tExpectedType: string?,\n\t\tLiteral: any?,\n\t\tValues: { any }?,\n\t\tItem: SchemaNode?,\n\t\tShape: { [any]: SchemaNode }?,\n\t\tSchemas: { SchemaNode }?,\n\t\tIsOptional: boolean?,\n\t\tHasDefault: boolean?,\n\t\tDefaultValue: any?,\n\t\tRefinements: { Refinement }?,\n\t\tMinimum: number?,\n\t\tMaximum: number?,\n\t\tInteger: boolean?,\n\t}\n\n\t--// Setup \\\\--\n\tlocal Node = {}\n\tNode.__index = Node\n\n\tlocal Schema = {}\n\n\t--// Helpers \\\\--\n\tlocal function CloneValue(Value)\n\t\tif type(Value) ~= \"table\" then\n\t\t\treturn Value\n\t\tend\n\n\t\tlocal Copy = {}\n\t\tfor Key, Child in Value do\n\t\t\tCopy[CloneValue(Key)] = CloneValue(Child)\n\t\tend\n\t\treturn Copy\n\tend\n\n\tlocal function CloneNode(self: SchemaNode): SchemaNode\n\t\tlocal Copy = table.clone(self)\n\t\tCopy.Refinements = self.Refinements and table.clone(self.Refinements) or nil\n\t\treturn setmetatable(Copy, Node) :: any\n\tend\n\n\tlocal function NewNode(Kind: SchemaKind, Data: { [any]: any }?): SchemaNode\n\t\tlocal NewSchema = Data and table.clone(Data) or {}\n\t\tNewSchema.Kind = Kind\n\t\treturn setmetatable(NewSchema, Node) :: any\n\tend\n\n\tlocal function AddError(Errors: { string }, Path: string, Message: string)\n\t\ttable.insert(Errors, `{Path}: {Message}`)\n\tend\n\n\tlocal function ChildPath(Path: string, Key: any): string\n\t\tif type(Key) == \"number\" then\n\t\t\treturn `{Path}[{Key}]`\n\t\tend\n\t\treturn Path == \"\" and tostring(Key) or `{Path}.{Key}`\n\tend\n\n\tlocal function IsSchema(Value): boolean\n\t\treturn type(Value) == \"table\" and getmetatable(Value) == Node\n\tend\n\n\tlocal function ValidateNode(CurrentSchema: SchemaNode, Value: any, Path: string, Errors: { string }): (boolean, any)\n\t\tif Value == nil then\n\t\t\tif CurrentSchema.HasDefault then\n\t\t\t\treturn true, CloneValue(CurrentSchema.DefaultValue)\n\t\t\tend\n\t\t\tif CurrentSchema.IsOptional then\n\t\t\t\treturn true, nil\n\t\t\tend\n\n\t\t\tAddError(Errors, Path, \"is required\")\n\t\t\treturn false, nil\n\t\tend\n\n\t\tlocal IsValid = true\n\t\tlocal Output = Value\n\t\tlocal Kind = CurrentSchema.Kind\n\n\t\tif Kind == \"Type\" then\n\t\t\tIsValid = typeof(Value) == CurrentSchema.ExpectedType\n\t\t\tif not IsValid then\n\t\t\t\tAddError(Errors, Path, `expected {CurrentSchema.ExpectedType}, got {typeof(Value)}`)\n\t\t\tend\n\t\telseif Kind == \"Literal\" then\n\t\t\tIsValid = Value == CurrentSchema.Literal\n\t\t\tif not IsValid then\n\t\t\t\tAddError(Errors, Path, `expected {tostring(CurrentSchema.Literal)}`)\n\t\t\tend\n\t\telseif Kind == \"Enum\" then\n\t\t\tIsValid = false\n\t\t\tfor _, Option in CurrentSchema.Values or {} do\n\t\t\t\tif Value == Option then\n\t\t\t\t\tIsValid = true\n\t\t\t\t\tbreak\n\t\t\t\tend\n\t\t\tend\n\t\t\tif not IsValid then\n\t\t\t\tlocal Options = {}\n\t\t\t\tfor _, Option in CurrentSchema.Values or {} do\n\t\t\t\t\ttable.insert(Options, tostring(Option))\n\t\t\t\tend\n\t\t\t\tAddError(Errors, Path, `expected one of {table.concat(Options, \", \")}`)\n\t\t\tend\n\t\telseif Kind == \"Array\" then\n\t\t\tif type(Value) ~= \"table\" then\n\t\t\t\tAddError(Errors, Path, `expected table, got {typeof(Value)}`)\n\t\t\t\tIsValid = false\n\t\t\telse\n\t\t\t\tOutput = {}\n\t\t\t\tfor Index, Child in Value do\n\t\t\t\t\tif type(Index) ~= \"number\" or Index % 1 ~= 0 or Index < 1 then\n\t\t\t\t\t\tAddError(Errors, Path, \"expected an array with positive integer keys\")\n\t\t\t\t\t\tIsValid = false\n\t\t\t\t\t\tcontinue\n\t\t\t\t\tend\n\n\t\t\t\t\tlocal ChildValid, ChildOutput = ValidateNode(CurrentSchema.Item :: SchemaNode, Child, ChildPath(Path, Index), Errors)\n\t\t\t\t\tIsValid = ChildValid and IsValid\n\t\t\t\t\tif ChildValid then\n\t\t\t\t\t\tOutput[Index] = ChildOutput\n\t\t\t\t\tend\n\t\t\t\tend\n\t\t\tend\n\t\telseif Kind == \"Object\" then\n\t\t\tif type(Value) ~= \"table\" then\n\t\t\t\tAddError(Errors, Path, `expected table, got {typeof(Value)}`)\n\t\t\t\tIsValid = false\n\t\t\telse\n\t\t\t\tOutput = {}\n\t\t\t\tfor Key, ChildSchema in CurrentSchema.Shape or {} do\n\t\t\t\t\tlocal ChildValid, ChildOutput = ValidateNode(ChildSchema, Value[Key], ChildPath(Path, Key), Errors)\n\t\t\t\t\tIsValid = ChildValid and IsValid\n\t\t\t\t\tif ChildOutput ~= nil then\n\t\t\t\t\t\tOutput[Key] = ChildOutput\n\t\t\t\t\tend\n\t\t\t\tend\n\t\t\tend\n\t\telseif Kind == \"Union\" then\n\t\t\tIsValid = false\n\t\t\tfor _, ChildSchema in CurrentSchema.Schemas or {} do\n\t\t\t\tlocal ChildErrors = {}\n\t\t\t\tlocal ChildValid, ChildOutput = ValidateNode(ChildSchema, Value, Path, ChildErrors)\n\t\t\t\tif ChildValid then\n\t\t\t\t\tIsValid = true\n\t\t\t\t\tOutput = ChildOutput\n\t\t\t\t\tbreak\n\t\t\t\tend\n\t\t\tend\n\t\t\tif not IsValid then\n\t\t\t\tAddError(Errors, Path, \"did not match any allowed schema\")\n\t\t\tend\n\t\tend\n\n\t\tif not IsValid then\n\t\t\treturn false, nil\n\t\tend\n\n\t\tif type(Output) == \"number\" then\n\t\t\tif CurrentSchema.Integer and Output % 1 ~= 0 then\n\t\t\t\tAddError(Errors, Path, \"expected an integer\")\n\t\t\t\tIsValid = false\n\t\t\tend\n\t\t\tif CurrentSchema.Minimum ~= nil and Output < CurrentSchema.Minimum then\n\t\t\t\tAddError(Errors, Path, `must be at least {CurrentSchema.Minimum}`)\n\t\t\t\tIsValid = false\n\t\t\tend\n\t\t\tif CurrentSchema.Maximum ~= nil and Output > CurrentSchema.Maximum then\n\t\t\t\tAddError(Errors, Path, `must be at most {CurrentSchema.Maximum}`)\n\t\t\t\tIsValid = false\n\t\t\tend\n\t\tend\n\n\t\tfor _, Refinement in CurrentSchema.Refinements or {} do\n\t\t\tlocal Success, Result = pcall(Refinement.Predicate, Output)\n\t\t\tif not Success or not Result then\n\t\t\t\tAddError(Errors, Path, Refinement.Message)\n\t\t\t\tIsValid = false\n\t\t\tend\n\t\tend\n\n\t\tif not IsValid then\n\t\t\treturn false, nil\n\t\tend\n\t\treturn true, Output\n\tend\n\n\t--// Modifiers \\\\--\n\tfunction Node:optional(): SchemaNode\n\t\tlocal Copy = CloneNode(self)\n\t\tCopy.IsOptional = true\n\t\treturn Copy\n\tend\n\n\tfunction Node:default(Value: any): SchemaNode\n\t\tlocal Copy = CloneNode(self)\n\t\tCopy.HasDefault = true\n\t\tCopy.DefaultValue = Value\n\t\treturn Copy\n\tend\n\n\tfunction Node:refine(Predicate: (any) -> boolean, Message: string?): SchemaNode\n\t\tassert(type(Predicate) == \"function\", \"Schema refinement must be a function\")\n\t\tlocal Copy = CloneNode(self)\n\t\tCopy.Refinements = Copy.Refinements or {}\n\t\ttable.insert(Copy.Refinements, {\n\t\t\tPredicate = Predicate,\n\t\t\tMessage = Message or \"failed refinement\",\n\t\t})\n\t\treturn Copy\n\tend\n\n\tfunction Node:integer(): SchemaNode\n\t\tassert(self.Kind == \"Type\" and self.ExpectedType == \"number\", \"integer() can only be used on number schemas\")\n\t\tlocal Copy = CloneNode(self)\n\t\tCopy.Integer = true\n\t\treturn Copy\n\tend\n\n\tfunction Node:min(Value: number): SchemaNode\n\t\tassert(self.Kind == \"Type\" and self.ExpectedType == \"number\", \"min() can only be used on number schemas\")\n\t\tlocal Copy = CloneNode(self)\n\t\tCopy.Minimum = Value\n\t\treturn Copy\n\tend\n\n\tfunction Node:max(Value: number): SchemaNode\n\t\tassert(self.Kind == \"Type\" and self.ExpectedType == \"number\", \"max() can only be used on number schemas\")\n\t\tlocal Copy = CloneNode(self)\n\t\tCopy.Maximum = Value\n\t\treturn Copy\n\tend\n\n\t--// Constructors \\\\--\n\tfunction Schema.any(): SchemaNode\n\t\treturn NewNode(\"Any\")\n\tend\n\n\tfunction Schema.type(ExpectedType: string): SchemaNode\n\t\tassert(type(ExpectedType) == \"string\", \"Schema type must be a string\")\n\t\treturn NewNode(\"Type\", { ExpectedType = ExpectedType })\n\tend\n\n\tfunction Schema.string(): SchemaNode\n\t\treturn Schema.type(\"string\")\n\tend\n\n\tfunction Schema.number(): SchemaNode\n\t\treturn Schema.type(\"number\")\n\tend\n\n\tfunction Schema.boolean(): SchemaNode\n\t\treturn Schema.type(\"boolean\")\n\tend\n\n\tfunction Schema.table(): SchemaNode\n\t\treturn Schema.type(\"table\")\n\tend\n\n\tfunction Schema.callback(): SchemaNode\n\t\treturn Schema.type(\"function\")\n\tend\n\n\tfunction Schema.instance(ClassName: string?): SchemaNode\n\t\tlocal InstanceSchema = Schema.type(\"Instance\")\n\t\tif ClassName then\n\t\t\treturn InstanceSchema:refine(function(Value)\n\t\t\t\treturn Value:IsA(ClassName)\n\t\t\tend, `expected an Instance that is a {ClassName}`)\n\t\tend\n\t\treturn InstanceSchema\n\tend\n\n\tfunction Schema.literal(Value: any): SchemaNode\n\t\tassert(Value ~= nil, \"Schema literal cannot be nil; use optional() instead\")\n\t\treturn NewNode(\"Literal\", { Literal = Value })\n\tend\n\n\tfunction Schema.enum(Values: { any }): SchemaNode\n\t\tassert(type(Values) == \"table\" and #Values > 0, \"Schema enum requires at least one value\")\n\t\treturn NewNode(\"Enum\", { Values = table.clone(Values) })\n\tend\n\n\tfunction Schema.array(ItemSchema: SchemaNode): SchemaNode\n\t\tassert(IsSchema(ItemSchema), \"Schema array requires an item schema\")\n\t\treturn NewNode(\"Array\", { Item = ItemSchema })\n\tend\n\n\tfunction Schema.object(Shape: { [any]: SchemaNode }): SchemaNode\n\t\tassert(type(Shape) == \"table\", \"Schema object requires a shape\")\n\t\tfor Key, ChildSchema in Shape do\n\t\t\tassert(IsSchema(ChildSchema), `Schema object field {tostring(Key)} must be a schema`)\n\t\tend\n\t\treturn NewNode(\"Object\", { Shape = table.clone(Shape) })\n\tend\n\n\tfunction Schema.union(Schemas: { SchemaNode }): SchemaNode\n\t\tassert(type(Schemas) == \"table\" and #Schemas > 0, \"Schema union requires at least one schema\")\n\t\tfor _, ChildSchema in Schemas do\n\t\t\tassert(IsSchema(ChildSchema), \"Schema union entries must be schemas\")\n\t\tend\n\t\treturn NewNode(\"Union\", { Schemas = table.clone(Schemas) })\n\tend\n\n\t--// Validation \\\\--\n\tfunction Schema.Validate(DataSchema: SchemaNode, Value: any): (boolean, any, { string })\n\t\tassert(IsSchema(DataSchema), \"ValidateSchema requires a schema created by Validation.Schema\")\n\t\tlocal Errors = {}\n\t\tlocal IsValid, Output = ValidateNode(DataSchema, Value, \"Value\", Errors)\n\t\treturn IsValid, Output, Errors\n\tend\n\n\twax.shared.ValidationSchema = Schema\nend\n--#endregion\n\n--#region @include \"Src/Utils/Validation/init.luau\" as \"wax.shared.Validation\"\ndo\n\t--// Imports \\\\--\n\tlocal Schema = wax.shared.ValidationSchema or require(script.Schema)\n\n\t--// Module \\\\--\n\tlocal Validation = {\n\t\tSchema = Schema,\n\t}\n\n\t--// Functions \\\\--\n\tfunction Validation.FillTemplate(Data, Template)\n\t\tlocal NewData = {}\n\t\tfor Key, Value in Template do\n\t\t\tif Data[Key] == nil or typeof(Data[Key]) ~= typeof(Value) then\n\t\t\t\tNewData[Key] = Value\n\t\t\telse\n\t\t\t\tNewData[Key] = Data[Key]\n\t\t\tend\n\t\tend\n\n\t\treturn NewData\n\tend\n\n\tfunction Validation.ValidateSchema(Data, DataSchema)\n\t\treturn Schema.Validate(DataSchema, Data)\n\tend\n\n\twax.shared.Validation = Validation\nend\n--#endregion\n\n--#region @include \"Src/Utils/CallFilter/Operators.luau\" as \"wax.shared.CallFilterOperators\"\ndo\n\tlocal Operators = {}\n\n\tlocal Registry = {\n\t\tEquals = {\n\t\t\tText = \"==\",\n\t\t\tAllowedTypes = { boolean = true, number = true, string = true },\n\t\t\tEvaluate = function(Value, Expected)\n\t\t\t\treturn Value == Expected\n\t\t\tend,\n\t\t},\n\t\tNotEquals = {\n\t\t\tText = \"~=\",\n\t\t\tAllowedTypes = { boolean = true, number = true, string = true },\n\t\t\tEvaluate = function(Value, Expected)\n\t\t\t\treturn Value ~= Expected\n\t\t\tend,\n\t\t},\n\t\tLessThan = {\n\t\t\tText = \"<\",\n\t\t\tNumericComparison = true,\n\t\t\tAllowedTypes = { number = true },\n\t\t\tEvaluate = function(Value, Expected)\n\t\t\t\treturn typeof(Value) == \"number\" and typeof(Expected) == \"number\" and Value < Expected\n\t\t\tend,\n\t\t},\n\t\tLessThanOrEqual = {\n\t\t\tText = \"<=\",\n\t\t\tNumericComparison = true,\n\t\t\tAllowedTypes = { number = true },\n\t\t\tEvaluate = function(Value, Expected)\n\t\t\t\treturn typeof(Value) == \"number\" and typeof(Expected) == \"number\" and Value <= Expected\n\t\t\tend,\n\t\t},\n\t\tGreaterThan = {\n\t\t\tText = \">\",\n\t\t\tNumericComparison = true,\n\t\t\tAllowedTypes = { number = true },\n\t\t\tEvaluate = function(Value, Expected)\n\t\t\t\treturn typeof(Value) == \"number\" and typeof(Expected) == \"number\" and Value > Expected\n\t\t\tend,\n\t\t},\n\t\tGreaterThanOrEqual = {\n\t\t\tText = \">=\",\n\t\t\tNumericComparison = true,\n\t\t\tAllowedTypes = { number = true },\n\t\t\tEvaluate = function(Value, Expected)\n\t\t\t\treturn typeof(Value) == \"number\" and typeof(Expected) == \"number\" and Value >= Expected\n\t\t\tend,\n\t\t},\n\t\tContains = {\n\t\t\tText = \"Contains\",\n\t\t\tSummaryText = \"contains\",\n\t\t\tAllowedTypes = { string = true },\n\t\t\tEvaluate = function(Value, Expected)\n\t\t\t\treturn typeof(Value) == \"string\"\n\t\t\t\t\tand typeof(Expected) == \"string\"\n\t\t\t\t\tand string.find(Value, Expected, 1, true) ~= nil\n\t\t\tend,\n\t\t},\n\t\tStartsWith = {\n\t\t\tText = \"Starts with\",\n\t\t\tSummaryText = \"starts with\",\n\t\t\tAllowedTypes = { string = true },\n\t\t\tEvaluate = function(Value, Expected)\n\t\t\t\treturn typeof(Value) == \"string\"\n\t\t\t\t\tand typeof(Expected) == \"string\"\n\t\t\t\t\tand string.sub(Value, 1, #Expected) == Expected\n\t\t\tend,\n\t\t},\n\t\tEndsWith = {\n\t\t\tText = \"Ends with\",\n\t\t\tSummaryText = \"ends with\",\n\t\t\tAllowedTypes = { string = true },\n\t\t\tEvaluate = function(Value, Expected)\n\t\t\t\treturn typeof(Value) == \"string\"\n\t\t\t\t\tand typeof(Expected) == \"string\"\n\t\t\t\t\tand (Expected == \"\" or string.sub(Value, -#Expected) == Expected)\n\t\t\tend,\n\t\t},\n\t\tTypeIs = {\n\t\t\tText = \"Type\",\n\t\t\tSummaryText = \"type\",\n\t\t\tEvaluate = function(Value, Expected)\n\t\t\t\treturn typeof(Value) == tostring(Expected)\n\t\t\tend,\n\t\t},\n\t}\n\n\tlocal Order = {\n\t\t\"Equals\",\n\t\t\"NotEquals\",\n\t\t\"LessThan\",\n\t\t\"LessThanOrEqual\",\n\t\t\"GreaterThan\",\n\t\t\"GreaterThanOrEqual\",\n\t\t\"Contains\",\n\t\t\"StartsWith\",\n\t\t\"EndsWith\",\n\t\t\"TypeIs\",\n\t}\n\n\tlocal TypeNames = {\n\t\t\"nil\",\n\t\t\"boolean\",\n\t\t\"number\",\n\t\t\"string\",\n\t\t\"table\",\n\t\t\"function\",\n\t\t\"thread\",\n\t\t\"userdata\",\n\t\t\"Instance\",\n\t\t\"EnumItem\",\n\t\t\"RBXScriptSignal\",\n\t\t\"RBXScriptConnection\",\n\t\t\"Vector2\",\n\t\t\"Vector3\",\n\t\t\"CFrame\",\n\t\t\"Color3\",\n\t\t\"BrickColor\",\n\t\t\"UDim\",\n\t\t\"UDim2\",\n\t\t\"Rect\",\n\t\t\"Ray\",\n\t\t\"buffer\",\n\t}\n\n\tlocal TypeNameLookup = {}\n\tfor _, TypeName in TypeNames do\n\t\tTypeNameLookup[TypeName] = true\n\tend\n\n\tlocal function GetSubjectKey(Subject): string\n\t\treturn if Subject.Type == \"ArgumentCount\" then \"ArgumentCount\" else `Argument:{Subject.Index}`\n\tend\n\n\tlocal function FormatSubject(Subject): string\n\t\treturn if Subject.Type == \"ArgumentCount\" then \"#Arg\" else `Arg[{Subject.Index}]`\n\tend\n\n\tlocal function GetAndGroupRange(Conditions, Condition)\n\t\tlocal ConditionIndex = table.find(Conditions, Condition)\n\t\tif not ConditionIndex then\n\t\t\treturn 1, #Conditions\n\t\tend\n\n\t\tlocal FirstIndex = 1\n\t\tfor Index = ConditionIndex, 2, -1 do\n\t\t\tif Conditions[Index].Join == \"Or\" then\n\t\t\t\tFirstIndex = Index\n\t\t\t\tbreak\n\t\t\tend\n\t\tend\n\n\t\tlocal LastIndex = #Conditions\n\t\tfor Index = ConditionIndex + 1, #Conditions do\n\t\t\tif Conditions[Index].Join == \"Or\" then\n\t\t\t\tLastIndex = Index - 1\n\t\t\t\tbreak\n\t\t\tend\n\t\tend\n\n\t\treturn FirstIndex, LastIndex\n\tend\n\n\tlocal function FormatValue(Value): string\n\t\treturn if typeof(Value) == \"string\" then `\"{Value}\"` else tostring(Value)\n\tend\n\n\tfunction Operators.Get(Operator)\n\t\treturn Registry[Operator]\n\tend\n\n\tfunction Operators.GetOptions()\n\t\tlocal Options = {}\n\t\tfor _, Operator in Order do\n\t\t\tlocal Definition = Registry[Operator]\n\t\t\ttable.insert(Options, {\n\t\t\t\tValue = Operator,\n\t\t\t\tText = Definition.Text,\n\t\t\t})\n\t\tend\n\t\treturn Options\n\tend\n\n\tfunction Operators.GetTypeNames()\n\t\treturn table.clone(TypeNames)\n\tend\n\n\tfunction Operators.IsTypeName(Value): boolean\n\t\treturn type(Value) == \"string\" and TypeNameLookup[Value] == true\n\tend\n\n\tfunction Operators.GetText(Operator, Summary: boolean?): string\n\t\tlocal Definition = Registry[Operator]\n\t\tif not Definition then\n\t\t\treturn tostring(Operator)\n\t\tend\n\t\treturn Summary and Definition.SummaryText or Definition.Text\n\tend\n\n\tfunction Operators.FormatValue(Value): string\n\t\treturn FormatValue(Value)\n\tend\n\n\tfunction Operators.IsNumericComparison(Operator): boolean\n\t\tlocal Definition = Registry[Operator]\n\t\treturn Definition ~= nil and Definition.NumericComparison == true\n\tend\n\n\tfunction Operators.Evaluate(Operator, Value, Expected): boolean\n\t\tlocal Definition = Registry[Operator]\n\t\treturn Definition ~= nil and Definition.Evaluate(Value, Expected) or false\n\tend\n\n\tfunction Operators.ResolveSubject(Subject, Arguments)\n\t\tif Subject.Type == \"ArgumentCount\" then\n\t\t\treturn Arguments.n or #Arguments\n\t\tend\n\n\t\treturn Arguments[Subject.Index]\n\tend\n\n\tfunction Operators.MatchesCondition(Condition, Arguments): boolean\n\t\treturn Operators.Evaluate(Condition.Operator, Operators.ResolveSubject(Condition.Subject, Arguments), Condition.Value)\n\tend\n\n\tfunction Operators.Matches(Conditions, ResolveValue): boolean\n\t\tif #Conditions == 0 then\n\t\t\treturn true\n\t\tend\n\n\t\tlocal AnyGroupMatches = false\n\t\tlocal CurrentGroupMatches = Operators.Evaluate(\n\t\t\tConditions[1].Operator,\n\t\t\tResolveValue(Conditions[1]),\n\t\t\tConditions[1].Value\n\t\t)\n\t\tfor Index = 2, #Conditions do\n\t\t\tlocal Condition = Conditions[Index]\n\t\t\tlocal Matches = Operators.Evaluate(Condition.Operator, ResolveValue(Condition), Condition.Value)\n\t\t\tif Condition.Join == \"Or\" then\n\t\t\t\tAnyGroupMatches = AnyGroupMatches or CurrentGroupMatches\n\t\t\t\tCurrentGroupMatches = Matches\n\t\t\telse\n\t\t\t\tCurrentGroupMatches = CurrentGroupMatches and Matches\n\t\t\tend\n\t\tend\n\n\t\treturn AnyGroupMatches or CurrentGroupMatches\n\tend\n\n\tfunction Operators.MatchesConditions(Conditions, Arguments): boolean\n\t\treturn Operators.Matches(Conditions, function(Condition)\n\t\t\treturn Operators.ResolveSubject(Condition.Subject, Arguments)\n\t\tend)\n\tend\n\n\tfunction Operators.GetConditionType(Conditions, Condition): string?\n\t\tif Condition.Subject.Type == \"ArgumentCount\" then\n\t\t\treturn \"number\"\n\t\tend\n\n\t\tlocal SubjectKey = GetSubjectKey(Condition.Subject)\n\t\tlocal FirstIndex, LastIndex = GetAndGroupRange(Conditions, Condition)\n\t\tfor Index = FirstIndex, LastIndex do\n\t\t\tlocal OtherCondition = Conditions[Index]\n\t\t\tif\n\t\t\t\tOtherCondition ~= Condition\n\t\t\t\tand GetSubjectKey(OtherCondition.Subject) == SubjectKey\n\t\t\t\tand OtherCondition.Operator == \"TypeIs\"\n\t\t\tthen\n\t\t\t\treturn tostring(OtherCondition.Value)\n\t\t\tend\n\t\tend\n\n\t\tif Condition.Operator == \"TypeIs\" then\n\t\t\treturn tostring(Condition.Value)\n\t\tend\n\n\t\tlocal ValueType = typeof(Condition.Value)\n\t\tif ValueType == \"boolean\" or ValueType == \"number\" then\n\t\t\treturn ValueType\n\t\tend\n\n\t\tfor Index = FirstIndex, LastIndex do\n\t\t\tlocal OtherCondition = Conditions[Index]\n\t\t\tlocal OtherValueType = typeof(OtherCondition.Value)\n\t\t\tif\n\t\t\t\tOtherCondition ~= Condition\n\t\t\t\tand GetSubjectKey(OtherCondition.Subject) == SubjectKey\n\t\t\t\tand (OtherValueType == \"boolean\" or OtherValueType == \"number\")\n\t\t\tthen\n\t\t\t\treturn OtherValueType\n\t\t\tend\n\t\tend\n\n\t\treturn if ValueType == \"string\" then \"string\" else nil\n\tend\n\n\tfunction Operators.IsAllowed(Conditions, Condition, Operator): boolean\n\t\tif Operator == \"TypeIs\" then\n\t\t\treturn Condition.Subject.Type == \"Argument\"\n\t\tend\n\n\t\tlocal Definition = Registry[Operator]\n\t\tif not Definition then\n\t\t\treturn false\n\t\tend\n\n\t\tlocal ConditionType = Operators.GetConditionType(Conditions, Condition)\n\t\treturn ConditionType == nil or Definition.AllowedTypes[ConditionType] == true\n\tend\n\n\tfunction Operators.IsConditionValid(Conditions, Condition): boolean\n\t\tlocal Definition = Registry[Condition.Operator]\n\t\tif not Definition then\n\t\t\treturn false\n\t\tend\n\n\t\tif Condition.Operator == \"TypeIs\" then\n\t\t\treturn Condition.Subject.Type == \"Argument\" and Operators.IsTypeName(Condition.Value)\n\t\tend\n\n\t\tlocal ConditionType = Operators.GetConditionType(Conditions, Condition)\n\t\treturn ConditionType ~= nil\n\t\t\tand Definition.AllowedTypes ~= nil\n\t\t\tand Definition.AllowedTypes[ConditionType] == true\n\t\t\tand typeof(Condition.Value) == ConditionType\n\tend\n\n\tlocal function NumericConditionsConflict(First, Second): boolean\n\t\tif typeof(First.Value) ~= \"number\" or typeof(Second.Value) ~= \"number\" then\n\t\t\treturn false\n\t\tend\n\n\t\tif First.Operator == \"Equals\" and Operators.IsNumericComparison(Second.Operator) then\n\t\t\treturn not Operators.Evaluate(Second.Operator, First.Value, Second.Value)\n\t\telseif Second.Operator == \"Equals\" and Operators.IsNumericComparison(First.Operator) then\n\t\t\treturn not Operators.Evaluate(First.Operator, Second.Value, First.Value)\n\t\telseif not Operators.IsNumericComparison(First.Operator) or not Operators.IsNumericComparison(Second.Operator) then\n\t\t\treturn false\n\t\tend\n\n\t\tlocal FirstIsLower = First.Operator == \"GreaterThan\" or First.Operator == \"GreaterThanOrEqual\"\n\t\tlocal SecondIsLower = Second.Operator == \"GreaterThan\" or Second.Operator == \"GreaterThanOrEqual\"\n\t\tif FirstIsLower == SecondIsLower then\n\t\t\treturn false\n\t\tend\n\n\t\tlocal Lower = if FirstIsLower then First else Second\n\t\tlocal Upper = if FirstIsLower then Second else First\n\t\treturn Lower.Value > Upper.Value\n\t\t\tor Lower.Value == Upper.Value and (Lower.Operator == \"GreaterThan\" or Upper.Operator == \"LessThan\")\n\tend\n\n\tlocal function AreInSameAndBranch(Conditions, FirstIndex: number, SecondIndex: number): boolean\n\t\tfor Index = FirstIndex + 1, SecondIndex do\n\t\t\tif Conditions[Index].Join == \"Or\" then\n\t\t\t\treturn false\n\t\t\tend\n\t\tend\n\t\treturn true\n\tend\n\n\tfunction Operators.Validate(Conditions, Adapter)\n\t\tlocal Errors = {}\n\t\tlocal Conflicts = {}\n\t\tlocal GetKey = Adapter and Adapter.GetKey or function(Condition)\n\t\t\treturn GetSubjectKey(Condition.Subject)\n\t\tend\n\t\tlocal GetLabel = Adapter and Adapter.GetLabel or function(Condition)\n\t\t\treturn FormatSubject(Condition.Subject)\n\t\tend\n\t\tlocal IsConditionValid = Adapter and Adapter.IsConditionValid or function(Condition)\n\t\t\treturn Operators.IsConditionValid(Conditions, Condition)\n\t\tend\n\n\t\tlocal function AddConflict(FirstIndex: number, SecondIndex: number, Message: string)\n\t\t\tConflicts[FirstIndex] = true\n\t\t\tConflicts[SecondIndex] = true\n\t\t\ttable.insert(Errors, Message)\n\t\tend\n\n\t\tfor Index, Condition in Conditions do\n\t\t\tif not IsConditionValid(Condition) then\n\t\t\t\tConflicts[Index] = true\n\t\t\t\ttable.insert(\n\t\t\t\t\tErrors,\n\t\t\t\t\t`{GetLabel(Condition)} has a value that is incompatible with {Operators.GetText(Condition.Operator, true)}.`\n\t\t\t\t)\n\t\t\tend\n\t\tend\n\n\t\tfor FirstIndex = 1, #Conditions do\n\t\t\tlocal First = Conditions[FirstIndex]\n\t\t\tfor SecondIndex = FirstIndex + 1, #Conditions do\n\t\t\t\tlocal Second = Conditions[SecondIndex]\n\t\t\t\tif Conflicts[FirstIndex] or Conflicts[SecondIndex] then\n\t\t\t\t\tcontinue\n\t\t\t\tend\n\t\t\t\tif GetKey(First) ~= GetKey(Second) or not AreInSameAndBranch(Conditions, FirstIndex, SecondIndex) then\n\t\t\t\t\tcontinue\n\t\t\t\tend\n\t\t\t\tlocal SubjectText = GetLabel(First)\n\n\t\t\t\tif First.Operator == \"Equals\" and Second.Operator == \"Equals\" and First.Value ~= Second.Value then\n\t\t\t\t\tAddConflict(FirstIndex, SecondIndex, `{SubjectText} cannot equal both {FormatValue(First.Value)} and {FormatValue(Second.Value)}.`)\n\t\t\t\telseif\n\t\t\t\t\tFirst.Operator == \"Equals\" and Second.Operator == \"NotEquals\" and First.Value == Second.Value\n\t\t\t\t\tor First.Operator == \"NotEquals\" and Second.Operator == \"Equals\" and First.Value == Second.Value\n\t\t\t\tthen\n\t\t\t\t\tAddConflict(FirstIndex, SecondIndex, `{SubjectText} cannot both equal and not equal {FormatValue(First.Value)}.`)\n\t\t\t\telseif First.Operator == \"TypeIs\" and Second.Operator == \"TypeIs\" and First.Value ~= Second.Value then\n\t\t\t\t\tAddConflict(FirstIndex, SecondIndex, `{SubjectText} cannot have both type {First.Value} and {Second.Value}.`)\n\t\t\t\telseif NumericConditionsConflict(First, Second) then\n\t\t\t\t\tAddConflict(FirstIndex, SecondIndex, `{SubjectText} cannot satisfy both numeric comparisons.`)\n\t\t\t\telse\n\t\t\t\t\tlocal TypeCondition\n\t\t\t\t\tlocal OtherCondition\n\t\t\t\t\tif First.Operator == \"TypeIs\" then\n\t\t\t\t\t\tTypeCondition, OtherCondition = First, Second\n\t\t\t\t\telseif Second.Operator == \"TypeIs\" then\n\t\t\t\t\t\tTypeCondition, OtherCondition = Second, First\n\t\t\t\t\tend\n\n\t\t\t\t\tif TypeCondition and OtherCondition and OtherCondition.Operator ~= \"TypeIs\" then\n\t\t\t\t\t\tlocal Definition = Registry[OtherCondition.Operator]\n\t\t\t\t\t\tlocal TypeName = tostring(TypeCondition.Value)\n\t\t\t\t\t\tif Definition and Definition.AllowedTypes and not Definition.AllowedTypes[TypeName] then\n\t\t\t\t\t\t\tAddConflict(FirstIndex, SecondIndex, `{SubjectText} has type {TypeName}, so it cannot use {Definition.SummaryText or Definition.Text}.`)\n\t\t\t\t\t\tend\n\t\t\t\t\tend\n\t\t\t\tend\n\t\t\tend\n\t\tend\n\n\t\treturn #Errors == 0, Errors, Conflicts\n\tend\n\n\twax.shared.CallFilterOperators = Operators\nend\n--#endregion\n\n--#region @include \"Src/Utils/CallFilter/RemoteFields.luau\" as \"wax.shared.CallFilterRemoteFields\"\ndo\n\tlocal Operators = wax.shared.CallFilterOperators or require(\"@src/Utils/CallFilter/Operators\")\n\n\tlocal RemoteFields = {}\n\n\tlocal RemoteClassOptions = {\n\t\t{ Value = \"RemoteEvent\", Text = \"RemoteEvent\" },\n\t\t{ Value = \"RemoteFunction\", Text = \"RemoteFunction\" },\n\t\t{ Value = \"UnreliableRemoteEvent\", Text = \"UnreliableRemoteEvent\" },\n\t\t{ Value = \"BindableEvent\", Text = \"BindableEvent\" },\n\t\t{ Value = \"BindableFunction\", Text = \"BindableFunction\" },\n\t}\n\n\tlocal Registry = {\n\t\tName = {\n\t\t\tText = \"Name\",\n\t\t\tGetValue = function(Remote)\n\t\t\t\treturn Remote.Name\n\t\t\tend,\n\t\t},\n\t\tClassName = {\n\t\t\tText = \"Class\",\n\t\t\tValueOptions = RemoteClassOptions,\n\t\t\tGetValue = function(Remote)\n\t\t\t\treturn Remote.ClassName\n\t\t\tend,\n\t\t},\n\t\tFullName = {\n\t\t\tText = \"Full path\",\n\t\t\tGetValue = function(Remote)\n\t\t\t\tlocal Success, Result = pcall(Remote.GetFullName, Remote)\n\t\t\t\treturn Success and Result or Remote.Name\n\t\t\tend,\n\t\t},\n\t}\n\n\tlocal Order = { \"Name\", \"ClassName\", \"FullName\" }\n\tlocal StringOperators = {\n\t\tEquals = true,\n\t\tNotEquals = true,\n\t\tContains = true,\n\t\tStartsWith = true,\n\t\tEndsWith = true,\n\t}\n\n\tfunction RemoteFields.Get(Field)\n\t\treturn Registry[Field]\n\tend\n\n\tfunction RemoteFields.GetOptions()\n\t\tlocal Options = {}\n\t\tfor _, Field in Order do\n\t\t\ttable.insert(Options, {\n\t\t\t\tValue = Field,\n\t\t\t\tText = Registry[Field].Text,\n\t\t\t})\n\t\tend\n\t\treturn Options\n\tend\n\n\tfunction RemoteFields.GetNames()\n\t\treturn table.clone(Order)\n\tend\n\n\tfunction RemoteFields.GetText(Field): string\n\t\tlocal Definition = Registry[Field]\n\t\treturn Definition and Definition.Text or tostring(Field)\n\tend\n\n\tfunction RemoteFields.GetValueOptions(Field)\n\t\tlocal Definition = Registry[Field]\n\t\treturn Definition and Definition.ValueOptions and table.clone(Definition.ValueOptions) or nil\n\tend\n\n\tfunction RemoteFields.IsValueAllowed(Field, Value): boolean\n\t\tlocal Options = RemoteFields.GetValueOptions(Field)\n\t\tif not Options then\n\t\t\treturn typeof(Value) == \"string\"\n\t\tend\n\n\t\tfor _, Option in Options do\n\t\t\tif Option.Value == Value then\n\t\t\t\treturn true\n\t\t\tend\n\t\tend\n\t\treturn false\n\tend\n\n\tfunction RemoteFields.IsOperatorAllowed(Operator, Field): boolean\n\t\tif Field == \"ClassName\" then\n\t\t\treturn Operator == \"Equals\" or Operator == \"NotEquals\"\n\t\tend\n\t\treturn StringOperators[Operator] == true\n\tend\n\n\tfunction RemoteFields.IsConditionValid(Condition): boolean\n\t\treturn Registry[Condition.Field] ~= nil\n\t\t\tand RemoteFields.IsOperatorAllowed(Condition.Operator, Condition.Field)\n\t\t\tand RemoteFields.IsValueAllowed(Condition.Field, Condition.Value)\n\tend\n\n\tfunction RemoteFields.Validate(Conditions)\n\t\treturn Operators.Validate(Conditions, {\n\t\t\tGetKey = function(Condition)\n\t\t\t\treturn Condition.Field\n\t\t\tend,\n\t\t\tGetLabel = function(Condition)\n\t\t\t\treturn RemoteFields.GetText(Condition.Field)\n\t\t\tend,\n\t\t\tIsConditionValid = RemoteFields.IsConditionValid,\n\t\t})\n\tend\n\n\tfunction RemoteFields.Matches(Conditions, Remote): boolean\n\t\treturn Operators.Matches(Conditions, function(Condition)\n\t\t\tlocal Definition = Registry[Condition.Field]\n\t\t\treturn Definition and Definition.GetValue(Remote) or nil\n\t\tend)\n\tend\n\n\twax.shared.CallFilterRemoteFields = RemoteFields\nend\n--#endregion\n\n--#region @include \"Src/Utils/CallFilter/Schema.luau\" as \"wax.shared.CallFilterSchema\"\ndo\n\t--// Imports \\\\--\n\tlocal Validation = wax.shared.Validation or require(\"@src/Utils/Validation\")\n\tlocal Operators = wax.shared.CallFilterOperators or require(\"@src/Utils/CallFilter/Operators\")\n\tlocal RemoteFields = wax.shared.CallFilterRemoteFields or require(\"@src/Utils/CallFilter/RemoteFields\")\n\n\tlocal Schema = Validation.Schema\n\n\t--// Helpers \\\\--\n\tlocal function GetOperatorNames()\n\t\tlocal Names = {}\n\t\tfor _, Option in Operators.GetOptions() do\n\t\t\ttable.insert(Names, Option.Value)\n\t\tend\n\t\treturn Names\n\tend\n\n\tlocal function IsConditionValueValid(Condition): boolean\n\t\treturn Operators.IsConditionValid({ Condition }, Condition)\n\tend\n\n\tlocal function HasNoConditionConflicts(Conditions): boolean\n\t\treturn Operators.Validate(Conditions)\n\tend\n\n\t--// Schemas \\\\--\n\tlocal Remote = Schema.instance():refine(function(Value)\n\t\treturn RemoteFields.IsValueAllowed(\"ClassName\", Value.ClassName)\n\tend, \"must be a supported remote\")\n\n\tlocal Subject = Schema.object({\n\t\tType = Schema.enum({ \"Argument\", \"ArgumentCount\" }),\n\t\tIndex = Schema.number():integer():min(1):optional(),\n\t}):refine(function(Value)\n\t\treturn Value.Type == \"ArgumentCount\" and Value.Index == nil or Value.Type == \"Argument\" and Value.Index ~= nil\n\tend, \"must provide an index only for argument subjects\")\n\n\tlocal Condition = Schema.object({\n\t\tSubject = Subject,\n\t\tOperator = Schema.enum(GetOperatorNames()),\n\t\tValue = Schema.any():optional(),\n\t\tJoin = Schema.enum({ \"And\", \"Or\" }):optional(),\n\t}):refine(IsConditionValueValid, \"has a value that is incompatible with its operator\")\n\n\tlocal ConditionArray = Schema.array(Condition):refine(HasNoConditionConflicts, \"contains conflicting conditions\")\n\tlocal Conditions = ConditionArray:default({})\n\n\tlocal RemoteCondition = Schema.object({\n\t\tField = Schema.enum(RemoteFields.GetNames()),\n\t\tOperator = Schema.enum(GetOperatorNames()),\n\t\tValue = Schema.string(),\n\t\tJoin = Schema.enum({ \"And\", \"Or\" }):optional(),\n\t}):refine(RemoteFields.IsConditionValid, \"has an operator or value that is incompatible with its field\")\n\n\tlocal RemoteConditions = Schema.array(RemoteCondition):refine(function(Value)\n\t\treturn #Value > 0 and RemoteFields.Validate(Value)\n\tend, \"must contain at least one non-conflicting remote condition\")\n\n\tlocal Target = Schema.union({\n\t\tSchema.object({\n\t\t\tType = Schema.literal(\"Instance\"),\n\t\t\tRemote = Remote,\n\t\t}),\n\t\tSchema.object({\n\t\t\tType = Schema.literal(\"Query\"),\n\t\t\tConditions = RemoteConditions,\n\t\t}),\n\t})\n\n\tlocal Filter = Schema.object({\n\t\tId = Schema.string():optional(),\n\t\tEnabled = Schema.boolean():default(true),\n\t\tTarget = Target,\n\t\tDirection = Schema.enum({ \"Outgoing\", \"Incoming\", \"Any\" }),\n\t\tConditions = Conditions,\n\t\tAction = Schema.enum({ \"Ignore\", \"Block\", \"Highlight\" }):default(\"Ignore\"),\n\t})\n\n\tlocal Update = Schema.object({\n\t\tEnabled = Schema.boolean():optional(),\n\t\tTarget = Target:optional(),\n\t\tDirection = Schema.enum({ \"Outgoing\", \"Incoming\", \"Any\" }):optional(),\n\t\tConditions = ConditionArray:optional(),\n\t\tAction = Schema.enum({ \"Ignore\", \"Block\", \"Highlight\" }):optional(),\n\t})\n\n\twax.shared.CallFilterSchema = {\n\t\tRemote = Remote,\n\t\tSubject = Subject,\n\t\tCondition = Condition,\n\t\tConditions = Conditions,\n\t\tRemoteCondition = RemoteCondition,\n\t\tRemoteConditions = RemoteConditions,\n\t\tTarget = Target,\n\t\tFilter = Filter,\n\t\tUpdate = Update,\n\t}\nend\n--#endregion\n\n--#region @include \"Src/Utils/CallFilter/Manager.luau\" as \"wax.shared.CallFilters\"\ndo\n\tlocal Operators = wax.shared.CallFilterOperators or require(\"@src/Utils/CallFilter/Operators\")\n\tlocal InstanceSerializer = wax.shared.InstanceSerializer or require(\"@src/Utils/CodeGen/Serializer/Instance\")\n\tlocal Validation = wax.shared.Validation or require(\"@src/Utils/Validation\")\n\tlocal CallFilterSchema = wax.shared.CallFilterSchema or require(\"@src/Utils/CallFilter/Schema\")\n\tlocal RemoteFields = wax.shared.CallFilterRemoteFields or require(\"@src/Utils/CallFilter/RemoteFields\")\n\n\tlocal CallFilters = {\n\t\tItems = {},\n\t\tById = {},\n\t\tListeners = {},\n\t}\n\n\tlocal ActionPriorities = {\n\t\tHighlight = 1,\n\t\tIgnore = 2,\n\t\tBlock = 3,\n\t}\n\n\tlocal function Validate(Data, DataSchema, Context: string)\n\t\tlocal IsValid, Result, Errors = Validation.ValidateSchema(Data, DataSchema)\n\t\tassert(IsValid, `{Context}: {Errors[1] or \"validation failed\"}`)\n\t\treturn Result\n\tend\n\n\tlocal function CopyFilter(Filter)\n\t\tlocal Copy = table.clone(Filter)\n\t\tCopy.Conditions = {}\n\n\t\tfor _, Condition in Filter.Conditions or {} do\n\t\t\tlocal ConditionCopy = table.clone(Condition)\n\t\t\tConditionCopy.Subject = table.clone(Condition.Subject)\n\t\t\ttable.insert(Copy.Conditions, ConditionCopy)\n\t\tend\n\n\t\tCopy.Target = table.clone(Filter.Target)\n\t\tif Filter.Target.Type == \"Query\" then\n\t\t\tCopy.Target.Conditions = {}\n\t\t\tfor _, Condition in Filter.Target.Conditions do\n\t\t\t\ttable.insert(Copy.Target.Conditions, table.clone(Condition))\n\t\t\tend\n\t\tend\n\n\t\tCopy.Enabled = Filter.Enabled ~= false\n\t\treturn Copy\n\tend\n\n\tlocal function EmitChanged()\n\t\tlocal Snapshot = CallFilters:GetAll()\n\t\tfor Listener in CallFilters.Listeners do\n\t\t\tif task then\n\t\t\t\ttask.spawn(Listener, Snapshot)\n\t\t\telse\n\t\t\t\tListener(Snapshot)\n\t\t\tend\n\t\tend\n\tend\n\n\tfunction CallFilters:GetAll()\n\t\tlocal Filters = {}\n\t\tfor _, Filter in self.Items do\n\t\t\ttable.insert(Filters, CopyFilter(Filter))\n\t\tend\n\t\treturn Filters\n\tend\n\n\tfunction CallFilters:Get(Id: string)\n\t\tlocal Filter = self.ById[Id]\n\t\treturn Filter and CopyFilter(Filter) or nil\n\tend\n\n\tfunction CallFilters:Add(Filter)\n\t\tlocal Copy = Validate(Filter, CallFilterSchema.Filter, \"Invalid call filter\")\n\t\tCopy.Id = Copy.Id or wax.shared.HttpService:GenerateGUID(false)\n\t\tassert(not self.ById[Copy.Id], `A call filter with id {Copy.Id} already exists`)\n\n\t\ttable.insert(self.Items, Copy)\n\t\tself.ById[Copy.Id] = Copy\n\t\tEmitChanged()\n\t\treturn CopyFilter(Copy)\n\tend\n\n\tfunction CallFilters:Update(Id: string, Changes)\n\t\tlocal Filter = self.ById[Id]\n\t\tif not Filter then\n\t\t\treturn nil\n\t\tend\n\n\t\tlocal ValidChanges = Validate(Changes, CallFilterSchema.Update, \"Invalid call filter update\")\n\t\tlocal Updated = CopyFilter(Filter)\n\t\tfor Key, Value in ValidChanges do\n\t\t\tUpdated[Key] = Value\n\t\tend\n\t\tUpdated = Validate(Updated, CallFilterSchema.Filter, \"Invalid updated call filter\")\n\n\t\tlocal Index = table.find(self.Items, Filter)\n\t\tif Index then\n\t\t\tself.Items[Index] = Updated\n\t\tend\n\t\tself.ById[Id] = Updated\n\n\t\tEmitChanged()\n\t\treturn CopyFilter(Updated)\n\tend\n\n\tfunction CallFilters:SetEnabled(Id: string, Enabled: boolean)\n\t\treturn self:Update(Id, { Enabled = Enabled })\n\tend\n\n\tfunction CallFilters:Remove(Id: string): boolean\n\t\tlocal Filter = self.ById[Id]\n\t\tif not Filter then\n\t\t\treturn false\n\t\tend\n\n\t\tself.ById[Id] = nil\n\t\tlocal Index = table.find(self.Items, Filter)\n\t\tif Index then\n\t\t\ttable.remove(self.Items, Index)\n\t\tend\n\t\tEmitChanged()\n\t\treturn true\n\tend\n\n\tfunction CallFilters:ReplaceAll(Filters, Silent: boolean?)\n\t\tlocal Validated = Validate(Filters or {}, Validation.Schema.array(CallFilterSchema.Filter), \"Invalid call filters\")\n\t\tlocal SeenIds = {}\n\t\tfor _, Filter in Validated do\n\t\t\tFilter.Id = Filter.Id or wax.shared.HttpService:GenerateGUID(false)\n\t\t\tassert(not SeenIds[Filter.Id], `A call filter with id {Filter.Id} already exists`)\n\t\t\tSeenIds[Filter.Id] = true\n\t\tend\n\n\t\ttable.clear(self.Items)\n\t\ttable.clear(self.ById)\n\t\tfor _, Filter in Validated do\n\t\t\ttable.insert(self.Items, Filter)\n\t\t\tself.ById[Filter.Id] = Filter\n\t\tend\n\n\t\tif not Silent then\n\t\t\tEmitChanged()\n\t\tend\n\tend\n\n\tfunction CallFilters:Subscribe(Listener)\n\t\tself.Listeners[Listener] = true\n\t\tListener(self:GetAll())\n\n\t\tlocal Subscription = {}\n\t\tfunction Subscription:Disconnect()\n\t\t\tCallFilters.Listeners[Listener] = nil\n\t\tend\n\t\treturn Subscription\n\tend\n\n\tfunction CallFilters:Match(Remote: Instance, Direction: string, Arguments)\n\t\tlocal WinningAction\n\t\tlocal WinningFilter\n\t\tlocal WinningPriority = 0\n\n\t\tfor _, Filter in self.Items do\n\t\t\tlocal TargetMatches = if Filter.Target.Type == \"Instance\"\n\t\t\t\tthen InstanceSerializer.IsEqualToInstance(Filter.Target.Remote, Remote)\n\t\t\t\telse RemoteFields.Matches(Filter.Target.Conditions, Remote)\n\t\t\tif\n\t\t\t\tFilter.Enabled\n\t\t\t\tand (Filter.Direction == \"Any\" or Filter.Direction == Direction)\n\t\t\t\tand TargetMatches\n\t\t\t\tand Operators.MatchesConditions(Filter.Conditions, Arguments)\n\t\t\tthen\n\t\t\t\tlocal Priority = ActionPriorities[Filter.Action] or 0\n\t\t\t\tif Priority > WinningPriority then\n\t\t\t\t\tWinningAction = Filter.Action\n\t\t\t\t\tWinningFilter = Filter\n\t\t\t\t\tWinningPriority = Priority\n\t\t\t\tend\n\t\t\tend\n\t\tend\n\n\t\treturn WinningAction, WinningFilter and CopyFilter(WinningFilter) or nil\n\tend\n\n\tfunction CallFilters:Resolve(Remote: Instance, Direction: string, Info)\n\t\tlocal Action, Filter = self:Match(Remote, Direction, Info.Arguments or {})\n\t\tif Action == \"Highlight\" then\n\t\t\tInfo.Highlighted = true\n\t\t\tInfo.CallFilterId = Filter.Id\n\t\telseif Action then\n\t\t\tInfo.CallFilterId = Filter.Id\n\t\tend\n\t\treturn Action, Filter\n\tend\n\n\twax.shared.CallFilters = CallFilters\nend\n--#endregion\n\n--#region @include region IsPlayerModule\nwax.shared.IsPlayerModule = function(Origin: LocalScript | ModuleScript, Instance: Instance): boolean\n\tif Instance and Instance.ClassName ~= \"BindableEvent\" then\n\t\treturn false\n\tend\n\n\tif not Origin or typeof(Origin) ~= \"Instance\" or not Origin.IsA(Origin, \"LuaSourceContainer\") then\n\t\treturn false\n\tend\n\n\tlocal PlayerModule = Origin and Origin.FindFirstAncestor(Origin, \"PlayerModule\") or nil\n\tif not PlayerModule then\n\t\treturn false\n\tend\n\n\tif PlayerModule.Parent == nil then\n\t\treturn true\n\tend\n\n\tif wax.shared.PlayerScripts then\n\t\treturn compareinstances(PlayerModule.Parent, wax.shared.PlayerScripts)\n\tend\n\n\treturn false\nend\nwax.shared.ShouldIgnore = function(Instance, Origin)\n\tif not wax.shared.Settings.LogRobloxInternalEvents.Value then\n\t\tif Instance.IsDescendantOf(Instance, wax.shared.RobloxReplicatedStorage) then\n\t\t\treturn true\n\t\tend\n\tend\n\n\treturn wax.shared.Settings.IgnoredRemotesDropdown.Value[Instance.ClassName] == true\n\t\tor (wax.shared.Settings.IgnorePlayerModule.Value and wax.shared.IsPlayerModule(Origin, Instance))\nend\n--#endregion\n\n--#region @include \"Src/Utils/Log.luau\" as \"wax.shared.Log\"\ndo\n\tlocal Log = {}\n\tLog.__index = Log\n\n\tlocal PendingCallDecisions = setmetatable({}, { __mode = \"k\" })\n\n\t-- `tostring(table)` is used as the pending-decision key and is needed twice per\n\t-- call (ShouldBlock + Call).  Remembering the key per info table halves that\n\t-- work and keeps both lookups on the same interned string.\n\tlocal CallDecisionKeys = setmetatable({}, { __mode = \"k\" })\n\n\t-- clonefunction() allocates a brand new closure every time it runs, and the\n\t-- same calling scripts are cloned over and over.  Clones are cached against the\n\t-- original closure (weak keys: once the game drops the original, the clone goes\n\t-- with it).\n\tlocal FunctionClones = setmetatable({}, { __mode = \"k\" })\n\n\tlocal function GetDecisionKey(RawInfo): string\n\t\tlocal Key = CallDecisionKeys[RawInfo]\n\t\tif not Key then\n\t\t\tKey = tostring(RawInfo)\n\t\t\tCallDecisionKeys[RawInfo] = Key\n\t\tend\n\n\t\treturn Key\n\tend\n\n\tlocal function CloneFunction(Function)\n\t\tlocal Cached = FunctionClones[Function]\n\t\tif Cached then\n\t\t\treturn Cached\n\t\tend\n\n\t\tif not clonefunction then\n\t\t\treturn Function\n\t\tend\n\n\t\tlocal Clone = clonefunction(Function)\n\t\tFunctionClones[Function] = Clone\n\t\treturn Clone\n\tend\n\n\t--[[\n\t\tCall retention limit.\n\n\t\tEvery captured call keeps a deep-cloned copy of its arguments alive for the\n\t\trest of the session.  On a chatty game (and especially on a phone, where the\n\t\tOS is quick to kill apps that grow) that is unbounded memory growth, so each\n\t\tremote keeps at most `MaxCallsPerRemote` calls and drops the oldest ones.\n\t\tThe limit is configurable in Settings (Capture -> Calls Kept Per Remote).\n\n\t\t`MaxCallsPerRemote` is cached: reading it through SaveManager validates the\n\t\twhole schema, which must not happen once per intercepted call.\n\t]]\n\tlocal DefaultMaxCallsPerRemote = 500\n\tlocal CallCapSlack = 32\n\tlocal CachedCallCap = nil\n\n\tlocal function GetSettingBoolean(Key: string, Default: boolean): boolean\n\t\tlocal Controls = wax.shared.Settings\n\t\tlocal Control = Controls and Controls[Key]\n\t\tif Control and Control.Value ~= nil then\n\t\t\treturn Control.Value == true\n\t\tend\n\n\t\tlocal SaveManager = wax.shared.SaveManager\n\t\tlocal Success, Value = pcall(function()\n\t\t\treturn SaveManager:GetState(Key, Default)\n\t\tend)\n\n\t\treturn if Success and Value ~= nil then Value == true else Default\n\tend\n\n\tlocal function GetMaxCallsPerRemote(): number\n\t\tlocal Controls = wax.shared.Settings\n\t\tlocal Control = Controls and Controls[\"MaxCallsPerRemote\"]\n\n\t\tif Control and Control.Value ~= nil then\n\t\t\tlocal Value = tonumber(Control.Value)\n\t\t\tif Value and Value >= 1 then\n\t\t\t\tCachedCallCap = math.floor(Value)\n\t\t\t\treturn CachedCallCap\n\t\t\tend\n\t\tend\n\n\t\tif CachedCallCap then\n\t\t\treturn CachedCallCap\n\t\tend\n\n\t\tlocal SaveManager = wax.shared.SaveManager\n\t\tlocal Success, Value = pcall(function()\n\t\t\treturn SaveManager:GetState(\"MaxCallsPerRemote\", DefaultMaxCallsPerRemote)\n\t\tend)\n\n\t\tCachedCallCap = math.floor(tonumber(Success and Value or DefaultMaxCallsPerRemote) or DefaultMaxCallsPerRemote)\n\t\tif CachedCallCap < 1 then\n\t\t\tCachedCallCap = DefaultMaxCallsPerRemote\n\t\tend\n\n\t\treturn CachedCallCap\n\tend\n\n\t--[[\n\t\tDevice-tiered budget lookup.\n\n\t\t`src/init.luau` publishes `wax.shared.DeviceProfile` (line 33) long before it\n\t\trequires this module (line 570), so the tier presets are already final here.\n\n\t\tThis is deliberately *not* `require(\"@src/Utils/DeviceProfile\")`: tools/bundle.py\n\t\tinlines this whole file into the generated actor environment, which runs as a\n\t\tstandalone chunk in another state.  That chunk has no wax `require` and no\n\t\tDeviceProfile, so a require here is a hard error at actor start\n\t\t(\"Expected ':' not '.' calling member function require\").  Every other\n\t\trequire that ends up inlined there is guarded by `wax.shared.X or require(...)`;\n\t\tthis module simply stays require-free and falls back to the \"high\" tier\n\t\tpresets, which match `DeviceProfile.MaxPendingNotifications` /\n\t\t`DeviceProfile.MaxNotificationsPerHeartbeat`.\n\t]]\n\tlocal function ProfileValue(Key: string, Default: number): number\n\t\tlocal Profile = wax.shared.DeviceProfile\n\t\tlocal Value = Profile and Profile[Key]\n\n\t\tif type(Value) == \"number\" then\n\t\t\treturn Value\n\t\tend\n\n\t\treturn Default\n\tend\n\n\t-- The producer is on a remote hook, while the consumer is the UI heartbeat.\n\t-- Keep the hand-off bounded and coalesce updates for the same remote.  A noisy\n\t-- remote therefore costs one small notification per frame, not one table per\n\t-- packet.  The caps come from the device tier preset, captured once at module\n\t-- load.\n\tlocal MaxPendingNotifications = ProfileValue(\"MaxPendingNotifications\", 256)\n\tlocal MaxNotificationsPerHeartbeat = ProfileValue(\"MaxNotificationsPerHeartbeat\", 96)\n\twax.shared.LogNotificationQueue = {\n\t\tItems = {},\n\t\tHead = 1,\n\t\tTail = 0,\n\t\tPendingByLog = setmetatable({}, { __mode = \"k\" }),\n\t\tDropped = 0,\n\t}\n\n\tlocal function QueueNotification(LogObject, CallIndex: number, Call)\n\t\tlocal Queue = wax.shared.LogNotificationQueue\n\t\tlocal Existing = Queue.PendingByLog[LogObject]\n\t\tif Existing then\n\t\t\tExisting.CallIndex = CallIndex\n\t\t\tExisting.Call = Call or LogObject.Calls[CallIndex]\n\t\t\tExisting.Suppressed = (Existing.Suppressed or 0) + 1\n\t\t\treturn\n\t\tend\n\n\t\tlocal Pending = Queue.Tail - Queue.Head + 1\n\t\twhile Pending >= MaxPendingNotifications do\n\t\t\tlocal Oldest = Queue.Items[Queue.Head]\n\t\t\tQueue.Items[Queue.Head] = nil\n\t\t\tQueue.Head += 1\n\t\t\tPending -= 1\n\t\t\tQueue.Dropped += 1\n\t\t\tif Oldest and Oldest.Log then\n\t\t\t\tQueue.PendingByLog[Oldest.Log] = nil\n\t\t\tend\n\t\tend\n\n\t\tif Queue.Head > Queue.Tail then\n\t\t\ttable.clear(Queue.Items)\n\t\t\tQueue.Head = 1\n\t\t\tQueue.Tail = 0\n\t\tend\n\n\t\tlocal Notification = {\n\t\t\tInstance = LogObject.Instance,\n\t\t\tType = LogObject.Type,\n\t\t\tLogIndex = LogObject.Index,\n\t\t\tCallIndex = CallIndex,\n\t\t\t-- Direct references avoid another DebugId lookup on the UI thread.\n\t\t\tLog = LogObject,\n\t\t\tCall = Call or LogObject.Calls[CallIndex],\n\t\t\tSuppressed = 0,\n\t\t}\n\t\tQueue.Tail += 1\n\t\tQueue.Items[Queue.Tail] = Notification\n\t\tQueue.PendingByLog[LogObject] = Notification\n\tend\n\n\tlocal SpamCallCountThreshold = 120\n\tlocal SpamTimeWindowSeconds = 1\n\n\t--[[\n\t\tHard capture valves.\n\n\t\tThese are pure frame-time / memory protection: when they trip the capture\n\t\tis dropped, nothing else.  An earlier revision also called `Log:Ignore()`\n\t\there, and because the *global* valve is shared by every remote, one spammy\n\t\tevent marked every other remote as ignored for the whole session - the\n\t\tinspector then showed an empty list while the game kept running.  Dropping\n\t\tcaptures keeps the UI truthful; ignoring remotes is an explicit, opt-in\n\t\tbehaviour (Settings -> Auto-ignore High-frequency Calls) that only engages\n\t\tafter a remote overflows its *own* budget for several consecutive windows.\n\t]]\n\tlocal HardCaptureLimitPerRemote = 500\n\tlocal HardCaptureLimitGlobal = 2500\n\tlocal GlobalCaptureWindowStart = 0\n\tlocal GlobalCaptureCount = 0\n\tlocal AutoIgnoreSpammyEvents = false\n\n\t-- Windows in a row a remote must overflow its own budget before the opt-in\n\t-- auto-ignore engages.  A single busy frame never marks a remote as ignored.\n\tlocal SustainedOverflowWindows = 2\n\n\tdo\n\t\tlocal Success, Value = pcall(function()\n\t\t\treturn wax.shared.SaveManager:GetState(\"AutoIgnoreSpammyEvents\", false)\n\t\tend)\n\t\tif Success then\n\t\t\tAutoIgnoreSpammyEvents = Value == true\n\t\tend\n\tend\n\n\tlocal function ShouldAutoIgnore(): boolean\n\t\tlocal Control = wax.shared.Settings and wax.shared.Settings.AutoIgnoreSpammyEvents\n\t\tif Control and Control.Value ~= nil then\n\t\t\treturn Control.Value == true\n\t\tend\n\t\treturn AutoIgnoreSpammyEvents\n\tend\n\n\tlocal function RejectCapture(LogObject, Now: number): boolean\n\t\tif Now - LogObject.SpamWindowStart >= SpamTimeWindowSeconds then\n\t\t\t-- Roll the overflow streak over: a window that ended in overflow keeps\n\t\t\t-- the streak alive, a quiet one resets it.\n\t\t\tLogObject.OverflowStreak = LogObject.OverflowedThisWindow and (LogObject.OverflowStreak or 0) + 1 or 0\n\t\t\tLogObject.OverflowedThisWindow = false\n\t\t\tLogObject.SpamWindowStart = Now\n\t\t\tLogObject.SpamCallCount = 0\n\t\tend\n\n\t\tif Now - GlobalCaptureWindowStart >= SpamTimeWindowSeconds then\n\t\t\tGlobalCaptureWindowStart = Now\n\t\t\tGlobalCaptureCount = 0\n\t\tend\n\n\t\t-- Global valve: protect the frame budget only.  The capture is dropped and\n\t\t-- the remote stays visible; ignoring an unrelated remote here is what used\n\t\t-- to empty the whole list.\n\t\tif GlobalCaptureCount >= HardCaptureLimitGlobal then\n\t\t\tLogObject.SuppressedCalls += 1\n\t\t\treturn true\n\t\tend\n\n\t\tif LogObject.SpamCallCount >= HardCaptureLimitPerRemote then\n\t\t\tLogObject.SuppressedCalls += 1\n\t\t\tLogObject.OverflowedThisWindow = true\n\n\t\t\t-- Opt-in auto-ignore: only this remote, only after it sustained the\n\t\t\t-- overflow across consecutive windows.\n\t\t\tif\n\t\t\t\tShouldAutoIgnore()\n\t\t\t\tand not LogObject.Ignored\n\t\t\t\tand (LogObject.OverflowStreak or 0) + 1 >= SustainedOverflowWindows\n\t\t\tthen\n\t\t\t\tLogObject:Ignore()\n\t\t\t\tlocal Sonner = wax.shared.Sonner\n\t\t\t\tif Sonner then\n\t\t\t\t\tlocal InstanceName = LogObject.Instance and LogObject.Instance.Name or \"remote\"\n\t\t\t\t\tpcall(Sonner.info, Sonner, `Ignored {InstanceName} ({LogObject.Type}) after sustained event spam.`)\n\t\t\t\tend\n\t\t\tend\n\t\t\treturn true\n\t\tend\n\n\t\tLogObject.SpamCallCount += 1\n\t\tGlobalCaptureCount += 1\n\t\treturn false\n\tend\n\n\tif not wax.shared.IS_ACTOR then\n\t\twax.shared.Connect(wax.shared.RunService.Heartbeat:Connect(function()\n\t\t\tlocal Queue = wax.shared.LogNotificationQueue\n\t\t\tif Queue.Head > Queue.Tail then\n\t\t\t\treturn\n\t\t\tend\n\n\t\t\tlocal Batch = table.create(math.min(MaxNotificationsPerHeartbeat, Queue.Tail - Queue.Head + 1))\n\t\t\tlocal BatchSize = 0\n\t\t\twhile Queue.Head <= Queue.Tail and BatchSize < MaxNotificationsPerHeartbeat do\n\t\t\t\tlocal Notification = Queue.Items[Queue.Head]\n\t\t\t\tQueue.Items[Queue.Head] = nil\n\t\t\t\tQueue.Head += 1\n\t\t\t\tif Notification then\n\t\t\t\t\tQueue.PendingByLog[Notification.Log] = nil\n\t\t\t\t\tBatchSize += 1\n\t\t\t\t\tBatch[BatchSize] = Notification\n\t\t\t\tend\n\t\t\tend\n\n\t\t\tif Queue.Head > Queue.Tail then\n\t\t\t\ttable.clear(Queue.Items)\n\t\t\t\tQueue.Head = 1\n\t\t\t\tQueue.Tail = 0\n\t\t\tend\n\n\t\t\tif BatchSize > 0 then\n\t\t\t\tlocal Communicator = wax.shared.Communicator\n\t\t\t\tif Communicator then\n\t\t\t\t\tCommunicator:Fire(Batch)\n\t\t\t\tend\n\t\t\t\ttable.clear(Batch)\n\t\t\tend\n\t\tend))\n\tend\n\n\n\tlocal FunctionToMetatadata, FixTable\n\tdo\n\t\tif wax.shared.IS_ACTOR then\n\t\t\tlocal FunctionMetadataCache = setmetatable({}, { __mode = \"k\" })\n\n\t\t\tlocal function CreateTraversalState(Refs)\n\t\t\t\treturn {\n\t\t\t\t\tCyclicRefs = Refs or {},\n\t\t\t\t\tTableIds = setmetatable({}, { __mode = \"k\" }),\n\t\t\t\t\tFunctions = setmetatable({}, { __mode = \"k\" }),\n\t\t\t\t\tNextId = 0,\n\t\t\t\t}\n\t\t\tend\n\n\t\t\tlocal function GenerateId(State)\n\t\t\t\tState.NextId += 1\n\t\t\t\treturn State.NextId\n\t\t\tend\n\n\t\t\tFixTable = function(Table, State)\n\t\t\t\tif not Table then\n\t\t\t\t\treturn nil\n\t\t\t\tend\n\n\t\t\t\tif not State or not State.CyclicRefs then\n\t\t\t\t\tState = CreateTraversalState(State)\n\t\t\t\tend\n\n\t\t\t\tlocal CyclicRefs = State.CyclicRefs\n\t\t\t\tlocal TableId = State.TableIds[Table]\n\t\t\t\tif not TableId then\n\t\t\t\t\tTableId = GenerateId(State)\n\t\t\t\t\tState.TableIds[Table] = TableId\n\t\t\t\tend\n\n\t\t\t\tlocal OutputTable = {}\n\t\t\t\tCyclicRefs[TableId] = OutputTable\n\n\t\t\t\tlocal ContainsCyclicRef = false\n\n\t\t\t\tfor Key, Value in next, Table do\n\t\t\t\t\tif type(Value) == \"table\" then\n\t\t\t\t\t\tlocal ExistingId = State.TableIds[Value]\n\t\t\t\t\t\tif ExistingId then\n\t\t\t\t\t\t\tContainsCyclicRef = true\n\n\t\t\t\t\t\t\tOutputTable[Key] = {\n\t\t\t\t\t\t\t\t__CyclicRef = true,\n\t\t\t\t\t\t\t\t__Id = ExistingId,\n\t\t\t\t\t\t\t}\n\t\t\t\t\t\t\tcontinue\n\t\t\t\t\t\tend\n\n\t\t\t\t\t\tif getmetatable(Value) then\n\t\t\t\t\t\t\tOutputTable[Key] =\n\t\t\t\t\t\t\t\t\"Cobalt: Impossible to bridge table with metatable from actor Environment to main Environment\"\n\t\t\t\t\t\t\tcontinue\n\t\t\t\t\t\tend\n\n\t\t\t\t\t\tlocal Result, _, ContainsCyclic = FixTable(Value, State)\n\t\t\t\t\t\tif not Result then\n\t\t\t\t\t\t\tcontinue\n\t\t\t\t\t\tend\n\n\t\t\t\t\t\tOutputTable[Key] = Result\n\t\t\t\t\t\tContainsCyclicRef = ContainsCyclicRef or ContainsCyclic\n\t\t\t\t\telseif type(Value) == \"function\" then\n\t\t\t\t\t\tOutputTable[Key] = FunctionToMetatadata(Value, State)\n\t\t\t\t\telse\n\t\t\t\t\t\tOutputTable[Key] = Value\n\t\t\t\t\tend\n\t\t\t\tend\n\n\t\t\t\treturn OutputTable, CyclicRefs, ContainsCyclicRef\n\t\t\tend\n\n\t\t\tFunctionToMetatadata = function(Function, State)\n\t\t\t\tif not Function then\n\t\t\t\t\treturn nil\n\t\t\t\tend\n\n\t\t\t\tif not State or not State.CyclicRefs then\n\t\t\t\t\tState = CreateTraversalState()\n\t\t\t\tend\n\n\t\t\t\tlocal CachedMetadata = FunctionMetadataCache[Function]\n\t\t\t\tif CachedMetadata then\n\t\t\t\t\treturn CachedMetadata\n\t\t\t\tend\n\n\t\t\t\tlocal Metadata = {\n\t\t\t\t\tAddress = tostring(Function),\n\t\t\t\t\tName = debug.info(Function, \"n\"),\n\t\t\t\t\tSource = debug.info(Function, \"s\"),\n\t\t\t\t\tIsC = iscclosure(Function),\n\t\t\t\t}\n\n\t\t\t\tif State.Functions[Function] then\n\t\t\t\t\tMetadata[\"Recursive\"] = true\n\t\t\t\t\tMetadata[\"Validation\"] = Data.Token\n\t\t\t\t\tMetadata[\"__Function\"] = true\n\n\t\t\t\t\treturn Metadata\n\t\t\t\tend\n\n\t\t\t\tState.Functions[Function] = true\n\n\t\t\t\tif not iscclosure(Function) then\n\t\t\t\t\tMetadata[\"Upvalues\"] = debug.getupvalues and #debug.getupvalues(Function) or 0\n\t\t\t\t\tMetadata[\"Constants\"] = debug.getconstants and #debug.getconstants(Function) or 0\n\t\t\t\t\tMetadata[\"Protos\"] = debug.getprotos and #debug.getprotos(Function) or 0\n\n\t\t\t\t\tif getfunctionhash then\n\t\t\t\t\t\tMetadata[\"FunctionHash\"] = getfunctionhash(Function)\n\t\t\t\t\tend\n\t\t\t\tend\n\n\t\t\t\t\n\t\t\t\tMetadata[\"Validation\"] = Data.Token\n\t\t\t\tMetadata[\"__Function\"] = true\n\n\t\t\t\tFunctionMetadataCache[Function] = Metadata\n\n\t\t\t\treturn Metadata\n\t\t\tend\n\t\tend\n\tend\n\n\n\tfunction DeepClone(OriginalValue, ValueCopies)\n\t\tif wax.shared.IS_ACTOR then\n\t\t\treturn OriginalValue\n\t\tend\n\n\t\tlocal OriginalType = type(OriginalValue)\n\t\tif OriginalType ~= \"table\" then\n\t\t\tif OriginalType == \"string\" or OriginalType == \"number\" or OriginalType == \"boolean\" or OriginalValue == nil then\n\t\t\t\treturn OriginalValue\n\t\t\tend\n\n\t\t\tlocal RobloxType = typeof(OriginalValue)\n\t\t\tif RobloxType == \"Instance\" then\n\t\t\t\treturn cloneref(OriginalValue)\n\t\t\n\t\t\telseif RobloxType == \"userdata\" then\n\t\t\t\tif getmetatable(OriginalValue) then\n\t\t\t\t\treturn newproxy(true)\n\t\t\t\telse\n\t\t\t\t\treturn newproxy()\n\t\t\t\tend\n\n\t\t\telseif RobloxType == \"function\" then\n\t\t\t\treturn CloneFunction(OriginalValue)\n\t\t\tend\n\n\t\t\treturn OriginalValue\n\t\tend\n\n\t\t\n\t\tif ValueCopies then\n\t\t\tlocal CachedValue = ValueCopies[OriginalValue]\n\t\t\tif CachedValue then\n\t\t\t\treturn CachedValue\n\t\t\tend\n\t\telse\n\t\t\tValueCopies = {}\n\t\tend\n\n\t\t\n\t\tlocal ShallowCopy = {}\n\t\tValueCopies[OriginalValue] = ShallowCopy\n\n\t\tfor Key, Value in next, OriginalValue do\n\t\t\tlocal ValueType = type(Value)\n\n\t\t\tif ValueType == \"table\" then\n\t\t\t\tShallowCopy[Key] = DeepClone(Value, ValueCopies)\n\n\t\t\telseif ValueType == \"userdata\" then\n\t\t\t\tlocal ValueRobloxType = typeof(Value)\n\n\t\t\t\tif ValueRobloxType == \"Instance\" then\n\t\t\t\t\tShallowCopy[Key] = cloneref(Value)\n\n\t\t\t\telseif ValueRobloxType == \"userdata\" then\n\t\t\t\t\tif getmetatable(Value) then\n\t\t\t\t\t\tShallowCopy[Key] = newproxy(true)\n\t\t\t\t\telse\n\t\t\t\t\t\tShallowCopy[Key] = newproxy()\n\t\t\t\t\tend\n\n\t\t\t\telse\n\t\t\t\t\tShallowCopy[Key] = Value\n\t\t\t\tend\n\n\t\t\telseif ValueType == \"function\" then\n\t\t\t\tShallowCopy[Key] = CloneFunction(Value)\n\t\t\n\t\t\telse\n\t\t\t\tShallowCopy[Key] = Value\n\t\t\tend\n\t\tend\n\n\t\treturn ShallowCopy\n\tend\n\n\tif wax.shared.IS_ACTOR then\n\t\twax.shared.SerializeActorInfo = function(Info)\n\t\t\treturn FixTable(DeepClone(Info))\n\t\tend\n\tend\n\n\tfunction Log.new(Instance, Type, Index, CallingScript)\n\t\tlocal NewLog = setmetatable({\n\t\t\tInstance = Instance,\n\t\t\tType = Type,\n\t\t\tIndex = Index,\n\t\t\tCalls = {},\n\t\t\tGameCalls = {},\n\t\t\tSpamWindowStart = 0,\n\t\t\tSpamCallCount = 0,\n\t\t\tSuppressedCalls = 0,\n\t\t\tOverflowStreak = 0,\n\t\t\tOverflowedThisWindow = false,\n\t\t\tIgnored = false,\n\t\t\tBlocked = false,\n\t\t\tButton = nil,\n\t\t}, Log)\n\n\t\treturn NewLog\n\tend\n\n\tfunction Log:IsOverSpamThreshold()\n\t\t-- Kept for plugins that query the old API.  Capture admission is enforced\n\t\t-- centrally in `Log:Call`, even when the optional auto-ignore setting is off.\n\t\treturn self.SpamCallCount >= SpamCallCountThreshold\n\tend\n\n\tlocal function RunInterceptors(Interceptors: { (...any) -> ...any }, Info: any, Log): boolean\n\t\tfor _, Callback in Interceptors do\n\t\t\tlocal Ok, Result = pcall(Callback, Info, Log.Instance, Log.Type)\n\t\t\tif not Ok then\n\t\t\t\twarn(`[Cobalt Plugin Interceptor] Error: {Result}`)\n\t\t\telseif Result == false then\n\t\t\t\treturn true\n\t\t\tend\n\t\tend\n\n\t\treturn false\n\tend\n\n\tfunction Log:ShouldBlock(RawInfo, PendingCallDecisionsKey): boolean\n\t\tPendingCallDecisionsKey = PendingCallDecisionsKey or GetDecisionKey(RawInfo)\n\n\t\tlocal Decision = PendingCallDecisions[PendingCallDecisionsKey]\n\t\tif Decision then\n\t\t\treturn Decision.ShouldBlock\n\t\tend\n\n\t\tlocal FilterAction\n\t\tlocal CallFilters = wax.shared.CallFilters\n\t\tdo\n\t\t\tif CallFilters then\n\t\t\t\tFilterAction = CallFilters:Resolve(self.Instance, self.Type, RawInfo)\n\t\t\tend\n\t\tend\n\n\t\tlocal ShouldBlock = RawInfo.Blocked == true or self.Blocked or FilterAction == \"Block\"\n\t\tif ShouldBlock then\n\t\t\tRawInfo.Blocked = true\n\t\tend\n\n\t\tPendingCallDecisions[PendingCallDecisionsKey] = {\n\t\t\tFilterAction = FilterAction,\n\t\t\tShouldBlock = ShouldBlock,\n\t\t}\n\t\treturn ShouldBlock\n\tend\n\n\t--[[\n\t\tKeeps at most `MaxCalls` entries by dropping the oldest ones.\n\n\t\tCall indices are the log's public currency (call lists, notifications, the\n\t\tfile logger), so both the call array and the executor-call index list are\n\t\trebuilt together and stay consistent.\n\t]]\n\tfunction Log:TrimCalls(MaxCalls: number)\n\t\tlocal Calls = self.Calls\n\t\tlocal Total = #Calls\n\t\tlocal RemoveCount = Total - MaxCalls\n\t\tif RemoveCount <= 0 then\n\t\t\treturn 0\n\t\tend\n\n\t\tlocal Trimmed = table.create(Total - RemoveCount)\n\t\tfor Index = RemoveCount + 1, Total do\n\t\t\tTrimmed[Index - RemoveCount] = Calls[Index]\n\t\tend\n\t\tself.Calls = Trimmed\n\n\t\tlocal GameCalls = self.GameCalls\n\t\tlocal WriteIndex = 1\n\t\tfor ReadIndex = 1, #GameCalls do\n\t\t\tlocal Shifted = GameCalls[ReadIndex] - RemoveCount\n\t\t\tif Shifted >= 1 then\n\t\t\t\tGameCalls[WriteIndex] = Shifted\n\t\t\t\tWriteIndex += 1\n\t\t\tend\n\t\tend\n\n\t\tfor Index = WriteIndex, #GameCalls do\n\t\t\tGameCalls[Index] = nil\n\t\tend\n\n\t\treturn RemoveCount\n\tend\n\n\tfunction Log:Call(RawInfo): number?\n\t\tlocal PendingCallDecisionsKey = GetDecisionKey(RawInfo)\n\n\t\tlocal ShouldBlock = self:ShouldBlock(RawInfo, PendingCallDecisionsKey)\n\t\tlocal Decision = PendingCallDecisions[PendingCallDecisionsKey]\n\t\tPendingCallDecisions[PendingCallDecisionsKey] = nil\n\n\t\tlocal ShouldCapture = not self.Ignored and Decision.FilterAction ~= \"Ignore\"\n\t\tdo\n\t\t\tif ShouldBlock then\n\t\t\t\tShouldCapture = GetSettingBoolean(\"LogBlockedRemotes\", false)\n\t\t\tend\n\n\t\t\tif RawInfo.Omit then\n\t\t\t\tShouldCapture = false\n\t\t\tend\n\t\tend\n\n\t\tif not ShouldCapture then\n\t\t\treturn nil\n\t\tend\n\n\t\t-- Do this before DeepClone.  Cloning arguments is the expensive part of a\n\t\t-- capture, and a hard per-remote/global budget prevents one spammy event\n\t\t-- from consuming the frame and memory budgets of the whole game.\n\t\tif RejectCapture(self, os.clock()) then\n\t\t\treturn nil\n\t\tend\n\n\t\tlocal Info = DeepClone(RawInfo)\n\t\tInfo.CreationTime = tick()\n\n\t\t\n\t\tif wax.shared.IS_ACTOR then\n\t\t\tif self.Instance == wax.shared.Communicator then\n\t\t\t\treturn nil\n\t\t\tend\n\n\t\t\tInfo[\"Actor\"] = CurrentActor\n\n\t\t\t\n\t\t\tlocal OldArguments = Info.Arguments\n\t\t\tInfo.Arguments = {\n\t\t\t\tData = OldArguments,\n\t\t\t\tn = OldArguments.n,\n\t\t\t}\n\n\t\t\tif Info.InvokeResult then\n\t\t\t\tlocal OldInvokeResult = Info.InvokeResult\n\t\t\t\tInfo.InvokeResult = {\n\t\t\t\t\tData = OldInvokeResult,\n\t\t\t\t\tn = OldInvokeResult.n,\n\t\t\t\t}\n\t\t\tend\n\n\t\t\tlocal FixedInfo, CyclicRefs, ContainsCyclicRef = FixTable(Info)\n\n\t\t\t\n\t\t\tlocal identity = getthreadidentity()\n\t\t\tsetthreadidentity(8)\n\t\t\twax.shared.Communicator.Fire(\n\t\t\t\twax.shared.Communicator,\n\t\t\t\t\"ActorCall\",\n\t\t\t\tself.Instance,\n\t\t\t\tself.Type,\n\t\t\t\tFixedInfo,\n\t\t\t\tCyclicRefs,\n\t\t\t\tContainsCyclicRef\n\t\t\t)\n\t\t\tsetthreadidentity(identity)\n\t\t\treturn nil\n\t\tend\n\n\t\t\n\t\tlocal PluginManager = wax.shared.CobaltPluginManager\n\t\tif PluginManager and PluginManager.HasInterceptors then\n\t\t\t\n\t\t\tlocal InstanceIntercept = PluginManager.Registry.Interceptors.Instance[self.Instance]\n\t\t\tif InstanceIntercept then\n\t\t\t\tif InstanceIntercept[self.Type] and RunInterceptors(InstanceIntercept[self.Type], Info, self) then\n\t\t\t\t\treturn nil\n\t\t\t\tend\n\t\t\t\tif InstanceIntercept[\"All\"] and RunInterceptors(InstanceIntercept[\"All\"], Info, self) then\n\t\t\t\t\treturn nil\n\t\t\t\tend\n\t\t\tend\n\n\t\t\t\n\t\t\tlocal GlobalByType = PluginManager.Registry.Interceptors.Global[self.Type]\n\t\t\tif GlobalByType and RunInterceptors(GlobalByType, Info, self) then\n\t\t\t\treturn nil\n\t\t\tend\n\n\t\t\tlocal GlobalAll = PluginManager.Registry.Interceptors.Global[\"All\"]\n\t\t\tif GlobalAll and RunInterceptors(GlobalAll, Info, self) then\n\t\t\t\treturn nil\n\t\t\tend\n\t\tend\n\n\t\t\n\t\tlocal Index = #self.Calls + 1\n\t\tself.Calls[Index] = Info\n\t\tif not Info.IsExecutor then\n\t\t\ttable.insert(self.GameCalls, Index)\n\t\tend\n\n\t\t-- Trim with a little slack so the rebuild cost is amortised over many calls\n\t\t-- instead of running on every single one at the cap.\n\t\tlocal CallCap = GetMaxCallsPerRemote()\n\t\tif Index > CallCap + CallCapSlack then\n\t\t\tself:TrimCalls(CallCap)\n\t\t\tIndex = #self.Calls\n\t\tend\n\n\t\tQueueNotification(self, Index, Info)\n\t\treturn Index\n\tend\n\n\tfunction Log:ClearCalls()\n\t\ttable.clear(self.Calls)\n\t\ttable.clear(self.GameCalls)\n\t\tlocal Pending = wax.shared.LogNotificationQueue.PendingByLog[self]\n\t\tif Pending then\n\t\t\tPending.Call = nil\n\t\t\tPending.CallIndex = nil\n\t\t\twax.shared.LogNotificationQueue.PendingByLog[self] = nil\n\t\tend\n\t\tself.SpamWindowStart = os.clock()\n\t\tself.SpamCallCount = 0\n\t\tself.SuppressedCalls = 0\n\t\tself.OverflowStreak = 0\n\t\tself.OverflowedThisWindow = false\n\tend\n\n\tfunction Log:Ignore()\n\t\tself.Ignored = not self.Ignored\n\n\t\tif not wax.shared.IS_ACTOR then\n\t\t\tif wax.shared.ActorCommunicator then\n\t\t\t\tpcall(wax.shared.ActorCommunicator.Fire, wax.shared.ActorCommunicator, \"MainIgnore\", self.Instance, self.Type)\n\t\t\tend\n\n\t\t\tlocal IgnoredRemoteList = wax.shared.Settings[\"IgnoredRemotes\"]\n\t\t\tif IgnoredRemoteList then\n\t\t\t\tif self.Ignored then\n\t\t\t\t\tIgnoredRemoteList:AddToList(self)\n\t\t\t\telse\n\t\t\t\t\tIgnoredRemoteList:RemoveFromList(self)\n\t\t\t\tend\n\t\t\tend\n\t\tend\n\tend\n\n\tlocal ClassesConnectionsToggle = {\n\t\tRemoteEvent = \"OnClientEvent\",\n\t\tUnreliableRemoteEvent = \"OnClientEvent\",\n\t\tBindableEvent = \"Event\",\n\t}\n\n\tfunction Log:SetConnectionsEnabled(enabled: boolean)\n\t\tif not self.Instance or not ClassesConnectionsToggle[self.Instance.ClassName] then\n\t\t\treturn\n\t\tend\n\n\t\tlocal ConnectionName = ClassesConnectionsToggle[self.Instance.ClassName]\n\t\tif self.Type ~= \"Incoming\" or not ConnectionName then\n\t\t\treturn\n\t\tend\n\n\t\tlocal LoggingFunctions = wax.shared.IncomingLogConnectionFunctions\n\t\tfor _, Connection in pairs(getconnections(self.Instance[ConnectionName])) do\n\t\t\tif LoggingFunctions and LoggingFunctions[Connection.Function] then\n\t\t\t\tcontinue\n\t\t\tend\n\n\t\t\tif enabled then\n\t\t\t\tConnection:Enable()\n\t\t\telse\n\t\t\t\tConnection:Disable()\n\t\t\tend\n\t\tend\n\tend\n\n\tfunction Log:Block()\n\t\tif not wax.shared.IS_ACTOR and wax.shared.ActorCommunicator then\n\t\t\tpcall(wax.shared.ActorCommunicator.Fire, wax.shared.ActorCommunicator, \"MainBlock\", self.Instance, self.Type)\n\t\tend\n\n\t\tself.Blocked = not self.Blocked\n\t\tself:SetConnectionsEnabled(not self.Blocked)\n\tend\n\n\tfunction Log:SetButton(Instance, Name, Calls)\n\t\tself.Button = {\n\t\t\tInstance = Instance,\n\t\t\tName = Name,\n\t\t\tCalls = Calls,\n\t\t}\n\tend\n\n\twax.shared.Log = Log\nend\n--#endregion\n\n--#region @include \"Src/Spy/Hooks/Luau/Interceptors/Incoming.luau\" as \"wax.shared.IncomingInterceptor\"\ndo\n\t--// Helpers \\\\--\n\tlocal function CreateLookupTable(table)\n\t\tlocal LookupTable = {}\n\t\tfor _, Method in next, table do\n\t\t\tLookupTable[Method] = true\n\t\tend\n\t\treturn LookupTable\n\tend\n\n\t--// Variables \\\\--\n\tlocal setfenv = setfenv\n\tlocal getconnections = wax.shared.ExecutorSupport[\"getconnections\"].IsWorking and getconnections or function() return {} end\n\n\tlocal ClassesToHook = {\n\t\tRemoteEvent = \"OnClientEvent\",\n\t\tRemoteFunction = \"OnClientInvoke\",\n\t\tUnreliableRemoteEvent = \"OnClientEvent\",\n\t\tBindableEvent = \"Event\",\n\t\tBindableFunction = \"OnInvoke\",\n\t}\n\n\tlocal ConnectionKeys = CreateLookupTable({\n\t\t\"Connect\",\n\t\t\"ConnectParallel\",\n\t\t\"connect\",\n\t\t\"connectParallel\",\n\t\t\"Once\",\n\t})\n\n\t--// State \\\\--\n\tlocal ConnectionsEnabled = false\n\tlocal CallbacksEnabled = false\n\tlocal ConnectionHookEnabled = false\n\n\t--// Signals & Detours \\\\--\n\tlocal LogConnectionFunctions = {}\n\tlocal CallbackOwners = setmetatable({}, { __mode = \"k\" })\n\tlocal SignalMapping = setmetatable({}, { __mode = \"kv\" })\n\tlocal ObservedConnectionInstances = setmetatable({}, { __mode = \"k\" })\n\twax.shared.IncomingLogConnectionFunctions = LogConnectionFunctions\n\n\tlocal CobaltObserverEnvironmentKey = \"__CobaltIncomingObserver\"\n\n\t--// Types \\\\--\n\ttype InstancesToHook = RemoteEvent | UnreliableRemoteEvent | RemoteFunction | BindableEvent | BindableFunction\n\ttype MethodsToHook = \"OnClientEvent\" | \"OnClientInvoke\" | \"Event\" | \"OnInvoke\"\n\texport type Options = {\n\t\tConnections: boolean?,\n\t\tCallbacks: boolean?,\n\t\tHookConnections: boolean?,\n\t}\n\n\t--// Functions \\\\--\n\tlocal function GetLog(Instance: InstancesToHook, Function: (...any) -> ...any)\n\t\tlocal DebugId = wax.shared.GetDebugId(Instance)\n\n\t\tif wax.shared.ShouldIgnore(Instance, getcallingscript()) or LogConnectionFunctions[Function] then\n\t\t\treturn nil\n\t\tend\n\n\t\tlocal IncomingLogs = wax.shared.Logs.Incoming\n\t\tif not IncomingLogs then\n\t\t\treturn nil\n\t\tend\n\n\t\tlocal Log = IncomingLogs[DebugId]\n\t\tif not Log then\n\t\t\tLog = wax.shared.NewLog(Instance, \"Incoming\", getcallingscript(), DebugId)\n\t\tend\n\n\t\treturn Log\n\tend\n\n\tlocal function ResolveCallableFunction(Value: any): ((...any) -> ...any)?\n\t\tif typeof(Value) == \"function\" then\n\t\t\treturn Value\n\t\tend\n\n\t\tlocal Success, Metatable = pcall(wax.shared.getrawmetatable, Value)\n\t\tif not Success or not Metatable then\n\t\t\treturn nil\n\t\tend\n\n\t\tlocal HasCall, Call = pcall(rawget, Metatable, \"__call\")\n\t\treturn if HasCall and typeof(Call) == \"function\" then Call else nil\n\tend\n\n\t--[[\n\t\tIndividually logs an incoming remote call.\n\n\t\t@param Instance The instance that was called.\n\t\t@param Function The function that was called, if applicable.\n\t\t@param Info The information about the call, including arguments and origin. Can be nil.\n\t\t@param ... The arguments passed from the server to the client.\n\t\t@return boolean, Log? Returns true if the call was blocked, plus the log when one was used.\n\t]]\n\tlocal function LogRemote(\n\t\tInstance: InstancesToHook,\n\t\tFunction: (...any) -> ...any,\n\t\tInfo: {\n\t\t\tArguments: { [number]: any, n: number },\n\t\t\tOrigin: Instance,\n\t\t\tFunction: (...any) -> ...any,\n\t\t\tLine: number,\n\t\t\tIsExecutor: boolean,\n\t\t\tBlocked: boolean?,\n\t\t}\n\t)\n\t\tlocal Log = GetLog(Instance, Function)\n\t\tif not Log then\n\t\t\treturn false, nil\n\t\tend\n\n\t\tlocal ShouldBlock = Log:ShouldBlock(Info)\n\t\tlocal CallIndex = Log:Call(Info)\n\t\treturn ShouldBlock, Log, CallIndex\n\tend\n\n\t--#region Hook Filters\n\tlocal SupportsFilters = wax.shared.ExecutorSupport[\"FilterBase\"].IsWorking\n\n\t--[[\n\t\tCreates a base filter for the incoming hooks.\n\n\t\t@return `table` The base filter.\n\t]]\n\tlocal function CreateBaseFilter()\n\t\tlocal Filters = {}\n\t\tif not SupportsFilters then\n\t\t\treturn Filters\n\t\tend\n\n\t\t--// allowed classnames \\\\--\n\t\tfor ClassName in ClassesToHook do\n\t\t\ttable.insert(Filters, InstanceTypeFilter.new(1, ClassName))\n\t\tend\n\n\t\treturn Filters\n\tend\n\t--#endregion\n\n\t--#region Incoming Connection Stuff\n\tlocal function IsCobaltConnectionFunction(Function): boolean\n\t\tif not Function then\n\t\t\treturn false\n\t\tend\n\n\t\tif LogConnectionFunctions[Function] then\n\t\t\treturn true\n\t\tend\n\n\t\tlocal Success, Environment = pcall(getfenv, Function)\n\t\tlocal VerificationToken = wax.shared.CobaltVerificationToken\n\t\treturn (\n\t\t\tSuccess\n\t\t\tand VerificationToken ~= nil\n\t\t\tand typeof(Environment) == \"table\"\n\t\t\tand rawequal(rawget(Environment, CobaltObserverEnvironmentKey), VerificationToken)\n\t\t)\n\tend\n\n\t--[[\n\t\tCreates a function that can be used to pass to `Connect` which will log all the incoming calls. It will additonally add the function to a ignore list (`LogConnectionFunctions`) to prevent unneccessary logging.\n\t\t\n\t\t@param Instance The instance to log.\n\t\t@param Method The method to log (e.g., \"OnClientEvent\").\n\t\t@return function Returns a function that logs all calls to the given instance and method.\n\t]]\n\tlocal function CreateConnectionFunction(Instance: InstancesToHook, Method: MethodsToHook)\n\t\tlocal CachedConnectionInfo = nil\n\t\tlocal CachedConnectionCount = -1\n\n\t\tlocal DebugId = wax.shared.GetDebugId(Instance)\n\n\t\tlocal ConnectionFunction = function(...)\n\t\t\t--// Skip if this remote is already ignored \\\\--\n\t\t\tlocal ExistingLog = wax.shared.Logs.Incoming[DebugId]\n\t\t\tif ExistingLog and ExistingLog.Ignored then\n\t\t\t\treturn\n\t\t\tend\n\n\t\t\tlocal Signal = (Instance :: any)[Method]\n\t\t\tlocal Connections = getconnections(Signal)\n\t\t\tlocal ConnectionCount = #Connections\n\n\t\t\t-- Only re-analyze connections when the count changes (connect/disconnect)\n\t\t\tif ConnectionCount ~= CachedConnectionCount then\n\t\t\t\tCachedConnectionCount = ConnectionCount\n\n\t\t\t\tlocal Information = {\n\t\t\t\t\tHasValidConnections = false,\n\t\t\t\t\tHasForeignLuaConnections = false,\n\t\t\t\t\tEntries = {},\n\t\t\t\t}\n\n\t\t\t\tfor _, Connection in Connections do\n\t\t\t\t\t--// Foreign State Connections \\\\--\n\t\t\t\t\tif Connection.ForeignState then\n\t\t\t\t\t\t--// It is a Lua Connection - Other Actor's Connections \\\\--\n\t\t\t\t\t\tif Connection.LuaConnection then\n\t\t\t\t\t\t\tInformation.HasForeignLuaConnections = true\n\t\t\t\t\t\tend\n\n\t\t\t\t\t\tcontinue\n\t\t\t\t\tend\n\n\t\t\t\t\t--// Get Function \\\\--\n\t\t\t\t\tlocal Function = typeof(Connection.Function) == \"function\" and (Connection.Function) or (nil)\n\t\t\t\t\tif IsCobaltConnectionFunction(Function) then\n\t\t\t\t\t\tcontinue\n\t\t\t\t\tend\n\n\t\t\t\t\tInformation.HasValidConnections = true\n\n\t\t\t\t\t--// Get Origin \\\\--\n\t\t\t\t\tlocal Thread = Connection.Thread\n\t\t\t\t\tlocal Origin = nil\n\n\t\t\t\t\tif Thread and getscriptfromthread then\n\t\t\t\t\t\tOrigin = getscriptfromthread(Thread)\n\t\t\t\t\tend\n\n\t\t\t\t\tif not Origin and Function then\n\t\t\t\t\t\t-- ts is unreliable because people could js set the script global to nil\n\t\t\t\t\t\t-- if only debug.getinfo(Function).source or debug.info(Function, \"s\") returned an Instance...\n\n\t\t\t\t\t\tlocal Script = rawget(getfenv(Function), \"script\")\n\t\t\t\t\t\tif typeof(Script) == \"Instance\" then\n\t\t\t\t\t\t\tOrigin = Script\n\t\t\t\t\t\tend\n\t\t\t\t\tend\n\n\t\t\t\t\ttable.insert(Information.Entries, {\n\t\t\t\t\t\tFunction = Function,\n\t\t\t\t\t\tOrigin = Origin,\n\t\t\t\t\t\tIsExecutor = Function and isexecutorclosure(Function) or false,\n\t\t\t\t\t})\n\t\t\t\tend\n\n\t\t\t\tCachedConnectionInfo = Information\n\t\t\tend\n\n\t\t\tlocal Arguments = wax.shared.SafePack.Pack(...)\n\t\t\tlocal TargetLog, TargetCallIndex\n\n\t\t\t--// Log Remote \\\\--\n\t\t\tif CachedConnectionInfo.HasValidConnections then\n\t\t\t\tfor _, Entry in CachedConnectionInfo.Entries do\n\t\t\t\t\tTargetLog, TargetCallIndex = select(2, LogRemote(Instance, Entry.Function, {\n\t\t\t\t\t\tArguments = Arguments,\n\t\t\t\t\t\tOrigin = Entry.Origin,\n\t\t\t\t\t\tFunction = Entry.Function,\n\t\t\t\t\t\tLine = nil,\n\t\t\t\t\t\tIsExecutor = Entry.IsExecutor,\n\t\t\t\t\t}))\n\t\t\t\tend\n\n\t\t\telseif not wax.shared.IS_ACTOR then\n\t\t\t\tTargetLog, TargetCallIndex = select(2, LogRemote(Instance, nil, {\n\t\t\t\t\tArguments = Arguments,\n\t\t\t\t\tOrigin = nil,\n\t\t\t\t\tFunction = nil,\n\t\t\t\t\tLine = nil,\n\t\t\t\t\tIsExecutor = false,\n\t\t\t\t}))\n\t\t\tend\n\n\t\t\tlocal Communicator = wax.shared.ActorCommunicator\n\t\t\tif Communicator then\n\t\t\t\tif\n\t\t\t\t\tnot wax.shared.IS_ACTOR\n\t\t\t\t\tand CachedConnectionInfo.HasForeignLuaConnections\n\t\t\t\t\tand TargetLog\n\t\t\t\t\tand TargetCallIndex\n\t\t\t\tthen\n\t\t\t\t\tCommunicator:Fire(\n\t\t\t\t\t\t\"InspectIncomingConnections\",\n\t\t\t\t\t\tInstance,\n\t\t\t\t\t\tMethod,\n\t\t\t\t\t\tTargetLog.Index,\n\t\t\t\t\t\tTargetCallIndex\n\t\t\t\t\t)\n\t\t\t\tend\n\t\t\tend\n\t\tend\n\n\t\tlocal OriginalEnvironment = getfenv(ConnectionFunction)\n\t\tsetfenv(ConnectionFunction, setmetatable({\n\t\t\t[CobaltObserverEnvironmentKey] = wax.shared.CobaltVerificationToken,\n\t\t}, {\n\t\t\t__index = OriginalEnvironment,\n\t\t\t__newindex = OriginalEnvironment,\n\t\t}))\n\n\t\tLogConnectionFunctions[ConnectionFunction] = true\n\t\treturn ConnectionFunction\n\tend\n\t--#endregion\n\n\t--#region Incoming Callback Stuff\n\t--[[\n\t\tHandles logging for a callback.\n\n\t\t@param Log The log to use.\n\t\t@param Info The pending callback call information.\n\t\t@param InitialEnv The initial environment to use.\n\t\t@param InitialIdentity The initial identity to use.\n\t\t@param ... The result of the callback.\n\n\t\t@return The result of the callback.\n\t]]\n\tlocal function HandleCallbackLogging(Log, Info, InitialEnv, InitialIdentity, ...)\n\t\tsetfenv(0, InitialEnv)\n\t\tsetthreadidentity(InitialIdentity)\n\n\t\tif Log then\n\t\t\tInfo.InvokeResult = wax.shared.SafePack.Pack(...)\n\t\t\tLog:Call(Info)\n\t\tend\n\n\t\treturn ...\n\tend\n\n\t--[[\n\t\tCreates a function that can be used to pass to callbacks (.OnInvoke & .OnClientInvoke) which will log all the incoming calls.\n\t\t\n\t\t@param Instance The instance to log.\n\t\t@param Function The original callback of the RemoteFunction\n\t\t@return function Returns a function that logs all function calls to the given instance.\n\t]]\n\tlocal function CreateCallbackDetour(Instance: InstancesToHook, Callback: any)\n\t\tlocal CallbackFunction = assert(ResolveCallableFunction(Callback), \"Callback is not callable\")\n\t\tlocal Detour = function(...)\n\t\t\tlocal Origin = nil\n\n\t\t\t-- May not exist in all executors\n\t\t\tif getscriptfromthread then\n\t\t\t\tOrigin = getscriptfromthread(coroutine.running())\n\t\t\tend\n\n\t\t\t-- Unreliable method to get script.\n\t\t\tif not Origin then\n\t\t\t\tlocal Script = rawget(getfenv(CallbackFunction), \"script\")\n\t\t\t\tif typeof(Script) == \"Instance\" then\n\t\t\t\t\tOrigin = Script\n\t\t\t\tend\n\t\t\tend\n\n\t\t\tlocal FunctionCaller = debug.info(2, \"f\")\n\t\t\tlocal IsExecutor = if typeof(FunctionCaller) == \"function\"\n\t\t\t\tthen isexecutorclosure(FunctionCaller)\n\t\t\t\telse isexecutorclosure(CallbackFunction)\n\n\t\t\tlocal Arguments = wax.shared.SafePack.Pack(...)\n\t\t\tlocal Log = GetLog(Instance, CallbackFunction)\n\t\t\tlocal Info = {\n\t\t\t\tArguments = Arguments,\n\t\t\t\tOrigin = Origin,\n\t\t\t\tFunction = CallbackFunction,\n\t\t\t\tLine = nil,\n\t\t\t\tIsExecutor = IsExecutor,\n\t\t\t\tInvokeKind = \"Callback\",\n\t\t\t}\n\t\t\tif Log and Log:ShouldBlock(Info) then\n\t\t\t\tLog:Call(Info)\n\t\t\t\treturn\n\t\t\tend\n\n\t\t\tlocal InitialEnv, InitialIdentity = getfenv(CreateCallbackDetour), getthreadidentity()\n\t\t\tlocal IsDirectFunction = rawequal(Callback, CallbackFunction)\n\n\t\t\tsetthreadidentity(2)\n\t\t\tsetfenv(0, getfenv(CallbackFunction))\n\t\t\tif IsDirectFunction then\n\t\t\t\treturn HandleCallbackLogging(\n\t\t\t\t\tLog,\n\t\t\t\t\tInfo,\n\t\t\t\t\tInitialEnv,\n\t\t\t\t\tInitialIdentity,\n\t\t\t\t\tCallbackFunction(...)\n\t\t\t\t)\n\t\t\tend\n\n\t\t\treturn HandleCallbackLogging(\n\t\t\t\tLog,\n\t\t\t\tInfo,\n\t\t\t\tInitialEnv,\n\t\t\t\tInitialIdentity,\n\t\t\t\tCallbackFunction(Callback, ...)\n\t\t\t)\n\t\tend\n\n\t\tif wax.shared.ExecutorSupport[\"setstackhidden\"].IsWorking then\n\t\t\tsetstackhidden(Detour, true)\n\t\tend\n\n\t\tCallbackOwners[Detour] = {\n\t\t\tOriginal = Callback,\n\t\t\tMethod = ClassesToHook[Instance.ClassName],\n\t\t\tInstance = Instance\n\t\t}\n\t\treturn Detour\n\tend\n\n\tlocal function GetOriginalScript(OriginalEnv: { [string]: any}): Instance?\n\t\tlocal OriginalScript = rawget(OriginalEnv, \"script\")\n\t\tif typeof(OriginalScript) ~= \"Instance\" then\n\t\t\treturn nil\n\t\tend\n\n\t\treturn OriginalScript\n\tend\n\n\t--[[\n\t\tRestores the callback detours for the given instances. Used for cobalt unloading.\n\t\tNOTE: Keep this in here so Actors can rely on wax.shared.RestoreCallbackDetours\n\t]]\n\twax.shared.RestoreCallbackDetours = function()\n\t\tfor Detour, Owner in CallbackOwners do\n\t\t\tlocal Success, CurrentCallback = pcall(getcallbackvalue, Owner.Instance, Owner.Method)\n\t\t\tif not (Success and rawequal(CurrentCallback, Detour)) then\n\t\t\t\tcontinue\n\t\t\tend\n\n\t\t\tpcall(function()\n\t\t\t\tif wax.shared.trampoline_call then\n\t\t\t\t\tlocal OriginalEnv = getfenv(Owner.Original)\n\t\t\t\t\tlocal OriginalScript = GetOriginalScript(OriginalEnv)\n\n\t\t\t\t\twax.shared.trampoline_call(function()\n\t\t\t\t\t\tOwner.Instance[Owner.Method] = Owner.Original\n\t\t\t\t\tend, {}, {\n\t\t\t\t\t\tenv = OriginalEnv,\n\t\t\t\t\t\tscript = OriginalScript,\n\t\t\t\t\t\tidentity = 2\n\t\t\t\t\t})\n\t\t\t\telse\n\t\t\t\t\ttask.spawn(function()\n\t\t\t\t\t\tlocal OriginalEnv = getfenv(Owner.Original)\n\n\t\t\t\t\t\tsetthreadidentity(2)\n\t\t\t\t\t\tsetfenv(0, OriginalEnv)\n\t\t\t\t\t\tOwner.Instance[Owner.Method] = Owner.Original\n\t\t\t\t\tend)\n\t\t\t\tend\n\t\t\tend)\n\t\tend\n\n\t\ttable.clear(CallbackOwners)\n\tend\n\n\t--#endregion\n\n\t--[[\n\t\tHandles setting up logging for the appropriate instances.\n\n\t\t@param Instance The instance to handle.\n\t]]\n\tlocal function HandleInstance(Instance: any)\n\t\tif\n\t\t\tnot ClassesToHook[Instance.ClassName]\n\t\t\tor Instance == wax.shared.Communicator\n\t\t\tor Instance == wax.shared.ActorCommunicator\n\t\tthen\n\t\t\treturn\n\t\tend\n\n\t\tlocal Method = ClassesToHook[Instance.ClassName]\n\n\t\tif ConnectionsEnabled and not ObservedConnectionInstances[Instance] then\n\t\t\tif Instance.ClassName == \"RemoteEvent\" or Instance.ClassName == \"UnreliableRemoteEvent\" then\n\t\t\t\twax.shared.Connect(Instance.OnClientEvent:Connect(CreateConnectionFunction(Instance, Method)))\n\n\t\t\t\tSignalMapping[Instance.OnClientEvent] = Instance\n\t\t\t\tObservedConnectionInstances[Instance] = true\n\t\t\telseif Instance.ClassName == \"BindableEvent\" then\n\t\t\t\twax.shared.Connect(Instance.Event:Connect(CreateConnectionFunction(Instance, Method)))\n\n\t\t\t\tSignalMapping[Instance.Event] = Instance\n\t\t\t\tObservedConnectionInstances[Instance] = true\n\t\t\tend\n\t\tend\n\n\t\tif CallbacksEnabled then\n\t\t\tif Instance.ClassName == \"RemoteFunction\" or Instance.ClassName == \"BindableFunction\" then\n\t\t\t\tlocal IsCoreRemote = Instance:IsDescendantOf(wax.shared.RobloxReplicatedStorage)\n\t\t\t\tif IsCoreRemote then return end\n\n\t\t\t\tlocal Success, Callback = pcall(getcallbackvalue, Instance, Method)\n\t\t\t\tlocal IsCallable = ResolveCallableFunction(Callback) ~= nil\n\n\t\t\t\tif not Success or not IsCallable or CallbackOwners[Callback] then\n\t\t\t\t\treturn\n\t\t\t\tend\n\n\t\t\t\t--// Use trampoline_call so error redirection dosent occur \\\\--\n\t\t\t\tif wax.shared.trampoline_call then\n\t\t\t\t\tlocal OriginalEnv = getfenv(Callback)\n\t\t\t\t\tlocal OriginalScript = GetOriginalScript(OriginalEnv)\n\n\t\t\t\t\twax.shared.trampoline_call(function()\n\t\t\t\t\t\tInstance[Method] = CreateCallbackDetour(Instance, Callback)\n\t\t\t\t\tend, {}, {\n\t\t\t\t\t\tenv = OriginalEnv,\n\t\t\t\t\t\tscript = OriginalScript,\n\t\t\t\t\t\tidentity = 2\n\t\t\t\t\t})\n\t\t\t\telse\n\t\t\t\t\tInstance[Method] = CreateCallbackDetour(Instance, Callback)\n\t\t\t\tend\n\t\t\tend\n\t\tend\n\tend\n\n\t--[[\n\t\tCreates a hook that intercepts .OnInvoke & .OnClientInvoke assignments and detours them to log the calls.\n\t]]\n\tlocal function SetupCallbackAssignmentHook()\n\t\tlocal NewIndexHookFilter = SupportsFilters and AnyFilter.new(CreateBaseFilter())\n\t\t\n\t\twax.shared.NewIndexHook = wax.shared.Hooking.HookMetaMethod(game, \"__newindex\", function(...)\n\t\t\tlocal self, key, value = ...\n\n\t\t\tif typeof(self) ~= \"Instance\" or not ClassesToHook[self.ClassName] then\n\t\t\t\treturn wax.shared.NewIndexHook(...)\n\t\t\tend\n\n\t\t\tif self.ClassName == \"RemoteFunction\" or self.ClassName == \"BindableFunction\" then\n\t\t\t\tlocal Method = ClassesToHook[self.ClassName]\n\n\t\t\t\tlocal IsCallable = ResolveCallableFunction(value) ~= nil\n\n\t\t\t\tif key == Method and IsCallable then\n\t\t\t\t\tif CallbackOwners[value] then\n\t\t\t\t\t\treturn wax.shared.NewIndexHook(...)\n\t\t\t\t\tend\n\n\t\t\t\t\treturn wax.shared.NewIndexHook(self, key, CreateCallbackDetour(self :: InstancesToHook, value))\n\t\t\t\tend\n\t\t\tend\n\n\t\t\treturn wax.shared.NewIndexHook(...)\n\t\tend, NewIndexHookFilter)\n\tend\n\n\t--[[\n\t\tHandles logging for a connection.\n\n\t\t@param Method The method to log.\n\t\t@param callback The callback to log.\n\t\t@param ... The arguments to log.\n\n\t\t@return The result of the connection.\n\t]]\n\tlocal function HandleConnectionLogging(Instance, Method, callback, ...)\n\t\tlocal Log = wax.shared.Logs.Incoming[wax.shared.GetDebugId(Instance)]\n\n\t\tif Log and Log.Blocked then\n\t\t\tfor _, Connection in getconnections(Instance[Method]) do\n\t\t\t\tif not Connection.ForeignState and Connection.Function ~= callback then\n\t\t\t\t\tcontinue\n\t\t\t\tend\n\n\t\t\t\tConnection:Disable()\n\t\t\tend\n\t\tend\n\n\t\treturn ...\n\tend\n\n\t--[[\n\t\tCreates a hook that disables connections for blocked instances on creation.\n\t]]\n\tlocal function SetupConnectionAssignmentHook()\n\t\tlocal SignalMetatable = wax.shared.getrawmetatable(Instance.new(\"Part\").Touched)\n\t\twax.shared.Hooks[SignalMetatable.__index] = wax.shared.Hooking.HookFunction(SignalMetatable.__index, function(...)\n\t\t\tlocal self, key = ...\n\n\t\t\tif not wax.shared.Unloaded and ConnectionKeys[key] then\n\t\t\t\tlocal Instance = SignalMapping[self]\n\t\t\t\tlocal Connect = wax.shared.Hooks[SignalMetatable.__index](...)\n\n\t\t\t\tif not Instance then\n\t\t\t\t\treturn Connect\n\t\t\t\tend\n\n\t\t\t\tlocal Method = ClassesToHook[Instance.ClassName]\n\t\t\t\treturn wax.shared.newcclosure(function(...)\n\t\t\t\t\tlocal _self, callback = ...\n\t\t\t\t\treturn HandleConnectionLogging(Instance, Method, callback, Connect(...))\n\t\t\t\tend, debug.info(Connect, \"n\"))\n\t\t\tend\n\n\t\t\treturn wax.shared.Hooks[SignalMetatable.__index](...)\n\t\tend)\n\tend\n\n\tlocal Started = false\n\twax.shared.IncomingInterceptor = function(Options: Options?)\n\t\tif Started then\n\t\t\treturn\n\t\tend\n\n\t\t--// Validation \\\\--\n\t\tOptions = Options or {}\n\t\tdo\n\t\t\tConnectionsEnabled = Options.Connections ~= false\n\t\t\tCallbacksEnabled = Options.Callbacks ~= false\n\t\t\tConnectionHookEnabled = Options.HookConnections ~= false\n\t\tend\n\n\t\tif not ConnectionsEnabled and not CallbacksEnabled then\n\t\t\treturn\n\t\tend\n\n\t\tStarted = true\n\n\t\t--// Listeners \\\\--\n\t\tif CallbacksEnabled then\n\t\t\tif wax.shared.ExecutorSupport[\"setstackhidden\"].IsWorking then\n\t\t\t\tsetstackhidden(HandleCallbackLogging, true)\n\t\t\tend\n\n\t\t\tSetupCallbackAssignmentHook()\n\t\tend\n\n\t\tif ConnectionsEnabled and ConnectionHookEnabled then\n\t\t\tSetupConnectionAssignmentHook()\n\t\tend\n\n\t\twax.shared.Connect(game.DescendantAdded:Connect(function(instance)\n\t\t\tHandleInstance(cloneref(instance))\n\t\tend))\n\n\t\t--// Initialization \\\\--\n\t\tlocal ClassesToSearch = {}\n\t\tdo\n\t\t\tif ConnectionsEnabled then\n\t\t\t\ttable.insert(ClassesToSearch, \"RemoteEvent\")\n\t\t\t\ttable.insert(ClassesToSearch, \"UnreliableRemoteEvent\")\n\t\t\t\ttable.insert(ClassesToSearch, \"BindableEvent\")\n\t\t\tend\n\t\t\tif CallbacksEnabled then\n\t\t\t\ttable.insert(ClassesToSearch, \"RemoteFunction\")\n\t\t\t\ttable.insert(ClassesToSearch, \"BindableFunction\")\n\t\t\tend\n\t\tend\n\n\t\tlocal function GetDescendantsByClassNames(Root, ClassNames)\n\t\t\tlocal Matches = {}\n\t\t\tfor _, Descendant in Root:GetDescendants() do\n\t\t\t\tfor _, ClassName in ClassNames do\n\t\t\t\t\tif Descendant:IsA(ClassName) then\n\t\t\t\t\t\ttable.insert(Matches, Descendant)\n\t\t\t\t\t\tbreak\n\t\t\t\t\tend\n\t\t\t\tend\n\t\t\tend\n\n\t\t\treturn Matches\n\t\tend\n\n\t\tlocal Categories = {\n\t\t\tGetDescendantsByClassNames(game, ClassesToSearch),\n\t\t}\n\t\tif wax.shared.ExecutorSupport[\"getnilinstances\"].IsWorking then\n\t\t\ttable.insert(Categories, getnilinstances())\n\t\tend\n\n\t\tfor _, Category in Categories do\n\t\t\tfor _, TargetInstance in next, Category do\n\t\t\t\tHandleInstance(cloneref(TargetInstance))\n\t\t\tend\n\t\tend\n\tend\nend\n--#endregion\n\ntask.spawn(wax.shared.IncomingInterceptor, {\n\tConnections = false,\n\tCallbacks = Data.IncomingCallbacks,\n\tHookConnections = false,\n})\n\nif Data.Outgoing then\n\ttask.spawn(function()\n\t\tlocal function CreateLookupTable(table)\n\t\t\tlocal LookupTable = {}\n\t\t\tfor _, Method in next, table do\n\t\t\t\tLookupTable[Method] = true\n\t\t\tend\n\t\t\treturn LookupTable\n\t\tend\n\n\t\tlocal NamecallMethods = {\n\t\t\t[\"FireServer\"] = CreateLookupTable({\"RemoteEvent\", \"UnreliableRemoteEvent\"}),\n\t\t\t[\"fireServer\"] = CreateLookupTable({\"RemoteEvent\", \"UnreliableRemoteEvent\"}),\n\t\t\t\n\t\t\t[\"InvokeServer\"] = CreateLookupTable({\"RemoteFunction\"}),\n\t\t\t[\"invokeServer\"] = CreateLookupTable({\"RemoteFunction\"}),\n\n\t\t\t[\"Fire\"] = CreateLookupTable({\"BindableEvent\"}),\n\t\t\t[\"fire\"] = CreateLookupTable({\"BindableEvent\"}),\n\t\t\t\n\t\t\t[\"Invoke\"] = CreateLookupTable({\"BindableFunction\"}),\n\t\t\t[\"invoke\"] = CreateLookupTable({\"BindableFunction\"}),\n\t\t}\n\t\tlocal AllowedClassNames =\n\t\t\tCreateLookupTable({ \"RemoteEvent\", \"RemoteFunction\", \"UnreliableRemoteEvent\", \"BindableEvent\", \"BindableFunction\" })\n\n\t\t--[[\n\t\t\tReturns the calling function via `debug.info`\n\n\t\t\t@return `function | nil` The calling function or nil if not found.\n\t\t]]\n\t\tlocal function getcallingfunction()\n\t\t\tlocal BaseLevel = if wax.shared.IsUsingOthHooks then 3 else 5\n\n\t\t\tfor i = BaseLevel, 10 do\n\t\t\t\tlocal Function, Source = debug.info(i, \"fs\")\n\t\t\t\tif not Function or not Source then\n\t\t\t\t\tbreak\n\t\t\t\tend\n\n\t\t\t\tif Source == \"[C]\" then\n\t\t\t\t\tcontinue\n\t\t\t\tend\n\n\t\t\t\treturn Function\n\t\t\tend\n\n\t\t\treturn debug.info(BaseLevel, \"f\")\n\t\tend\n\n\t\t--[[\n\t\t\tReturns the calling line of the script that called the function via `debug.info`\n\n\t\t\t@return number Returns the line number of the calling script.\n\t\t]]\n\t\tlocal function getcallingline()\n\t\t\tlocal BaseLevel = if wax.shared.IsUsingOthHooks then 3 else 5\n\n\t\t\tfor i = BaseLevel, 10 do\n\t\t\t\tlocal Source, Line = debug.info(i, \"sl\")\n\t\t\t\tif not Source then\n\t\t\t\t\tbreak\n\t\t\t\tend\n\n\t\t\t\tif Source == \"[C]\" then\n\t\t\t\t\tcontinue\n\t\t\t\tend\n\n\t\t\t\treturn Line\n\t\t\tend\n\n\t\t\treturn debug.info(BaseLevel, \"l\")\n\t\tend\n\n\t\t--[[\n\t\t\tReturns the calling source of the script that called the function via `debug.info`\n\n\t\t\t@return string Returns the source of the calling script.\n\t\t]]\n\t\tlocal function getcallingsource()\n\t\t\tlocal BaseLevel = if wax.shared.IsUsingOthHooks then 3 else 5\n\n\t\t\tfor i = BaseLevel, 10 do\n\t\t\t\tlocal Source = debug.info(i, \"s\")\n\t\t\t\tif not Source then\n\t\t\t\t\tbreak\n\t\t\t\tend\n\n\t\t\t\tif Source == \"[C]\" then\n\t\t\t\t\tcontinue\n\t\t\t\tend\n\n\t\t\t\treturn Source\n\t\t\tend\n\n\t\t\treturn debug.info(BaseLevel, \"s\")\n\t\tend\n\n\t\t--[[\n\t\t\tGets the log for a specific instance and direction.\n\n\t\t\t@param Instance: The instance that was called.\n\t\t\t@param Direction: The direction of the log (Outgoing, Incoming).\n\t\t\t@return Log: The log for the instance and direction.\n\t\t]]\n\t\tlocal function GetLog(Instance: Instance, Direction: \"Outgoing\" | \"Incoming\")\n\t\t\tlocal DebugId = wax.shared.GetDebugId(Instance)\n\n\t\t\tlocal LogsInDirection = wax.shared.Logs[Direction]\n\t\t\tif not LogsInDirection then\n\t\t\t\treturn nil\n\t\t\tend\n\n\t\t\tlocal Log = LogsInDirection[DebugId]\n\t\t\tif not Log then\n\t\t\t\tLog = wax.shared.NewLog(Instance, Direction, getcallingscript(), DebugId)\n\t\t\tend\n\n\t\t\treturn Log\n\t\tend\n\n\t\t--[[\n\t\t\tHandles logging for a result of a remote function.\n\t\t\t@param Log The log to use.\n\t\t\t@param Arguments The arguments to use.\n\t\t\t@param ... The result to log.\n\t\t\t@return The result.\n\t\t]]\n\t\tlocal function HandleLoggingResult(Log, Info, ResultKey, ...)\n\t\t\tlocal Result = wax.shared.SafePack.Pack(...)\n\t\t\tInfo[ResultKey] = Result\n\t\t\tLog:Call(Info)\n\n\t\t\treturn ...\n\t\tend\n\n\t\t--[[\n\t\t\tHandles the logging for a specific instance and method.\n\n\t\t\t@param Instance: The instance that was called.\n\t\t\t@param Method: The method that was called (e.g., \"OnClientEvent\").\n\t\t\t@param ... The arguments passed from the server to the client.\n\t\t]]\n\t\tlocal function HandleLogging(TargetInstance: Instance, Method: string, OldFunction: (...any) -> ...any, ...)\n\t\t\tlocal Log = GetLog(TargetInstance, \"Outgoing\")\n\t\t\tif not Log then\n\t\t\t\treturn OldFunction(...)\n\t\t\tend\n\t\t\tlocal Arguments = wax.shared.SafePack.Pack(select(2, ...))\n\n\t\t\tlocal Info = {\n\t\t\t\tArguments = Arguments,\n\t\t\t\tOrigin = getcallingscript(),\n\t\t\t\tFunction = getcallingfunction(),\n\t\t\t\tLine = getcallingline(),\n\t\t\t\tSource = getcallingsource(),\n\t\t\t\tIsExecutor = checkcaller(),\n\t\t\t}\n\t\t\tlocal ShouldBlock = Log:ShouldBlock(Info)\n\t\t\tLog:Call(Info)\n\t\t\tif ShouldBlock then\n\t\t\t\treturn\n\t\t\tend\n\n\t\t\tlocal IsRemoteFunctionInvoke = (\n\t\t\t\tTargetInstance.ClassName == \"RemoteFunction\" and (Method == \"InvokeServer\" or Method == \"invokeServer\")\n\t\t\t)\n\n\t\t\tlocal IsBindableFunctionInvoke = (\n\t\t\t\tTargetInstance.ClassName == \"BindableFunction\" and (Method == \"Invoke\" or Method == \"invoke\")\n\t\t\t)\n\n\t\t\tif IsRemoteFunctionInvoke or IsBindableFunctionInvoke then\n\t\t\t\t--// Handle Incoming Log \\\\--\n\t\t\t\tLog = GetLog(TargetInstance, \"Incoming\")\n\t\t\t\tlocal RFResultInfo = {\n\t\t\t\t\tArguments = Arguments,\n\t\t\t\t\tInvokeResult = nil,\n\t\t\t\t\tOrigin = getcallingscript(),\n\t\t\t\t\tFunction = getcallingfunction(),\n\t\t\t\t\tLine = getcallingline(),\n\t\t\t\t\tSource = getcallingsource(),\n\t\t\t\t\tIsExecutor = checkcaller(),\n\t\t\t\t\tInvokeKind = \"Request\",\n\t\t\t\t}\n\n\t\t\t\tif Log:ShouldBlock(RFResultInfo) then\n\t\t\t\t\tLog:Call(RFResultInfo)\n\t\t\t\t\treturn\n\t\t\t\tend\n\n\t\t\t\treturn HandleLoggingResult(Log, RFResultInfo, \"InvokeResult\", OldFunction(...))\n\t\t\tend\n\n\t\t\treturn OldFunction(...)\n\t\tend\n\n\t\t--#region Hook Filters\n\t\tlocal SupportsFilters = wax.shared.ExecutorSupport[\"FilterBase\"].IsWorking\n\n\t\t--[[\n\t\t\tCreates a base filter for the outgoing hooks.\n\n\t\t\t@return `table` The base filter.\n\t\t]]\n\t\tlocal function CreateBaseFilter()\n\t\t\tlocal Filters = {}\n\t\t\tif not SupportsFilters then\n\t\t\t\treturn Filters\n\t\t\tend\n\n\t\t\t--// ignore communicator \\\\--\n\t\t\ttable.insert(Filters, NotFilter.new(ArgumentFilter.new(1, wax.shared.Communicator)))\n\t\t\ttable.insert(Filters, NotFilter.new(ArgumentFilter.new(1, wax.shared.ActorCommunicator)))\n\n\t\t\treturn Filters\n\t\tend\n\n\t\tlocal NamecallHookFilter = SupportsFilters and AllFilter.new((function()\n\t\t\tlocal Filters = CreateBaseFilter()\n\n\t\t\t--[[\n\t\t\t\tAllFilter:\n\t\t\t\t\tnot communicator\n\t\t\t\t\tnot actor communicator\n\t\t\t\t\tAnyFilter:\n\t\t\t\t\t\tRemoteEvent\n\t\t\t\t\t\t...\n\t\t\t\t\tAnyFilter:\n\t\t\t\t\t\tFireServer\n\t\t\t\t\t\tinvokeServer\n\t\t\t\t\t\t...\n\t\t\t--]]\n\n\t\t\t--// classnames \\\\--\n\t\t\tlocal AnyClassNameFilters = {}\n\t\t\tfor ClassName in AllowedClassNames do\n\t\t\t\ttable.insert(AnyClassNameFilters, InstanceTypeFilter.new(1, ClassName))\n\t\t\tend\n\t\t\t\n\t\t\t--// methods \\\\--\n\t\t\tlocal AnyNamecallMethoFilters = {}\n\t\t    for Method in NamecallMethods do\n\t\t        table.insert(AnyNamecallMethoFilters, NamecallFilter.new(Method))\n\t\t    end\n\n\t\t\ttable.insert(Filters, AnyFilter.new(AnyClassNameFilters))\n\t\t\ttable.insert(Filters, AnyFilter.new(AnyNamecallMethoFilters))\n\t\t    return Filters\n\t\tend)())\n\t\t--#endregion\n\n\t\t-- namecall hook\n\t\twax.shared.NamecallHook = wax.shared.Hooking.HookMetaMethod(game, \"__namecall\", function(...)\n\t\t\tlocal self = ...\n\t\t\tlocal Method = getnamecallmethod()\n\n\t\t\tif\n\t\t\t\ttypeof(self) == \"Instance\"\n\t\t\t\tand AllowedClassNames[self.ClassName]\n\t\t\t\tand not rawequal(self, wax.shared.Communicator)\n\t\t\t\tand not rawequal(self, wax.shared.ActorCommunicator)\n\t\t\t\tand (NamecallMethods[Method] and NamecallMethods[Method][self.ClassName])\n\t\t\t\tand not wax.shared.ShouldIgnore(self, getcallingscript())\n\t\t\tthen\n\t\t\t\treturn HandleLogging(cloneref(self), Method, wax.shared.NamecallHook, ...)\n\t\t\tend\n\n\t\t\treturn wax.shared.NamecallHook(...)\n\t\tend, NamecallHookFilter)\n\n\t\t-- function hooks\n\t\tlocal FunctionsToHook\n\t\tdo\n\t\t\tlocal BindableFunction = Instance.new(\"BindableFunction\")\n\t\t\tlocal BindableEvent = Instance.new(\"BindableEvent\")\n\n\t\t\tlocal RemoteFunction = Instance.new(\"RemoteFunction\")\n\t\t\tlocal RemoteEvent = Instance.new(\"RemoteEvent\")\n\t\t\tlocal UnreliableRemoteEvent = Instance.new(\"UnreliableRemoteEvent\")\n\n\t\t\tFunctionsToHook = {\n\t\t\t\tBindableFunction.Invoke,\n\t\t\t\tBindableEvent.Fire,\n\n\t\t\t\tRemoteFunction.InvokeServer,\n\t\t\t\tRemoteEvent.FireServer,\n\t\t\t\tUnreliableRemoteEvent.FireServer,\n\t\t\t}\n\n\t\t\tBindableFunction:Destroy()\n\t\t\tBindableEvent:Destroy()\n\n\t\t\tRemoteFunction:Destroy()\n\t\t\tRemoteEvent:Destroy()\n\t\t\tUnreliableRemoteEvent:Destroy()\n\t\tend\n\n\t\tlocal FunctionHookFilter = SupportsFilters and AllFilter.new((function()\n\t\t\tlocal Filters = CreateBaseFilter()\n\n\t\t\t--[[\n\t\t\t\tAllFilter:\n\t\t\t\t\tnot communicator\n\t\t\t\t\tnot actor communicator\n\t\t\t\t\tAnyFilter:\n\t\t\t\t\t\tRemoteEvent\n\t\t\t\t\t\tRemoteFunction\n\t\t\t\t\t\tUnreliableRemoteEvent\n\t\t\t\t\t\tBindableEvent\n\t\t\t\t\t\tBindableFunction\n\t\t\t--]]\n\n\t\t\tlocal ClassFilters = {}\n\t\t\tfor ClassName in AllowedClassNames do\n\t\t\t\ttable.insert(ClassFilters, InstanceTypeFilter.new(1, ClassName))\n\t\t\tend\n\n\t\t\ttable.insert(Filters, AnyFilter.new(ClassFilters))\n\t\t\treturn Filters\n\t\tend)())\n\n\t\tfor _, Function in next, FunctionsToHook do\n\t\t\tlocal Method = debug.info(Function, \"n\")\n\n\t\t\twax.shared.Hooks[Function] = wax.shared.Hooking.HookFunction(Function, function(...)\n\t\t\t\tlocal self = ...\n\n\t\t\t\tif\n\t\t\t\t\ttypeof(self) == \"Instance\"\n\t\t\t\t\tand AllowedClassNames[self.ClassName]\n\t\t\t\t\tand not rawequal(self, wax.shared.Communicator)\n\t\t\t\t\tand not wax.shared.ShouldIgnore(self, getcallingscript())\n\t\t\t\tthen\n\t\t\t\t\treturn HandleLogging(cloneref(self), Method, wax.shared.Hooks[Function], ...)\n\t\t\t\tend\n\n\t\t\t\treturn wax.shared.Hooks[Function](...)\n\t\t\tend, FunctionHookFilter)\n\t\tend\n\tend)\nend\n\ntask.spawn(function()\n\tlocal getrawmetatable = getrawmetatable or debug.getmetatable\n\n\twax.shared.Communicator.Event:Connect(function(Type, ...)\n\t\tif Type ~= \"Unload\" then\n\t\t\treturn\n\t\tend\n\n\t\tlocal gameMetatable = getrawmetatable(game)\n\n\t\tif wax.shared.ExecutorSupport[\"oth\"].IsWorking then\n\t\t\tif Data.Outgoing then\n\t\t\t\tpcall(oth.unhook, gameMetatable.__namecall)\n\t\t\tend\n\t\t\tif Data.IncomingCallbacks then\n\t\t\t\tpcall(oth.unhook, gameMetatable.__newindex)\n\t\t\tend\n\t\telse\n\t\t\tif wax.shared.ExecutorSupport[\"restorefunction\"].IsWorking and wax.shared.ExecutorSupport[\"hookmetamethod\"].IsWorking then\n\t\t\t\tif Data.Outgoing then\n\t\t\t\t\tpcall(restorefunction, gameMetatable.__namecall)\n\t\t\t\tend\n\t\t\t\tif Data.IncomingCallbacks then\n\t\t\t\t\tpcall(restorefunction, gameMetatable.__newindex)\n\t\t\t\tend\n\t\t\telse\n\t\t\t\tif Data.Outgoing then\n\t\t\t\t\twax.shared.Hooking.HookMetaMethod(game, \"__namecall\", wax.shared.NamecallHook)\n\t\t\t\tend\n\t\t\t\tif Data.IncomingCallbacks then\n\t\t\t\t\twax.shared.Hooking.HookMetaMethod(game, \"__newindex\", wax.shared.NewIndexHook)\n\t\t\t\tend\n\t\t\t\tend\n\t\t\tend\n\n\t\t\tif Data.IncomingCallbacks and wax.shared.RestoreCallbackDetours then\n\t\t\t\twax.shared.RestoreCallbackDetours()\n\t\t\tend\n\n\t\t\tfor Function, Original in pairs(wax.shared.Hooks) do\n\t\t\tif wax.shared.ExecutorSupport[\"oth\"].IsWorking then\n\t\t\t\ttask.spawn(pcall, oth.unhook, Function)\n\t\t\telseif wax.shared.ExecutorSupport[\"restorefunction\"].IsWorking then\n\t\t\t\ttask.spawn(pcall, wax.shared.restorefunction, Function)\n\t\t\telse\n\t\t\t\tpcall(wax.shared.Hooking.HookFunction, Function, Original)\n\t\t\tend\n\t\tend\n\n\t\ttask.defer(function()\n\t\t\tgetgenv().CobaltInitialized = false\n\t\tend)\n\tend)\nend)\n"
+                                                    Value = "if getgenv().CobaltInitialized == true then\n\treturn\nend\n\ngetgenv().CobaltInitialized = true\n\ntype ActorData = {\n\tToken: string,\n\tIncomingConnections: boolean,\n\tIncomingCallbacks: boolean,\n\tHookIncomingConnections: boolean,\n\tOutgoing: boolean,\n\n\tIgnorePlayerModule: boolean,\n\tLogBlockedRemotes: boolean,\n\tAutoIgnoreSpammyEvents: boolean,\n\tIgnoredRemotesDropdown: { [string]: boolean },\n\n\tExecutorSupport: { [string]: { IsWorking: boolean } },\n}\n\nlocal Data: ActorData = COBALT_ACTOR_DATA\n\nlocal ChannelId, CurrentActor = ...\nif typeof(CurrentActor) == \"Instance\" then\n\tCurrentActor = cloneref(CurrentActor)\nend\n\nlocal function ResolveCurrentActor(Origin)\n\tif Origin and getluastate then\n\t\tlocal Success, LuaStateProxy = pcall(getluastate, Origin)\n\n\t\t\n\t\tif Success then\n\t\t\tlocal Actors = LuaStateProxy:GetActors()\n\t\t\tfor _, Actor in Actors do\n\t\t\t\tif Origin:IsDescendantOf(Actor) then\n\t\t\t\t\treturn cloneref(Actor)\n\t\t\t\tend\n\t\t\tend\n\n\t\t\tif #Actors == 1 then\n\t\t\t\treturn cloneref(Actors[1])\n\t\t\tend\n\t\tend\n\tend\n\n\t\n\t\n\tlocal ResolvedActor = get_current_actor and get_current_actor()\n\tif typeof(ResolvedActor) == \"Instance\" then\n\t\treturn cloneref(ResolvedActor)\n\tend\n\n\t\n\treturn CurrentActor\nend\n\nlocal RelayChannel = get_comm_channel(ChannelId)\n\nlocal wax = {shared = {}}\nwax.shared.IS_ACTOR = true\nwax.shared.CobaltVerificationToken = Data.Token\nlocal OnUnload\ndo\n\twax.shared.Hooks = {}\n\n\twax.shared.Settings = {\n\t\tIgnorePlayerModule = { Value = Data.IgnorePlayerModule },\n\t\tLogBlockedRemotes = { Value = Data.LogBlockedRemotes },\n\t\tAutoIgnoreSpammyEvents = { Value = Data.AutoIgnoreSpammyEvents },\n\t\tIgnoredRemotesDropdown = { Value = Data.IgnoredRemotesDropdown },\n\t\tLogRobloxInternalEvents = { Value = Data.LogRobloxInternalEvents },\n\t}\n\n\twax.shared.SaveManager = {\n\t\tGetState = function(Idx, Default)\n\t\t\treturn (wax.shared.Settings[Idx] and wax.shared.Settings[Idx].Value) or Data[Idx] or Default\n\t\tend,\n\t}\n\n\twax.shared.Log = {}\n\tdo\n\t\twax.shared.Logs = {\n\t\t\tOutgoing = {},\n\t\t\tIncoming = {},\n\t\t}\n\n\t\twax.shared.NewLog = function(Instance, Type, CallingScript, DebugId)\n\t\t\tlocal NewLog = wax.shared.Log.new(Instance, Type, 0, CallingScript)\n\t\t\twax.shared.Logs[Type][DebugId] = NewLog\n\t\t\treturn NewLog\n\t\tend\n\tend\n\n\twax.shared.ExecutorSupport = Data.ExecutorSupport\n\twax.shared.Communicator = RelayChannel\n\twax.shared.ExecutorName = string.split(identifyexecutor(), \" \")[1]\n\n\t\n\tfor _, Service in pairs({\n\t\t\"Players\",\n\t\t\"HttpService\",\n\t\t\"RobloxReplicatedStorage\",\n\t}) do\n\t\twax.shared[Service] = cloneref(game:GetService(Service))\n\tend\n\n\twax.shared.trampoline_call = trampoline_call or (syn and syn.trampoline_call)\n\n\t\n\n\tlocal InstanceSerializer = {}\n\tdo\n\t\t\n\t\t\n\t\tlocal function IsEqualToInstance(Object, ToCompareTo)\n\t\t\tif typeof(Object) ~= \"Instance\" or typeof(ToCompareTo) ~= \"Instance\" then return false end\n\n\t\t\tif rawequal(Object, ToCompareTo) then\n\t\t\t\treturn true\n\t\t\tend\n\n\t\t\tif wax.shared.ExecutorSupport[\"compareinstances\"].IsWorking then\n\t\t\t\treturn compareinstances(Object, ToCompareTo)\n\t\t\tend\n\n\t\t\tlocal ObjectDebugId, ToCompareToDebugId, ShouldCompareDebugIds = nil, nil, false\n\t\t\tdo\n\t\t\t\tlocal Success, ObjectDebugIdResult = pcall(wax.shared.GetDebugId, Object)\n\t\t\t\tlocal Success2, ToCompareToDebugIdResult = pcall(wax.shared.GetDebugId, ToCompareTo)\n\n\t\t\t\tif Success and Success2 then\n\t\t\t\t\tObjectDebugId = ObjectDebugIdResult\n\t\t\t\t\tToCompareToDebugId = ToCompareToDebugIdResult\n\t\t\t\t\tShouldCompareDebugIds = true\n\t\t\t\tend\n\t\t\tend\n\n\t\t\tif ShouldCompareDebugIds then\n\t\t\t\treturn ObjectDebugId == ToCompareToDebugId\n\t\t\tend\n\n\t\t\treturn false\n\t\tend\n\t\t\n\n\t\tInstanceSerializer.IsEqualToInstance = IsEqualToInstance\n\tend\n\twax.shared.InstanceSerializer = InstanceSerializer\n\n\tlocal Formatter = {}\n\tdo\n\t\t\n\t\t\n\t\tFormatter.CleanTable = { ['\"'] = '\\\\\"', [\"\\\\\"] = \"\\\\\\\\\" }\n\t\tdo\n\t\t\tfor i = 0, 31 do\n\t\t\t\tFormatter.CleanTable[string.char(i)] = \"\\\\\" .. string.format(\"%03d\", i)\n\t\t\tend\n\t\t\tfor i = 127, 255 do\n\t\t\t\tFormatter.CleanTable[string.char(i)] = \"\\\\\" .. string.format(\"%03d\", i)\n\t\t\tend\n\t\tend\n\n\t\t\n\t\tlocal IndentTemplate = string.rep(\" \", 4)\n\n\t\t\n\t\tfunction Formatter.FormatLuaString(str)\n\t\t\treturn string.gsub(str, '[\"\\\\\\0-\\31\\127-\\255]', Formatter.CleanTable)\n\t\tend\n\n\t\t\n\t\tfunction Formatter.FormatLuaLiteral(Value): string?\n\t\t\tlocal ValueType = type(Value)\n\t\t\tif ValueType == \"string\" then\n\t\t\t\treturn `\"{Formatter.FormatLuaString(Value)}\"`\n\t\t\telseif ValueType == \"number\" or ValueType == \"boolean\" then\n\t\t\t\treturn tostring(Value)\n\t\t\tend\n\n\t\t\treturn nil\n\t\tend\n\t\t\n\tend\n\n\t\n\t\t\n\t\tlocal function FindEventReferenceInTable(\n\t\t\tTable: { [any]: any },\n\t\t\tInstance: Instance,\n\t\t\tVisited: { [any]: boolean }?\n\t\t): { any }?\n\t\t\tlocal Seen = Visited or {}\n\t\t\tif Seen[Table] then\n\t\t\t\treturn nil\n\t\t\tend\n\n\t\t\tSeen[Table] = true\n\n\t\t\tfor Key, Value in next, Table do\n\t\t\t\tif\n\t\t\t\t\ttypeof(Value) == \"Instance\"\n\t\t\t\t\tand InstanceSerializer.IsEqualToInstance(Value, Instance)\n\t\t\t\t\tand Formatter.FormatLuaLiteral(Key)\n\t\t\t\tthen\n\t\t\t\t\treturn { Key }\n\t\t\t\tend\n\n\t\t\t\tif type(Value) == \"table\" and Formatter.FormatLuaLiteral(Key) then\n\t\t\t\t\tlocal ChildPath = FindEventReferenceInTable(Value, Instance, Seen)\n\t\t\t\t\tif ChildPath then\n\t\t\t\t\t\ttable.insert(ChildPath, 1, Key)\n\t\t\t\t\t\treturn ChildPath\n\t\t\t\t\tend\n\t\t\t\tend\n\t\t\tend\n\n\t\t\treturn nil\n\t\tend\n\t\n\n\t\n\tlocal RelayConnection\n\tRelayConnection = RelayChannel.Event:Connect(function(Type, ...)\n\t\tif Type == \"Unload\" then\n\t\t\tRelayConnection:Disconnect()\n\t\t\twax.shared.Unloaded = true\n\t\t\tfor _, Connection in wax.shared.Connections do\n\t\t\t\tConnection:Disconnect()\n\t\t\tend\n\t\t\ttable.clear(wax.shared.Connections)\n\n\t\t\tif OnUnload then\n\t\t\t\tOnUnload()\n\t\t\tend\n\t\telseif Type == \"MainBlock\" then\n\t\t\tlocal Instance, EventType = ...\n\t\t\tlocal Log = wax.shared.Logs[EventType][wax.shared.GetDebugId(Instance)]\n\t\t\tif Log then\n\t\t\t\tLog:Block()\n\t\t\tend\n\t\telseif Type == \"MainIgnore\" then\n\t\t\tlocal Instance, EventType = ...\n\t\t\tlocal Log = wax.shared.Logs[EventType][wax.shared.GetDebugId(Instance)]\n\t\t\tif Log then\n\t\t\t\tLog:Ignore()\n\t\t\tend\n\t\telseif Type == \"MainSettingsSync\" then\n\t\t\tlocal Setting, Value = ...\n\t\t\tif wax.shared.Settings[Setting] then\n\t\t\t\twax.shared.Settings[Setting].Value = Value\n\t\t\tend\n\t\telseif Type == \"MainCallFiltersSync\" then\n\t\t\twax.shared.CallFilters:ReplaceAll(..., true)\n\t\telseif Type == \"InspectIncomingConnections\" then\n\t\t\tlocal Instance, Method, LogIndex, CallIndex = ...\n\t\t\tlocal Success, Signal = pcall(function()\n\t\t\t\treturn Instance[Method]\n\t\t\tend)\n\t\t\tif not Success or typeof(Signal) ~= \"RBXScriptSignal\" then\n\t\t\t\treturn\n\t\t\tend\n\n\t\t\tfor _, Connection in getconnections(Signal) do\n\t\t\t\tif Connection.ForeignState then\n\t\t\t\t\tcontinue\n\t\t\t\tend\n\n\t\t\t\tlocal Function = typeof(Connection.Function) == \"function\" and Connection.Function or nil\n\n\t\t\t\tlocal Origin\n\t\t\t\tlocal Thread = Connection.Thread\n\t\t\t\tif Thread and getscriptfromthread then\n\t\t\t\t\tOrigin = getscriptfromthread(Thread)\n\t\t\t\tend\n\t\t\t\tif not Origin and Function then\n\t\t\t\t\tlocal Script = rawget(getfenv(Function), \"script\")\n\t\t\t\t\tif typeof(Script) == \"Instance\" then\n\t\t\t\t\t\tOrigin = Script\n\t\t\t\t\tend\n\t\t\t\tend\n\n\t\t\t\tlocal FixedInfo, CyclicRefs, ContainsCyclicRef = wax.shared.SerializeActorInfo({\n\t\t\t\t\tOrigin = Origin,\n\t\t\t\t\tFunction = Function,\n\t\t\t\t\tLine = nil,\n\t\t\t\t\tIsExecutor = Function and isexecutorclosure(Function) or false,\n\t\t\t\t\tIsActor = true,\n\t\t\t\t\tActor = ResolveCurrentActor(Origin),\n\t\t\t\t})\n\n\t\t\t\tRelayChannel:Fire(\n\t\t\t\t\t\"IncomingConnectionMetadata\",\n\t\t\t\t\tInstance,\n\t\t\t\t\tLogIndex,\n\t\t\t\t\tCallIndex,\n\t\t\t\t\tFixedInfo,\n\t\t\t\t\tCyclicRefs,\n\t\t\t\t\tContainsCyclicRef\n\t\t\t\t)\n\t\t\tend\n\t\telseif Type == \"ResolveEventReference\" then\n\t\t\tlocal Hash, Instance, IsExecutor, RequestId = ...\n\t\t\tlocal Retrieved = nil\n\n\t\t\tif filtergc then\n\t\t\t\tRetrieved = filtergc(\"function\", {\n\t\t\t\t\tHash = Hash,\n\t\t\t\t\tIgnoreExecutor = not IsExecutor,\n\t\t\t\t}, true)\n\t\t\telse\n\t\t\t\tfor _, Func in getgc() do\n\t\t\t\t\tif typeof(Func) ~= \"function\" then\n\t\t\t\t\t\tcontinue\n\t\t\t\t\tend\n\n\t\t\t\t\tif IsExecutor and not isexecutorclosure(Func) then\n\t\t\t\t\t\tcontinue\n\t\t\t\t\tend\n\n\t\t\t\t\tif getfunctionhash(Func) == Hash then\n\t\t\t\t\t\tRetrieved = Func\n\t\t\t\t\t\tbreak\n\t\t\t\t\tend\n\t\t\t\tend\n\t\t\tend\n\n\t\t\tif not Retrieved then\n\t\t\t\tRelayChannel:Fire(\"ResolveEventReferenceResponse\", RequestId, nil)\n\t\t\t\treturn\n\t\t\tend\n\n\t\t\tlocal UpvaluePath = FindEventReferenceInTable(debug.getupvalues(Retrieved), Instance)\n\n\t\t\tif not UpvaluePath then\n\t\t\t\tRelayChannel:Fire(\"ResolveEventReferenceResponse\", RequestId, nil)\n\t\t\t\treturn\n\t\t\tend\n\n\t\t\tlocal UpvalueIndex = table.remove(UpvaluePath, 1)\n\t\t\tRelayChannel:Fire(\"ResolveEventReferenceResponse\", RequestId, {\n\t\t\t\tHash = Hash,\n\t\t\t\tIndex = UpvalueIndex,\n\t\t\t\tPath = UpvaluePath,\n\t\t\t})\n\t\tend\n\tend)\n\n\twax.shared.Unloaded = false\nend\n\n\ndo\n\tlocal Connections = {}\n\n\tlocal function Connect(Connection)\n\t\ttable.insert(Connections, Connection)\n\t\treturn Connection\n\tend\n\n\tlocal function Disconnect(Connection)\n\t\tConnection:Disconnect()\n\n\t\tlocal Index = table.find(Connections, Connection)\n\t\tif Index then\n\t\t\ttable.remove(Connections, Index)\n\t\tend\n\n\t\treturn true\n\tend\n\n\twax.shared.Connections = Connections\n\twax.shared.Connect = Connect\n\twax.shared.Disconnect = Disconnect\n\n\twax.shared.Connect = Connect\nend\n\n\n\nwax.shared.LocalPlayer = wax.shared.Players.LocalPlayer\n\n--[[\n\t`QueryDescendants` is a native engine call and is dramatically faster than\n\twalking `GetDescendants()` in Lua, but a few executors ship without it, so\n\tthe manual scan is kept as the compatibility path.\n]]\nlocal function FindFirstDescendantOfClass(Root, ClassName)\n\tlocal QueryDescendants = (Root :: any).QueryDescendants\n\tif typeof(QueryDescendants) == \"function\" then\n\t\tlocal Success, Matches = pcall(function()\n\t\t\treturn Root:QueryDescendants(ClassName)\n\t\tend)\n\n\t\tif Success and typeof(Matches) == \"table\" then\n\t\t\treturn Matches[1]\n\t\tend\n\tend\n\n\tfor _, Descendant in Root:GetDescendants() do\n\t\tif Descendant:IsA(ClassName) then\n\t\t\treturn Descendant\n\t\tend\n\tend\n\n\treturn nil\nend\n\nlocal ContendingPlayerScripts =\n\tcloneref(FindFirstDescendantOfClass(wax.shared.LocalPlayer, \"PlayerScripts\") or wax.shared.LocalPlayer)\nif ContendingPlayerScripts:IsA(\"PlayerScripts\") then\n\twax.shared.PlayerScripts = ContendingPlayerScripts\nelse\n\twax.shared.PlayerScripts = nil\n\n\tlocal ChildAddedConnection\n\tChildAddedConnection = wax.shared.Connect(wax.shared.LocalPlayer.ChildAdded:Connect(function(Child)\n\t\tif Child:IsA(\"PlayerScripts\") then\n\t\t\twax.shared.PlayerScripts = cloneref(Child)\n\t\t\twax.shared.Disconnect(ChildAddedConnection)\n\t\tend\n\tend))\nend\n\n\n\nwax.shared.restorefunction = function(Function: (...any) -> ...any, Silent: boolean?)\n\tlocal Original = wax.shared.Hooks[Function]\n\n\tif Silent and not Original then\n\t\treturn\n\tend\n\n\tassert(Original, \"Function not hooked\")\n\n\tif restorefunction and isfunctionhooked(Function) then\n\t\trestorefunction(Function)\n\telse\n\t\twax.shared.Hooking.HookFunction(Function, Original)\n\tend\n\n\twax.shared.Hooks[Function] = nil\nend\nwax.shared.getrawmetatable = wax.shared.ExecutorSupport[\"getrawmetatable\"].IsWorking\n\t\tand (getrawmetatable or debug.getmetatable)\n\tor function()\n\t\treturn setmetatable({}, {\n\t\t\t__index = function()\n\t\t\t\treturn function() end\n\t\t\tend,\n\t\t})\n\tend\n\nlocal RawGetDebugId = clonefunction and clonefunction(game.GetDebugId) or game.GetDebugId\nwax.shared.GetDebugId = function(Instance)\n\tlocal identity = getthreadidentity()\n\tsetthreadidentity(8)\n\tlocal id = RawGetDebugId(Instance)\n\tsetthreadidentity(identity)\n\treturn id\nend\n\nwax.shared.newcclosure = wax.shared.ExecutorName == \"AWP\"\n\t\tand function(f, name)\n\t\t\tlocal env = getfenv(f)\n\t\t\tlocal x = setmetatable({\n\t\t\t\t__F = f,\n\t\t\t}, {\n\t\t\t\t__index = env,\n\t\t\t\t__newindex = env,\n\t\t\t})\n\n\t\t\tlocal nf = function(...)\n\t\t\t\treturn __F(...)\n\t\t\tend\n\n\t\t\tsetfenv(nf, x) \n\t\t\treturn newcclosure(nf, name)\n\t\tend\n\tor newcclosure\n\n\n\ndo\n\tlocal Hooking = {}\n\n\tHooking.HookFunction = function(Original, Replacement, Filter)\n\t\tif\n\t\t\twax.shared.IsUsingOthHooks\n\t\t\tand iscclosure(Original)\n\t\tthen\n\t\t\treturn oth.hook(Original, Replacement, Filter)\n\t\tend\n\n\t\tif islclosure(Replacement) then\n\t\t\tReplacement = wax.shared.newcclosure(Replacement)\n\t\tend\n\n\t\tif not wax.shared.ExecutorSupport[\"hookfunction\"].IsWorking then\n\t\t\treturn Original\n\t\tend\n\n\t\treturn hookfunction(Original, Replacement, Filter)\n\tend\n\n\tHooking.HookMetaMethod = function(object, method, hook, filter)\n\t\tlocal Metatable = wax.shared.getrawmetatable(object)\n\t\tlocal originalMethod = rawget(Metatable, method)\n\n\t\tassert(typeof(originalMethod) == \"function\", `{method} is not a function in the metatable of {object}`)\n\n\t\tif wax.shared.IsUsingOthHooks then\n\t\t\treturn oth.hook(originalMethod, hook, filter)\n\t\tend\n\n\t\tif islclosure(hook) then\n\t\t\thook = wax.shared.newcclosure(hook)\n\t\tend\n\n\t\tif\n\t\t\tnot wax.shared.ExecutorSupport[\"hookmetamethod\"].IsWorking\n\t\t\tand wax.shared.ExecutorSupport[\"getrawmetatable\"].IsWorking\n\t\tthen\n\t\t\tsetreadonly(Metatable, false)\n\t\t\trawset(Metatable, method, hook)\n\t\t\tsetreadonly(Metatable, true)\n\n\t\t\treturn originalMethod\n\t\tend\n\n\t\tif not wax.shared.ExecutorSupport[\"hookmetamethod\"].IsWorking then\n\t\t\tif method == \"__index\" then\n\t\t\t\tlocal _, Metamethod = xpcall(function()\n\t\t\t\t\treturn object[tostring(math.random())]\n\t\t\t\tend, function(err)\n\t\t\t\t\treturn debug.info(2, \"f\")\n\t\t\t\tend)\n\n\t\t\t\treturn Metamethod\n\t\t\telseif method == \"__newindex\" then\n\t\t\t\tlocal _, Metamethod = xpcall(function()\n\t\t\t\t\tobject[tostring(math.random())] = true\n\t\t\t\tend, function(err)\n\t\t\t\t\treturn debug.info(2, \"f\")\n\t\t\t\tend)\n\n\t\t\t\treturn Metamethod\n\t\t\telseif method == \"__namecall\" then\n\t\t\t\tlocal _, Metamethod = xpcall(function()\n\t\t\t\t\tobject:Mustard()\n\t\t\t\tend, function(err)\n\t\t\t\t\treturn debug.info(2, \"f\")\n\t\t\t\tend)\n\n\t\t\t\treturn Metamethod\n\t\t\tend\n\n\t\t\treturn nil\n\t\tend\n\n\t\tif filter then\n\t\t\treturn hookmetamethod(object, method, hook, true, filter)\n\t\tend\n\t\t\n\t\treturn hookmetamethod(object, method, hook)\n\tend\n\n\twax.shared.Hooking = Hooking\nend\n\n\n\ndo\n\t\n\n\tlocal TableProxy = {}\n\n\tlocal UNPACK_CHUNK = 7997\n\tlocal SAFE_LIMIT = 12000\n\n\tfunction TableProxy.Pack(...)\n\t    return { n = select(\"#\", ...), ... }\n\tend\n\n\tfunction TableProxy.Unpack(Tbl, I, J)\n\t    I = I or 1\n\t    J = J or Tbl.n or #Tbl\n\n\t    if J - I + 1 > SAFE_LIMIT then\n\t        J = I + SAFE_LIMIT - 1\n\t    end\n\n\t    if J < I then\n\t        return\n\t    end\n\n\t    if J - I + 1 <= UNPACK_CHUNK then\n\t        return table.unpack(Tbl, I, J)\n\t    end\n\n\t    return Tbl[I], TableProxy.Unpack(Tbl, I + 1, J)\n\tend\n\n\twax.shared.SafePack = TableProxy\nend\n\n\n\ndo\n\t\n\ttype SchemaKind = \"Any\" | \"Type\" | \"Literal\" | \"Enum\" | \"Array\" | \"Object\" | \"Union\"\n\ttype Refinement = {\n\t\tPredicate: (any) -> boolean,\n\t\tMessage: string,\n\t}\n\ttype SchemaNode = {\n\t\tKind: SchemaKind,\n\t\tExpectedType: string?,\n\t\tLiteral: any?,\n\t\tValues: { any }?,\n\t\tItem: SchemaNode?,\n\t\tShape: { [any]: SchemaNode }?,\n\t\tSchemas: { SchemaNode }?,\n\t\tIsOptional: boolean?,\n\t\tHasDefault: boolean?,\n\t\tDefaultValue: any?,\n\t\tRefinements: { Refinement }?,\n\t\tMinimum: number?,\n\t\tMaximum: number?,\n\t\tInteger: boolean?,\n\t}\n\n\t\n\tlocal Node = {}\n\tNode.__index = Node\n\n\tlocal Schema = {}\n\n\t\n\tlocal function CloneValue(Value)\n\t\tif type(Value) ~= \"table\" then\n\t\t\treturn Value\n\t\tend\n\n\t\tlocal Copy = {}\n\t\tfor Key, Child in Value do\n\t\t\tCopy[CloneValue(Key)] = CloneValue(Child)\n\t\tend\n\t\treturn Copy\n\tend\n\n\tlocal function CloneNode(self: SchemaNode): SchemaNode\n\t\tlocal Copy = table.clone(self)\n\t\tCopy.Refinements = self.Refinements and table.clone(self.Refinements) or nil\n\t\treturn setmetatable(Copy, Node) :: any\n\tend\n\n\tlocal function NewNode(Kind: SchemaKind, Data: { [any]: any }?): SchemaNode\n\t\tlocal NewSchema = Data and table.clone(Data) or {}\n\t\tNewSchema.Kind = Kind\n\t\treturn setmetatable(NewSchema, Node) :: any\n\tend\n\n\tlocal function AddError(Errors: { string }, Path: string, Message: string)\n\t\ttable.insert(Errors, `{Path}: {Message}`)\n\tend\n\n\tlocal function ChildPath(Path: string, Key: any): string\n\t\tif type(Key) == \"number\" then\n\t\t\treturn `{Path}[{Key}]`\n\t\tend\n\t\treturn Path == \"\" and tostring(Key) or `{Path}.{Key}`\n\tend\n\n\tlocal function IsSchema(Value): boolean\n\t\treturn type(Value) == \"table\" and getmetatable(Value) == Node\n\tend\n\n\tlocal function ValidateNode(CurrentSchema: SchemaNode, Value: any, Path: string, Errors: { string }): (boolean, any)\n\t\tif Value == nil then\n\t\t\tif CurrentSchema.HasDefault then\n\t\t\t\treturn true, CloneValue(CurrentSchema.DefaultValue)\n\t\t\tend\n\t\t\tif CurrentSchema.IsOptional then\n\t\t\t\treturn true, nil\n\t\t\tend\n\n\t\t\tAddError(Errors, Path, \"is required\")\n\t\t\treturn false, nil\n\t\tend\n\n\t\tlocal IsValid = true\n\t\tlocal Output = Value\n\t\tlocal Kind = CurrentSchema.Kind\n\n\t\tif Kind == \"Type\" then\n\t\t\tIsValid = typeof(Value) == CurrentSchema.ExpectedType\n\t\t\tif not IsValid then\n\t\t\t\tAddError(Errors, Path, `expected {CurrentSchema.ExpectedType}, got {typeof(Value)}`)\n\t\t\tend\n\t\telseif Kind == \"Literal\" then\n\t\t\tIsValid = Value == CurrentSchema.Literal\n\t\t\tif not IsValid then\n\t\t\t\tAddError(Errors, Path, `expected {tostring(CurrentSchema.Literal)}`)\n\t\t\tend\n\t\telseif Kind == \"Enum\" then\n\t\t\tIsValid = false\n\t\t\tfor _, Option in CurrentSchema.Values or {} do\n\t\t\t\tif Value == Option then\n\t\t\t\t\tIsValid = true\n\t\t\t\t\tbreak\n\t\t\t\tend\n\t\t\tend\n\t\t\tif not IsValid then\n\t\t\t\tlocal Options = {}\n\t\t\t\tfor _, Option in CurrentSchema.Values or {} do\n\t\t\t\t\ttable.insert(Options, tostring(Option))\n\t\t\t\tend\n\t\t\t\tAddError(Errors, Path, `expected one of {table.concat(Options, \", \")}`)\n\t\t\tend\n\t\telseif Kind == \"Array\" then\n\t\t\tif type(Value) ~= \"table\" then\n\t\t\t\tAddError(Errors, Path, `expected table, got {typeof(Value)}`)\n\t\t\t\tIsValid = false\n\t\t\telse\n\t\t\t\tOutput = {}\n\t\t\t\tfor Index, Child in Value do\n\t\t\t\t\tif type(Index) ~= \"number\" or Index % 1 ~= 0 or Index < 1 then\n\t\t\t\t\t\tAddError(Errors, Path, \"expected an array with positive integer keys\")\n\t\t\t\t\t\tIsValid = false\n\t\t\t\t\t\tcontinue\n\t\t\t\t\tend\n\n\t\t\t\t\tlocal ChildValid, ChildOutput = ValidateNode(CurrentSchema.Item :: SchemaNode, Child, ChildPath(Path, Index), Errors)\n\t\t\t\t\tIsValid = ChildValid and IsValid\n\t\t\t\t\tif ChildValid then\n\t\t\t\t\t\tOutput[Index] = ChildOutput\n\t\t\t\t\tend\n\t\t\t\tend\n\t\t\tend\n\t\telseif Kind == \"Object\" then\n\t\t\tif type(Value) ~= \"table\" then\n\t\t\t\tAddError(Errors, Path, `expected table, got {typeof(Value)}`)\n\t\t\t\tIsValid = false\n\t\t\telse\n\t\t\t\tOutput = {}\n\t\t\t\tfor Key, ChildSchema in CurrentSchema.Shape or {} do\n\t\t\t\t\tlocal ChildValid, ChildOutput = ValidateNode(ChildSchema, Value[Key], ChildPath(Path, Key), Errors)\n\t\t\t\t\tIsValid = ChildValid and IsValid\n\t\t\t\t\tif ChildOutput ~= nil then\n\t\t\t\t\t\tOutput[Key] = ChildOutput\n\t\t\t\t\tend\n\t\t\t\tend\n\t\t\tend\n\t\telseif Kind == \"Union\" then\n\t\t\tIsValid = false\n\t\t\tfor _, ChildSchema in CurrentSchema.Schemas or {} do\n\t\t\t\tlocal ChildErrors = {}\n\t\t\t\tlocal ChildValid, ChildOutput = ValidateNode(ChildSchema, Value, Path, ChildErrors)\n\t\t\t\tif ChildValid then\n\t\t\t\t\tIsValid = true\n\t\t\t\t\tOutput = ChildOutput\n\t\t\t\t\tbreak\n\t\t\t\tend\n\t\t\tend\n\t\t\tif not IsValid then\n\t\t\t\tAddError(Errors, Path, \"did not match any allowed schema\")\n\t\t\tend\n\t\tend\n\n\t\tif not IsValid then\n\t\t\treturn false, nil\n\t\tend\n\n\t\tif type(Output) == \"number\" then\n\t\t\tif CurrentSchema.Integer and Output % 1 ~= 0 then\n\t\t\t\tAddError(Errors, Path, \"expected an integer\")\n\t\t\t\tIsValid = false\n\t\t\tend\n\t\t\tif CurrentSchema.Minimum ~= nil and Output < CurrentSchema.Minimum then\n\t\t\t\tAddError(Errors, Path, `must be at least {CurrentSchema.Minimum}`)\n\t\t\t\tIsValid = false\n\t\t\tend\n\t\t\tif CurrentSchema.Maximum ~= nil and Output > CurrentSchema.Maximum then\n\t\t\t\tAddError(Errors, Path, `must be at most {CurrentSchema.Maximum}`)\n\t\t\t\tIsValid = false\n\t\t\tend\n\t\tend\n\n\t\tfor _, Refinement in CurrentSchema.Refinements or {} do\n\t\t\tlocal Success, Result = pcall(Refinement.Predicate, Output)\n\t\t\tif not Success or not Result then\n\t\t\t\tAddError(Errors, Path, Refinement.Message)\n\t\t\t\tIsValid = false\n\t\t\tend\n\t\tend\n\n\t\tif not IsValid then\n\t\t\treturn false, nil\n\t\tend\n\t\treturn true, Output\n\tend\n\n\t\n\tfunction Node:optional(): SchemaNode\n\t\tlocal Copy = CloneNode(self)\n\t\tCopy.IsOptional = true\n\t\treturn Copy\n\tend\n\n\tfunction Node:default(Value: any): SchemaNode\n\t\tlocal Copy = CloneNode(self)\n\t\tCopy.HasDefault = true\n\t\tCopy.DefaultValue = Value\n\t\treturn Copy\n\tend\n\n\tfunction Node:refine(Predicate: (any) -> boolean, Message: string?): SchemaNode\n\t\tassert(type(Predicate) == \"function\", \"Schema refinement must be a function\")\n\t\tlocal Copy = CloneNode(self)\n\t\tCopy.Refinements = Copy.Refinements or {}\n\t\ttable.insert(Copy.Refinements, {\n\t\t\tPredicate = Predicate,\n\t\t\tMessage = Message or \"failed refinement\",\n\t\t})\n\t\treturn Copy\n\tend\n\n\tfunction Node:integer(): SchemaNode\n\t\tassert(self.Kind == \"Type\" and self.ExpectedType == \"number\", \"integer() can only be used on number schemas\")\n\t\tlocal Copy = CloneNode(self)\n\t\tCopy.Integer = true\n\t\treturn Copy\n\tend\n\n\tfunction Node:min(Value: number): SchemaNode\n\t\tassert(self.Kind == \"Type\" and self.ExpectedType == \"number\", \"min() can only be used on number schemas\")\n\t\tlocal Copy = CloneNode(self)\n\t\tCopy.Minimum = Value\n\t\treturn Copy\n\tend\n\n\tfunction Node:max(Value: number): SchemaNode\n\t\tassert(self.Kind == \"Type\" and self.ExpectedType == \"number\", \"max() can only be used on number schemas\")\n\t\tlocal Copy = CloneNode(self)\n\t\tCopy.Maximum = Value\n\t\treturn Copy\n\tend\n\n\t\n\tfunction Schema.any(): SchemaNode\n\t\treturn NewNode(\"Any\")\n\tend\n\n\tfunction Schema.type(ExpectedType: string): SchemaNode\n\t\tassert(type(ExpectedType) == \"string\", \"Schema type must be a string\")\n\t\treturn NewNode(\"Type\", { ExpectedType = ExpectedType })\n\tend\n\n\tfunction Schema.string(): SchemaNode\n\t\treturn Schema.type(\"string\")\n\tend\n\n\tfunction Schema.number(): SchemaNode\n\t\treturn Schema.type(\"number\")\n\tend\n\n\tfunction Schema.boolean(): SchemaNode\n\t\treturn Schema.type(\"boolean\")\n\tend\n\n\tfunction Schema.table(): SchemaNode\n\t\treturn Schema.type(\"table\")\n\tend\n\n\tfunction Schema.callback(): SchemaNode\n\t\treturn Schema.type(\"function\")\n\tend\n\n\tfunction Schema.instance(ClassName: string?): SchemaNode\n\t\tlocal InstanceSchema = Schema.type(\"Instance\")\n\t\tif ClassName then\n\t\t\treturn InstanceSchema:refine(function(Value)\n\t\t\t\treturn Value:IsA(ClassName)\n\t\t\tend, `expected an Instance that is a {ClassName}`)\n\t\tend\n\t\treturn InstanceSchema\n\tend\n\n\tfunction Schema.literal(Value: any): SchemaNode\n\t\tassert(Value ~= nil, \"Schema literal cannot be nil; use optional() instead\")\n\t\treturn NewNode(\"Literal\", { Literal = Value })\n\tend\n\n\tfunction Schema.enum(Values: { any }): SchemaNode\n\t\tassert(type(Values) == \"table\" and #Values > 0, \"Schema enum requires at least one value\")\n\t\treturn NewNode(\"Enum\", { Values = table.clone(Values) })\n\tend\n\n\tfunction Schema.array(ItemSchema: SchemaNode): SchemaNode\n\t\tassert(IsSchema(ItemSchema), \"Schema array requires an item schema\")\n\t\treturn NewNode(\"Array\", { Item = ItemSchema })\n\tend\n\n\tfunction Schema.object(Shape: { [any]: SchemaNode }): SchemaNode\n\t\tassert(type(Shape) == \"table\", \"Schema object requires a shape\")\n\t\tfor Key, ChildSchema in Shape do\n\t\t\tassert(IsSchema(ChildSchema), `Schema object field {tostring(Key)} must be a schema`)\n\t\tend\n\t\treturn NewNode(\"Object\", { Shape = table.clone(Shape) })\n\tend\n\n\tfunction Schema.union(Schemas: { SchemaNode }): SchemaNode\n\t\tassert(type(Schemas) == \"table\" and #Schemas > 0, \"Schema union requires at least one schema\")\n\t\tfor _, ChildSchema in Schemas do\n\t\t\tassert(IsSchema(ChildSchema), \"Schema union entries must be schemas\")\n\t\tend\n\t\treturn NewNode(\"Union\", { Schemas = table.clone(Schemas) })\n\tend\n\n\t\n\tfunction Schema.Validate(DataSchema: SchemaNode, Value: any): (boolean, any, { string })\n\t\tassert(IsSchema(DataSchema), \"ValidateSchema requires a schema created by Validation.Schema\")\n\t\tlocal Errors = {}\n\t\tlocal IsValid, Output = ValidateNode(DataSchema, Value, \"Value\", Errors)\n\t\treturn IsValid, Output, Errors\n\tend\n\n\twax.shared.ValidationSchema = Schema\nend\n\n\n\ndo\n\t\n\tlocal Schema = wax.shared.ValidationSchema or require(script.Schema)\n\n\t\n\tlocal Validation = {\n\t\tSchema = Schema,\n\t}\n\n\t\n\tfunction Validation.FillTemplate(Data, Template)\n\t\tlocal NewData = {}\n\t\tfor Key, Value in Template do\n\t\t\tif Data[Key] == nil or typeof(Data[Key]) ~= typeof(Value) then\n\t\t\t\tNewData[Key] = Value\n\t\t\telse\n\t\t\t\tNewData[Key] = Data[Key]\n\t\t\tend\n\t\tend\n\n\t\treturn NewData\n\tend\n\n\tfunction Validation.ValidateSchema(Data, DataSchema)\n\t\treturn Schema.Validate(DataSchema, Data)\n\tend\n\n\twax.shared.Validation = Validation\nend\n\n\n\ndo\n\tlocal Operators = {}\n\n\tlocal Registry = {\n\t\tEquals = {\n\t\t\tText = \"==\",\n\t\t\tAllowedTypes = { boolean = true, number = true, string = true },\n\t\t\tEvaluate = function(Value, Expected)\n\t\t\t\treturn Value == Expected\n\t\t\tend,\n\t\t},\n\t\tNotEquals = {\n\t\t\tText = \"~=\",\n\t\t\tAllowedTypes = { boolean = true, number = true, string = true },\n\t\t\tEvaluate = function(Value, Expected)\n\t\t\t\treturn Value ~= Expected\n\t\t\tend,\n\t\t},\n\t\tLessThan = {\n\t\t\tText = \"<\",\n\t\t\tNumericComparison = true,\n\t\t\tAllowedTypes = { number = true },\n\t\t\tEvaluate = function(Value, Expected)\n\t\t\t\treturn typeof(Value) == \"number\" and typeof(Expected) == \"number\" and Value < Expected\n\t\t\tend,\n\t\t},\n\t\tLessThanOrEqual = {\n\t\t\tText = \"<=\",\n\t\t\tNumericComparison = true,\n\t\t\tAllowedTypes = { number = true },\n\t\t\tEvaluate = function(Value, Expected)\n\t\t\t\treturn typeof(Value) == \"number\" and typeof(Expected) == \"number\" and Value <= Expected\n\t\t\tend,\n\t\t},\n\t\tGreaterThan = {\n\t\t\tText = \">\",\n\t\t\tNumericComparison = true,\n\t\t\tAllowedTypes = { number = true },\n\t\t\tEvaluate = function(Value, Expected)\n\t\t\t\treturn typeof(Value) == \"number\" and typeof(Expected) == \"number\" and Value > Expected\n\t\t\tend,\n\t\t},\n\t\tGreaterThanOrEqual = {\n\t\t\tText = \">=\",\n\t\t\tNumericComparison = true,\n\t\t\tAllowedTypes = { number = true },\n\t\t\tEvaluate = function(Value, Expected)\n\t\t\t\treturn typeof(Value) == \"number\" and typeof(Expected) == \"number\" and Value >= Expected\n\t\t\tend,\n\t\t},\n\t\tContains = {\n\t\t\tText = \"Contains\",\n\t\t\tSummaryText = \"contains\",\n\t\t\tAllowedTypes = { string = true },\n\t\t\tEvaluate = function(Value, Expected)\n\t\t\t\treturn typeof(Value) == \"string\"\n\t\t\t\t\tand typeof(Expected) == \"string\"\n\t\t\t\t\tand string.find(Value, Expected, 1, true) ~= nil\n\t\t\tend,\n\t\t},\n\t\tStartsWith = {\n\t\t\tText = \"Starts with\",\n\t\t\tSummaryText = \"starts with\",\n\t\t\tAllowedTypes = { string = true },\n\t\t\tEvaluate = function(Value, Expected)\n\t\t\t\treturn typeof(Value) == \"string\"\n\t\t\t\t\tand typeof(Expected) == \"string\"\n\t\t\t\t\tand string.sub(Value, 1, #Expected) == Expected\n\t\t\tend,\n\t\t},\n\t\tEndsWith = {\n\t\t\tText = \"Ends with\",\n\t\t\tSummaryText = \"ends with\",\n\t\t\tAllowedTypes = { string = true },\n\t\t\tEvaluate = function(Value, Expected)\n\t\t\t\treturn typeof(Value) == \"string\"\n\t\t\t\t\tand typeof(Expected) == \"string\"\n\t\t\t\t\tand (Expected == \"\" or string.sub(Value, -#Expected) == Expected)\n\t\t\tend,\n\t\t},\n\t\tTypeIs = {\n\t\t\tText = \"Type\",\n\t\t\tSummaryText = \"type\",\n\t\t\tEvaluate = function(Value, Expected)\n\t\t\t\treturn typeof(Value) == tostring(Expected)\n\t\t\tend,\n\t\t},\n\t}\n\n\tlocal Order = {\n\t\t\"Equals\",\n\t\t\"NotEquals\",\n\t\t\"LessThan\",\n\t\t\"LessThanOrEqual\",\n\t\t\"GreaterThan\",\n\t\t\"GreaterThanOrEqual\",\n\t\t\"Contains\",\n\t\t\"StartsWith\",\n\t\t\"EndsWith\",\n\t\t\"TypeIs\",\n\t}\n\n\tlocal TypeNames = {\n\t\t\"nil\",\n\t\t\"boolean\",\n\t\t\"number\",\n\t\t\"string\",\n\t\t\"table\",\n\t\t\"function\",\n\t\t\"thread\",\n\t\t\"userdata\",\n\t\t\"Instance\",\n\t\t\"EnumItem\",\n\t\t\"RBXScriptSignal\",\n\t\t\"RBXScriptConnection\",\n\t\t\"Vector2\",\n\t\t\"Vector3\",\n\t\t\"CFrame\",\n\t\t\"Color3\",\n\t\t\"BrickColor\",\n\t\t\"UDim\",\n\t\t\"UDim2\",\n\t\t\"Rect\",\n\t\t\"Ray\",\n\t\t\"buffer\",\n\t}\n\n\tlocal TypeNameLookup = {}\n\tfor _, TypeName in TypeNames do\n\t\tTypeNameLookup[TypeName] = true\n\tend\n\n\tlocal function GetSubjectKey(Subject): string\n\t\treturn if Subject.Type == \"ArgumentCount\" then \"ArgumentCount\" else `Argument:{Subject.Index}`\n\tend\n\n\tlocal function FormatSubject(Subject): string\n\t\treturn if Subject.Type == \"ArgumentCount\" then \"#Arg\" else `Arg[{Subject.Index}]`\n\tend\n\n\tlocal function GetAndGroupRange(Conditions, Condition)\n\t\tlocal ConditionIndex = table.find(Conditions, Condition)\n\t\tif not ConditionIndex then\n\t\t\treturn 1, #Conditions\n\t\tend\n\n\t\tlocal FirstIndex = 1\n\t\tfor Index = ConditionIndex, 2, -1 do\n\t\t\tif Conditions[Index].Join == \"Or\" then\n\t\t\t\tFirstIndex = Index\n\t\t\t\tbreak\n\t\t\tend\n\t\tend\n\n\t\tlocal LastIndex = #Conditions\n\t\tfor Index = ConditionIndex + 1, #Conditions do\n\t\t\tif Conditions[Index].Join == \"Or\" then\n\t\t\t\tLastIndex = Index - 1\n\t\t\t\tbreak\n\t\t\tend\n\t\tend\n\n\t\treturn FirstIndex, LastIndex\n\tend\n\n\tlocal function FormatValue(Value): string\n\t\treturn if typeof(Value) == \"string\" then `\"{Value}\"` else tostring(Value)\n\tend\n\n\tfunction Operators.Get(Operator)\n\t\treturn Registry[Operator]\n\tend\n\n\tfunction Operators.GetOptions()\n\t\tlocal Options = {}\n\t\tfor _, Operator in Order do\n\t\t\tlocal Definition = Registry[Operator]\n\t\t\ttable.insert(Options, {\n\t\t\t\tValue = Operator,\n\t\t\t\tText = Definition.Text,\n\t\t\t})\n\t\tend\n\t\treturn Options\n\tend\n\n\tfunction Operators.GetTypeNames()\n\t\treturn table.clone(TypeNames)\n\tend\n\n\tfunction Operators.IsTypeName(Value): boolean\n\t\treturn type(Value) == \"string\" and TypeNameLookup[Value] == true\n\tend\n\n\tfunction Operators.GetText(Operator, Summary: boolean?): string\n\t\tlocal Definition = Registry[Operator]\n\t\tif not Definition then\n\t\t\treturn tostring(Operator)\n\t\tend\n\t\treturn Summary and Definition.SummaryText or Definition.Text\n\tend\n\n\tfunction Operators.FormatValue(Value): string\n\t\treturn FormatValue(Value)\n\tend\n\n\tfunction Operators.IsNumericComparison(Operator): boolean\n\t\tlocal Definition = Registry[Operator]\n\t\treturn Definition ~= nil and Definition.NumericComparison == true\n\tend\n\n\tfunction Operators.Evaluate(Operator, Value, Expected): boolean\n\t\tlocal Definition = Registry[Operator]\n\t\treturn Definition ~= nil and Definition.Evaluate(Value, Expected) or false\n\tend\n\n\tfunction Operators.ResolveSubject(Subject, Arguments)\n\t\tif Subject.Type == \"ArgumentCount\" then\n\t\t\treturn Arguments.n or #Arguments\n\t\tend\n\n\t\treturn Arguments[Subject.Index]\n\tend\n\n\tfunction Operators.MatchesCondition(Condition, Arguments): boolean\n\t\treturn Operators.Evaluate(Condition.Operator, Operators.ResolveSubject(Condition.Subject, Arguments), Condition.Value)\n\tend\n\n\tfunction Operators.Matches(Conditions, ResolveValue): boolean\n\t\tif #Conditions == 0 then\n\t\t\treturn true\n\t\tend\n\n\t\tlocal AnyGroupMatches = false\n\t\tlocal CurrentGroupMatches = Operators.Evaluate(\n\t\t\tConditions[1].Operator,\n\t\t\tResolveValue(Conditions[1]),\n\t\t\tConditions[1].Value\n\t\t)\n\t\tfor Index = 2, #Conditions do\n\t\t\tlocal Condition = Conditions[Index]\n\t\t\tlocal Matches = Operators.Evaluate(Condition.Operator, ResolveValue(Condition), Condition.Value)\n\t\t\tif Condition.Join == \"Or\" then\n\t\t\t\tAnyGroupMatches = AnyGroupMatches or CurrentGroupMatches\n\t\t\t\tCurrentGroupMatches = Matches\n\t\t\telse\n\t\t\t\tCurrentGroupMatches = CurrentGroupMatches and Matches\n\t\t\tend\n\t\tend\n\n\t\treturn AnyGroupMatches or CurrentGroupMatches\n\tend\n\n\tfunction Operators.MatchesConditions(Conditions, Arguments): boolean\n\t\treturn Operators.Matches(Conditions, function(Condition)\n\t\t\treturn Operators.ResolveSubject(Condition.Subject, Arguments)\n\t\tend)\n\tend\n\n\tfunction Operators.GetConditionType(Conditions, Condition): string?\n\t\tif Condition.Subject.Type == \"ArgumentCount\" then\n\t\t\treturn \"number\"\n\t\tend\n\n\t\tlocal SubjectKey = GetSubjectKey(Condition.Subject)\n\t\tlocal FirstIndex, LastIndex = GetAndGroupRange(Conditions, Condition)\n\t\tfor Index = FirstIndex, LastIndex do\n\t\t\tlocal OtherCondition = Conditions[Index]\n\t\t\tif\n\t\t\t\tOtherCondition ~= Condition\n\t\t\t\tand GetSubjectKey(OtherCondition.Subject) == SubjectKey\n\t\t\t\tand OtherCondition.Operator == \"TypeIs\"\n\t\t\tthen\n\t\t\t\treturn tostring(OtherCondition.Value)\n\t\t\tend\n\t\tend\n\n\t\tif Condition.Operator == \"TypeIs\" then\n\t\t\treturn tostring(Condition.Value)\n\t\tend\n\n\t\tlocal ValueType = typeof(Condition.Value)\n\t\tif ValueType == \"boolean\" or ValueType == \"number\" then\n\t\t\treturn ValueType\n\t\tend\n\n\t\tfor Index = FirstIndex, LastIndex do\n\t\t\tlocal OtherCondition = Conditions[Index]\n\t\t\tlocal OtherValueType = typeof(OtherCondition.Value)\n\t\t\tif\n\t\t\t\tOtherCondition ~= Condition\n\t\t\t\tand GetSubjectKey(OtherCondition.Subject) == SubjectKey\n\t\t\t\tand (OtherValueType == \"boolean\" or OtherValueType == \"number\")\n\t\t\tthen\n\t\t\t\treturn OtherValueType\n\t\t\tend\n\t\tend\n\n\t\treturn if ValueType == \"string\" then \"string\" else nil\n\tend\n\n\tfunction Operators.IsAllowed(Conditions, Condition, Operator): boolean\n\t\tif Operator == \"TypeIs\" then\n\t\t\treturn Condition.Subject.Type == \"Argument\"\n\t\tend\n\n\t\tlocal Definition = Registry[Operator]\n\t\tif not Definition then\n\t\t\treturn false\n\t\tend\n\n\t\tlocal ConditionType = Operators.GetConditionType(Conditions, Condition)\n\t\treturn ConditionType == nil or Definition.AllowedTypes[ConditionType] == true\n\tend\n\n\tfunction Operators.IsConditionValid(Conditions, Condition): boolean\n\t\tlocal Definition = Registry[Condition.Operator]\n\t\tif not Definition then\n\t\t\treturn false\n\t\tend\n\n\t\tif Condition.Operator == \"TypeIs\" then\n\t\t\treturn Condition.Subject.Type == \"Argument\" and Operators.IsTypeName(Condition.Value)\n\t\tend\n\n\t\tlocal ConditionType = Operators.GetConditionType(Conditions, Condition)\n\t\treturn ConditionType ~= nil\n\t\t\tand Definition.AllowedTypes ~= nil\n\t\t\tand Definition.AllowedTypes[ConditionType] == true\n\t\t\tand typeof(Condition.Value) == ConditionType\n\tend\n\n\tlocal function NumericConditionsConflict(First, Second): boolean\n\t\tif typeof(First.Value) ~= \"number\" or typeof(Second.Value) ~= \"number\" then\n\t\t\treturn false\n\t\tend\n\n\t\tif First.Operator == \"Equals\" and Operators.IsNumericComparison(Second.Operator) then\n\t\t\treturn not Operators.Evaluate(Second.Operator, First.Value, Second.Value)\n\t\telseif Second.Operator == \"Equals\" and Operators.IsNumericComparison(First.Operator) then\n\t\t\treturn not Operators.Evaluate(First.Operator, Second.Value, First.Value)\n\t\telseif not Operators.IsNumericComparison(First.Operator) or not Operators.IsNumericComparison(Second.Operator) then\n\t\t\treturn false\n\t\tend\n\n\t\tlocal FirstIsLower = First.Operator == \"GreaterThan\" or First.Operator == \"GreaterThanOrEqual\"\n\t\tlocal SecondIsLower = Second.Operator == \"GreaterThan\" or Second.Operator == \"GreaterThanOrEqual\"\n\t\tif FirstIsLower == SecondIsLower then\n\t\t\treturn false\n\t\tend\n\n\t\tlocal Lower = if FirstIsLower then First else Second\n\t\tlocal Upper = if FirstIsLower then Second else First\n\t\treturn Lower.Value > Upper.Value\n\t\t\tor Lower.Value == Upper.Value and (Lower.Operator == \"GreaterThan\" or Upper.Operator == \"LessThan\")\n\tend\n\n\tlocal function AreInSameAndBranch(Conditions, FirstIndex: number, SecondIndex: number): boolean\n\t\tfor Index = FirstIndex + 1, SecondIndex do\n\t\t\tif Conditions[Index].Join == \"Or\" then\n\t\t\t\treturn false\n\t\t\tend\n\t\tend\n\t\treturn true\n\tend\n\n\tfunction Operators.Validate(Conditions, Adapter)\n\t\tlocal Errors = {}\n\t\tlocal Conflicts = {}\n\t\tlocal GetKey = Adapter and Adapter.GetKey or function(Condition)\n\t\t\treturn GetSubjectKey(Condition.Subject)\n\t\tend\n\t\tlocal GetLabel = Adapter and Adapter.GetLabel or function(Condition)\n\t\t\treturn FormatSubject(Condition.Subject)\n\t\tend\n\t\tlocal IsConditionValid = Adapter and Adapter.IsConditionValid or function(Condition)\n\t\t\treturn Operators.IsConditionValid(Conditions, Condition)\n\t\tend\n\n\t\tlocal function AddConflict(FirstIndex: number, SecondIndex: number, Message: string)\n\t\t\tConflicts[FirstIndex] = true\n\t\t\tConflicts[SecondIndex] = true\n\t\t\ttable.insert(Errors, Message)\n\t\tend\n\n\t\tfor Index, Condition in Conditions do\n\t\t\tif not IsConditionValid(Condition) then\n\t\t\t\tConflicts[Index] = true\n\t\t\t\ttable.insert(\n\t\t\t\t\tErrors,\n\t\t\t\t\t`{GetLabel(Condition)} has a value that is incompatible with {Operators.GetText(Condition.Operator, true)}.`\n\t\t\t\t)\n\t\t\tend\n\t\tend\n\n\t\tfor FirstIndex = 1, #Conditions do\n\t\t\tlocal First = Conditions[FirstIndex]\n\t\t\tfor SecondIndex = FirstIndex + 1, #Conditions do\n\t\t\t\tlocal Second = Conditions[SecondIndex]\n\t\t\t\tif Conflicts[FirstIndex] or Conflicts[SecondIndex] then\n\t\t\t\t\tcontinue\n\t\t\t\tend\n\t\t\t\tif GetKey(First) ~= GetKey(Second) or not AreInSameAndBranch(Conditions, FirstIndex, SecondIndex) then\n\t\t\t\t\tcontinue\n\t\t\t\tend\n\t\t\t\tlocal SubjectText = GetLabel(First)\n\n\t\t\t\tif First.Operator == \"Equals\" and Second.Operator == \"Equals\" and First.Value ~= Second.Value then\n\t\t\t\t\tAddConflict(FirstIndex, SecondIndex, `{SubjectText} cannot equal both {FormatValue(First.Value)} and {FormatValue(Second.Value)}.`)\n\t\t\t\telseif\n\t\t\t\t\tFirst.Operator == \"Equals\" and Second.Operator == \"NotEquals\" and First.Value == Second.Value\n\t\t\t\t\tor First.Operator == \"NotEquals\" and Second.Operator == \"Equals\" and First.Value == Second.Value\n\t\t\t\tthen\n\t\t\t\t\tAddConflict(FirstIndex, SecondIndex, `{SubjectText} cannot both equal and not equal {FormatValue(First.Value)}.`)\n\t\t\t\telseif First.Operator == \"TypeIs\" and Second.Operator == \"TypeIs\" and First.Value ~= Second.Value then\n\t\t\t\t\tAddConflict(FirstIndex, SecondIndex, `{SubjectText} cannot have both type {First.Value} and {Second.Value}.`)\n\t\t\t\telseif NumericConditionsConflict(First, Second) then\n\t\t\t\t\tAddConflict(FirstIndex, SecondIndex, `{SubjectText} cannot satisfy both numeric comparisons.`)\n\t\t\t\telse\n\t\t\t\t\tlocal TypeCondition\n\t\t\t\t\tlocal OtherCondition\n\t\t\t\t\tif First.Operator == \"TypeIs\" then\n\t\t\t\t\t\tTypeCondition, OtherCondition = First, Second\n\t\t\t\t\telseif Second.Operator == \"TypeIs\" then\n\t\t\t\t\t\tTypeCondition, OtherCondition = Second, First\n\t\t\t\t\tend\n\n\t\t\t\t\tif TypeCondition and OtherCondition and OtherCondition.Operator ~= \"TypeIs\" then\n\t\t\t\t\t\tlocal Definition = Registry[OtherCondition.Operator]\n\t\t\t\t\t\tlocal TypeName = tostring(TypeCondition.Value)\n\t\t\t\t\t\tif Definition and Definition.AllowedTypes and not Definition.AllowedTypes[TypeName] then\n\t\t\t\t\t\t\tAddConflict(FirstIndex, SecondIndex, `{SubjectText} has type {TypeName}, so it cannot use {Definition.SummaryText or Definition.Text}.`)\n\t\t\t\t\t\tend\n\t\t\t\t\tend\n\t\t\t\tend\n\t\t\tend\n\t\tend\n\n\t\treturn #Errors == 0, Errors, Conflicts\n\tend\n\n\twax.shared.CallFilterOperators = Operators\nend\n\n\n\ndo\n\tlocal Operators = wax.shared.CallFilterOperators or require(\"@src/Utils/CallFilter/Operators\")\n\n\tlocal RemoteFields = {}\n\n\tlocal RemoteClassOptions = {\n\t\t{ Value = \"RemoteEvent\", Text = \"RemoteEvent\" },\n\t\t{ Value = \"RemoteFunction\", Text = \"RemoteFunction\" },\n\t\t{ Value = \"UnreliableRemoteEvent\", Text = \"UnreliableRemoteEvent\" },\n\t\t{ Value = \"BindableEvent\", Text = \"BindableEvent\" },\n\t\t{ Value = \"BindableFunction\", Text = \"BindableFunction\" },\n\t}\n\n\tlocal Registry = {\n\t\tName = {\n\t\t\tText = \"Name\",\n\t\t\tGetValue = function(Remote)\n\t\t\t\treturn Remote.Name\n\t\t\tend,\n\t\t},\n\t\tClassName = {\n\t\t\tText = \"Class\",\n\t\t\tValueOptions = RemoteClassOptions,\n\t\t\tGetValue = function(Remote)\n\t\t\t\treturn Remote.ClassName\n\t\t\tend,\n\t\t},\n\t\tFullName = {\n\t\t\tText = \"Full path\",\n\t\t\tGetValue = function(Remote)\n\t\t\t\tlocal Success, Result = pcall(Remote.GetFullName, Remote)\n\t\t\t\treturn Success and Result or Remote.Name\n\t\t\tend,\n\t\t},\n\t}\n\n\tlocal Order = { \"Name\", \"ClassName\", \"FullName\" }\n\tlocal StringOperators = {\n\t\tEquals = true,\n\t\tNotEquals = true,\n\t\tContains = true,\n\t\tStartsWith = true,\n\t\tEndsWith = true,\n\t}\n\n\tfunction RemoteFields.Get(Field)\n\t\treturn Registry[Field]\n\tend\n\n\tfunction RemoteFields.GetOptions()\n\t\tlocal Options = {}\n\t\tfor _, Field in Order do\n\t\t\ttable.insert(Options, {\n\t\t\t\tValue = Field,\n\t\t\t\tText = Registry[Field].Text,\n\t\t\t})\n\t\tend\n\t\treturn Options\n\tend\n\n\tfunction RemoteFields.GetNames()\n\t\treturn table.clone(Order)\n\tend\n\n\tfunction RemoteFields.GetText(Field): string\n\t\tlocal Definition = Registry[Field]\n\t\treturn Definition and Definition.Text or tostring(Field)\n\tend\n\n\tfunction RemoteFields.GetValueOptions(Field)\n\t\tlocal Definition = Registry[Field]\n\t\treturn Definition and Definition.ValueOptions and table.clone(Definition.ValueOptions) or nil\n\tend\n\n\tfunction RemoteFields.IsValueAllowed(Field, Value): boolean\n\t\tlocal Options = RemoteFields.GetValueOptions(Field)\n\t\tif not Options then\n\t\t\treturn typeof(Value) == \"string\"\n\t\tend\n\n\t\tfor _, Option in Options do\n\t\t\tif Option.Value == Value then\n\t\t\t\treturn true\n\t\t\tend\n\t\tend\n\t\treturn false\n\tend\n\n\tfunction RemoteFields.IsOperatorAllowed(Operator, Field): boolean\n\t\tif Field == \"ClassName\" then\n\t\t\treturn Operator == \"Equals\" or Operator == \"NotEquals\"\n\t\tend\n\t\treturn StringOperators[Operator] == true\n\tend\n\n\tfunction RemoteFields.IsConditionValid(Condition): boolean\n\t\treturn Registry[Condition.Field] ~= nil\n\t\t\tand RemoteFields.IsOperatorAllowed(Condition.Operator, Condition.Field)\n\t\t\tand RemoteFields.IsValueAllowed(Condition.Field, Condition.Value)\n\tend\n\n\tfunction RemoteFields.Validate(Conditions)\n\t\treturn Operators.Validate(Conditions, {\n\t\t\tGetKey = function(Condition)\n\t\t\t\treturn Condition.Field\n\t\t\tend,\n\t\t\tGetLabel = function(Condition)\n\t\t\t\treturn RemoteFields.GetText(Condition.Field)\n\t\t\tend,\n\t\t\tIsConditionValid = RemoteFields.IsConditionValid,\n\t\t})\n\tend\n\n\tfunction RemoteFields.Matches(Conditions, Remote): boolean\n\t\treturn Operators.Matches(Conditions, function(Condition)\n\t\t\tlocal Definition = Registry[Condition.Field]\n\t\t\treturn Definition and Definition.GetValue(Remote) or nil\n\t\tend)\n\tend\n\n\twax.shared.CallFilterRemoteFields = RemoteFields\nend\n\n\n\ndo\n\t\n\tlocal Validation = wax.shared.Validation or require(\"@src/Utils/Validation\")\n\tlocal Operators = wax.shared.CallFilterOperators or require(\"@src/Utils/CallFilter/Operators\")\n\tlocal RemoteFields = wax.shared.CallFilterRemoteFields or require(\"@src/Utils/CallFilter/RemoteFields\")\n\n\tlocal Schema = Validation.Schema\n\n\t\n\tlocal function GetOperatorNames()\n\t\tlocal Names = {}\n\t\tfor _, Option in Operators.GetOptions() do\n\t\t\ttable.insert(Names, Option.Value)\n\t\tend\n\t\treturn Names\n\tend\n\n\tlocal function IsConditionValueValid(Condition): boolean\n\t\treturn Operators.IsConditionValid({ Condition }, Condition)\n\tend\n\n\tlocal function HasNoConditionConflicts(Conditions): boolean\n\t\treturn Operators.Validate(Conditions)\n\tend\n\n\t\n\tlocal Remote = Schema.instance():refine(function(Value)\n\t\treturn RemoteFields.IsValueAllowed(\"ClassName\", Value.ClassName)\n\tend, \"must be a supported remote\")\n\n\tlocal Subject = Schema.object({\n\t\tType = Schema.enum({ \"Argument\", \"ArgumentCount\" }),\n\t\tIndex = Schema.number():integer():min(1):optional(),\n\t}):refine(function(Value)\n\t\treturn Value.Type == \"ArgumentCount\" and Value.Index == nil or Value.Type == \"Argument\" and Value.Index ~= nil\n\tend, \"must provide an index only for argument subjects\")\n\n\tlocal Condition = Schema.object({\n\t\tSubject = Subject,\n\t\tOperator = Schema.enum(GetOperatorNames()),\n\t\tValue = Schema.any():optional(),\n\t\tJoin = Schema.enum({ \"And\", \"Or\" }):optional(),\n\t}):refine(IsConditionValueValid, \"has a value that is incompatible with its operator\")\n\n\tlocal ConditionArray = Schema.array(Condition):refine(HasNoConditionConflicts, \"contains conflicting conditions\")\n\tlocal Conditions = ConditionArray:default({})\n\n\tlocal RemoteCondition = Schema.object({\n\t\tField = Schema.enum(RemoteFields.GetNames()),\n\t\tOperator = Schema.enum(GetOperatorNames()),\n\t\tValue = Schema.string(),\n\t\tJoin = Schema.enum({ \"And\", \"Or\" }):optional(),\n\t}):refine(RemoteFields.IsConditionValid, \"has an operator or value that is incompatible with its field\")\n\n\tlocal RemoteConditions = Schema.array(RemoteCondition):refine(function(Value)\n\t\treturn #Value > 0 and RemoteFields.Validate(Value)\n\tend, \"must contain at least one non-conflicting remote condition\")\n\n\tlocal Target = Schema.union({\n\t\tSchema.object({\n\t\t\tType = Schema.literal(\"Instance\"),\n\t\t\tRemote = Remote,\n\t\t}),\n\t\tSchema.object({\n\t\t\tType = Schema.literal(\"Query\"),\n\t\t\tConditions = RemoteConditions,\n\t\t}),\n\t})\n\n\tlocal Filter = Schema.object({\n\t\tId = Schema.string():optional(),\n\t\tEnabled = Schema.boolean():default(true),\n\t\tTarget = Target,\n\t\tDirection = Schema.enum({ \"Outgoing\", \"Incoming\", \"Any\" }),\n\t\tConditions = Conditions,\n\t\tAction = Schema.enum({ \"Ignore\", \"Block\", \"Highlight\" }):default(\"Ignore\"),\n\t})\n\n\tlocal Update = Schema.object({\n\t\tEnabled = Schema.boolean():optional(),\n\t\tTarget = Target:optional(),\n\t\tDirection = Schema.enum({ \"Outgoing\", \"Incoming\", \"Any\" }):optional(),\n\t\tConditions = ConditionArray:optional(),\n\t\tAction = Schema.enum({ \"Ignore\", \"Block\", \"Highlight\" }):optional(),\n\t})\n\n\twax.shared.CallFilterSchema = {\n\t\tRemote = Remote,\n\t\tSubject = Subject,\n\t\tCondition = Condition,\n\t\tConditions = Conditions,\n\t\tRemoteCondition = RemoteCondition,\n\t\tRemoteConditions = RemoteConditions,\n\t\tTarget = Target,\n\t\tFilter = Filter,\n\t\tUpdate = Update,\n\t}\nend\n\n\n\ndo\n\tlocal Operators = wax.shared.CallFilterOperators or require(\"@src/Utils/CallFilter/Operators\")\n\tlocal InstanceSerializer = wax.shared.InstanceSerializer or require(\"@src/Utils/CodeGen/Serializer/Instance\")\n\tlocal Validation = wax.shared.Validation or require(\"@src/Utils/Validation\")\n\tlocal CallFilterSchema = wax.shared.CallFilterSchema or require(\"@src/Utils/CallFilter/Schema\")\n\tlocal RemoteFields = wax.shared.CallFilterRemoteFields or require(\"@src/Utils/CallFilter/RemoteFields\")\n\n\tlocal CallFilters = {\n\t\tItems = {},\n\t\tById = {},\n\t\tListeners = {},\n\t}\n\n\tlocal ActionPriorities = {\n\t\tHighlight = 1,\n\t\tIgnore = 2,\n\t\tBlock = 3,\n\t}\n\n\tlocal function Validate(Data, DataSchema, Context: string)\n\t\tlocal IsValid, Result, Errors = Validation.ValidateSchema(Data, DataSchema)\n\t\tassert(IsValid, `{Context}: {Errors[1] or \"validation failed\"}`)\n\t\treturn Result\n\tend\n\n\tlocal function CopyFilter(Filter)\n\t\tlocal Copy = table.clone(Filter)\n\t\tCopy.Conditions = {}\n\n\t\tfor _, Condition in Filter.Conditions or {} do\n\t\t\tlocal ConditionCopy = table.clone(Condition)\n\t\t\tConditionCopy.Subject = table.clone(Condition.Subject)\n\t\t\ttable.insert(Copy.Conditions, ConditionCopy)\n\t\tend\n\n\t\tCopy.Target = table.clone(Filter.Target)\n\t\tif Filter.Target.Type == \"Query\" then\n\t\t\tCopy.Target.Conditions = {}\n\t\t\tfor _, Condition in Filter.Target.Conditions do\n\t\t\t\ttable.insert(Copy.Target.Conditions, table.clone(Condition))\n\t\t\tend\n\t\tend\n\n\t\tCopy.Enabled = Filter.Enabled ~= false\n\t\treturn Copy\n\tend\n\n\tlocal function EmitChanged()\n\t\tlocal Snapshot = CallFilters:GetAll()\n\t\tfor Listener in CallFilters.Listeners do\n\t\t\tif task then\n\t\t\t\ttask.spawn(Listener, Snapshot)\n\t\t\telse\n\t\t\t\tListener(Snapshot)\n\t\t\tend\n\t\tend\n\tend\n\n\tfunction CallFilters:GetAll()\n\t\tlocal Filters = {}\n\t\tfor _, Filter in self.Items do\n\t\t\ttable.insert(Filters, CopyFilter(Filter))\n\t\tend\n\t\treturn Filters\n\tend\n\n\tfunction CallFilters:Get(Id: string)\n\t\tlocal Filter = self.ById[Id]\n\t\treturn Filter and CopyFilter(Filter) or nil\n\tend\n\n\tfunction CallFilters:Add(Filter)\n\t\tlocal Copy = Validate(Filter, CallFilterSchema.Filter, \"Invalid call filter\")\n\t\tCopy.Id = Copy.Id or wax.shared.HttpService:GenerateGUID(false)\n\t\tassert(not self.ById[Copy.Id], `A call filter with id {Copy.Id} already exists`)\n\n\t\ttable.insert(self.Items, Copy)\n\t\tself.ById[Copy.Id] = Copy\n\t\tEmitChanged()\n\t\treturn CopyFilter(Copy)\n\tend\n\n\tfunction CallFilters:Update(Id: string, Changes)\n\t\tlocal Filter = self.ById[Id]\n\t\tif not Filter then\n\t\t\treturn nil\n\t\tend\n\n\t\tlocal ValidChanges = Validate(Changes, CallFilterSchema.Update, \"Invalid call filter update\")\n\t\tlocal Updated = CopyFilter(Filter)\n\t\tfor Key, Value in ValidChanges do\n\t\t\tUpdated[Key] = Value\n\t\tend\n\t\tUpdated = Validate(Updated, CallFilterSchema.Filter, \"Invalid updated call filter\")\n\n\t\tlocal Index = table.find(self.Items, Filter)\n\t\tif Index then\n\t\t\tself.Items[Index] = Updated\n\t\tend\n\t\tself.ById[Id] = Updated\n\n\t\tEmitChanged()\n\t\treturn CopyFilter(Updated)\n\tend\n\n\tfunction CallFilters:SetEnabled(Id: string, Enabled: boolean)\n\t\treturn self:Update(Id, { Enabled = Enabled })\n\tend\n\n\tfunction CallFilters:Remove(Id: string): boolean\n\t\tlocal Filter = self.ById[Id]\n\t\tif not Filter then\n\t\t\treturn false\n\t\tend\n\n\t\tself.ById[Id] = nil\n\t\tlocal Index = table.find(self.Items, Filter)\n\t\tif Index then\n\t\t\ttable.remove(self.Items, Index)\n\t\tend\n\t\tEmitChanged()\n\t\treturn true\n\tend\n\n\tfunction CallFilters:ReplaceAll(Filters, Silent: boolean?)\n\t\tlocal Validated = Validate(Filters or {}, Validation.Schema.array(CallFilterSchema.Filter), \"Invalid call filters\")\n\t\tlocal SeenIds = {}\n\t\tfor _, Filter in Validated do\n\t\t\tFilter.Id = Filter.Id or wax.shared.HttpService:GenerateGUID(false)\n\t\t\tassert(not SeenIds[Filter.Id], `A call filter with id {Filter.Id} already exists`)\n\t\t\tSeenIds[Filter.Id] = true\n\t\tend\n\n\t\ttable.clear(self.Items)\n\t\ttable.clear(self.ById)\n\t\tfor _, Filter in Validated do\n\t\t\ttable.insert(self.Items, Filter)\n\t\t\tself.ById[Filter.Id] = Filter\n\t\tend\n\n\t\tif not Silent then\n\t\t\tEmitChanged()\n\t\tend\n\tend\n\n\tfunction CallFilters:Subscribe(Listener)\n\t\tself.Listeners[Listener] = true\n\t\tListener(self:GetAll())\n\n\t\tlocal Subscription = {}\n\t\tfunction Subscription:Disconnect()\n\t\t\tCallFilters.Listeners[Listener] = nil\n\t\tend\n\t\treturn Subscription\n\tend\n\n\tfunction CallFilters:Match(Remote: Instance, Direction: string, Arguments)\n\t\tlocal WinningAction\n\t\tlocal WinningFilter\n\t\tlocal WinningPriority = 0\n\n\t\tfor _, Filter in self.Items do\n\t\t\tlocal TargetMatches = if Filter.Target.Type == \"Instance\"\n\t\t\t\tthen InstanceSerializer.IsEqualToInstance(Filter.Target.Remote, Remote)\n\t\t\t\telse RemoteFields.Matches(Filter.Target.Conditions, Remote)\n\t\t\tif\n\t\t\t\tFilter.Enabled\n\t\t\t\tand (Filter.Direction == \"Any\" or Filter.Direction == Direction)\n\t\t\t\tand TargetMatches\n\t\t\t\tand Operators.MatchesConditions(Filter.Conditions, Arguments)\n\t\t\tthen\n\t\t\t\tlocal Priority = ActionPriorities[Filter.Action] or 0\n\t\t\t\tif Priority > WinningPriority then\n\t\t\t\t\tWinningAction = Filter.Action\n\t\t\t\t\tWinningFilter = Filter\n\t\t\t\t\tWinningPriority = Priority\n\t\t\t\tend\n\t\t\tend\n\t\tend\n\n\t\treturn WinningAction, WinningFilter and CopyFilter(WinningFilter) or nil\n\tend\n\n\tfunction CallFilters:Resolve(Remote: Instance, Direction: string, Info)\n\t\tlocal Action, Filter = self:Match(Remote, Direction, Info.Arguments or {})\n\t\tif Action == \"Highlight\" then\n\t\t\tInfo.Highlighted = true\n\t\t\tInfo.CallFilterId = Filter.Id\n\t\telseif Action then\n\t\t\tInfo.CallFilterId = Filter.Id\n\t\tend\n\t\treturn Action, Filter\n\tend\n\n\twax.shared.CallFilters = CallFilters\nend\n\n\n\nwax.shared.IsPlayerModule = function(Origin: LocalScript | ModuleScript, Instance: Instance): boolean\n\tif Instance and Instance.ClassName ~= \"BindableEvent\" then\n\t\treturn false\n\tend\n\n\tif not Origin or typeof(Origin) ~= \"Instance\" or not Origin.IsA(Origin, \"LuaSourceContainer\") then\n\t\treturn false\n\tend\n\n\tlocal PlayerModule = Origin and Origin.FindFirstAncestor(Origin, \"PlayerModule\") or nil\n\tif not PlayerModule then\n\t\treturn false\n\tend\n\n\tif PlayerModule.Parent == nil then\n\t\treturn true\n\tend\n\n\tif wax.shared.PlayerScripts then\n\t\treturn compareinstances(PlayerModule.Parent, wax.shared.PlayerScripts)\n\tend\n\n\treturn false\nend\nwax.shared.ShouldIgnore = function(Instance, Origin)\n\tif not wax.shared.Settings.LogRobloxInternalEvents.Value then\n\t\tif Instance.IsDescendantOf(Instance, wax.shared.RobloxReplicatedStorage) then\n\t\t\treturn true\n\t\tend\n\tend\n\n\t-- Hooks pass a resolver instead of a script: getcallingscript() only\n\t-- runs when the player-module check is even enabled (same contract as the\n\t-- main-state ShouldIgnore).\n\tif wax.shared.Settings.IgnorePlayerModule.Value and type(Origin) == \"function\" then\n\t\tOrigin = Origin()\n\tend\n\n\treturn wax.shared.Settings.IgnoredRemotesDropdown.Value[Instance.ClassName] == true\n\t\tor (wax.shared.Settings.IgnorePlayerModule.Value and wax.shared.IsPlayerModule(Origin, Instance))\nend\n\n\n\n--#region @include region Log\n-- Inlined here by tools/bundle.py from src/Utils/Log.luau - the single\n-- source of truth for the capture path in both the main state and actors.\n-- tools/bundle.py replaces this placeholder when it packs the actor\n-- environment, so edit src/Utils/Log.luau instead of pasting code here.\ndo\n\tlocal Log = {}\n\tLog.__index = Log\n\n\tlocal PendingCallDecisions = setmetatable({}, { __mode = \"k\" })\n\n\t-- `tostring(table)` is used as the pending-decision key and is needed twice per\n\t-- call (ShouldBlock + Call).  Remembering the key per info table halves that\n\t-- work and keeps both lookups on the same interned string.\n\tlocal CallDecisionKeys = setmetatable({}, { __mode = \"k\" })\n\n\t-- clonefunction() allocates a brand new closure every time it runs, and the\n\t-- same calling scripts are cloned over and over.  Clones are cached against the\n\t-- original closure (weak keys: once the game drops the original, the clone goes\n\t-- with it).\n\tlocal FunctionClones = setmetatable({}, { __mode = \"k\" })\n\n\tlocal function GetDecisionKey(RawInfo): string\n\t\tlocal Key = CallDecisionKeys[RawInfo]\n\t\tif not Key then\n\t\t\tKey = tostring(RawInfo)\n\t\t\tCallDecisionKeys[RawInfo] = Key\n\t\tend\n\n\t\treturn Key\n\tend\n\n\tlocal function CloneFunction(Function)\n\t\tlocal Cached = FunctionClones[Function]\n\t\tif Cached then\n\t\t\treturn Cached\n\t\tend\n\n\t\tif not clonefunction then\n\t\t\treturn Function\n\t\tend\n\n\t\tlocal Clone = clonefunction(Function)\n\t\tFunctionClones[Function] = Clone\n\t\treturn Clone\n\tend\n\n\t--[[\n\t\tCall retention limit.\n\n\t\tEvery captured call keeps a deep-cloned copy of its arguments alive for the\n\t\trest of the session.  On a chatty game (and especially on a phone, where the\n\t\tOS is quick to kill apps that grow) that is unbounded memory growth, so each\n\t\tremote keeps at most `MaxCallsPerRemote` calls and drops the oldest ones.\n\t\tThe limit is configurable in Settings (Capture -> Calls Kept Per Remote).\n\n\t\t`MaxCallsPerRemote` is cached: reading it through SaveManager validates the\n\t\twhole schema, which must not happen once per intercepted call.\n\t]]\n\tlocal DefaultMaxCallsPerRemote = 500\n\tlocal CallCapSlack = 32\n\tlocal CachedCallCap = nil\n\n\tlocal function GetSettingBoolean(Key: string, Default: boolean): boolean\n\t\tlocal Controls = wax.shared.Settings\n\t\tlocal Control = Controls and Controls[Key]\n\t\tif Control and Control.Value ~= nil then\n\t\t\treturn Control.Value == true\n\t\tend\n\n\t\tlocal SaveManager = wax.shared.SaveManager\n\t\tlocal Success, Value = pcall(function()\n\t\t\treturn SaveManager:GetState(Key, Default)\n\t\tend)\n\n\t\treturn if Success and Value ~= nil then Value == true else Default\n\tend\n\n\tlocal function GetMaxCallsPerRemote(): number\n\t\tlocal Controls = wax.shared.Settings\n\t\tlocal Control = Controls and Controls[\"MaxCallsPerRemote\"]\n\n\t\tif Control and Control.Value ~= nil then\n\t\t\tlocal Value = tonumber(Control.Value)\n\t\t\tif Value and Value >= 1 then\n\t\t\t\tCachedCallCap = math.floor(Value)\n\t\t\t\treturn CachedCallCap\n\t\t\tend\n\t\tend\n\n\t\tif CachedCallCap then\n\t\t\treturn CachedCallCap\n\t\tend\n\n\t\tlocal SaveManager = wax.shared.SaveManager\n\t\tlocal Success, Value = pcall(function()\n\t\t\treturn SaveManager:GetState(\"MaxCallsPerRemote\", DefaultMaxCallsPerRemote)\n\t\tend)\n\n\t\tCachedCallCap = math.floor(tonumber(Success and Value or DefaultMaxCallsPerRemote) or DefaultMaxCallsPerRemote)\n\t\tif CachedCallCap < 1 then\n\t\t\tCachedCallCap = DefaultMaxCallsPerRemote\n\t\tend\n\n\t\treturn CachedCallCap\n\tend\n\n\t--[[\n\t\tDevice-tiered budget lookup.\n\n\t\t`src/init.luau` publishes `wax.shared.DeviceProfile` (line 33) long before it\n\t\trequires this module (line 570), so the tier presets are already final here.\n\n\t\tThis is deliberately *not* `require(\"@src/Utils/DeviceProfile\")`: tools/bundle.py\n\t\tinlines this whole file into the generated actor environment, which runs as a\n\t\tstandalone chunk in another state.  That chunk has no wax `require` and no\n\t\tDeviceProfile, so a require here is a hard error at actor start\n\t\t(\"Expected ':' not '.' calling member function require\").  Every other\n\t\trequire that ends up inlined there is guarded by `wax.shared.X or require(...)`;\n\t\tthis module simply stays require-free and falls back to the \"high\" tier\n\t\tpresets, which match `DeviceProfile.MaxPendingNotifications` /\n\t\t`DeviceProfile.MaxNotificationsPerHeartbeat`.\n\t]]\n\tlocal function ProfileValue(Key: string, Default: number): number\n\t\tlocal Profile = wax.shared.DeviceProfile\n\t\tlocal Value = Profile and Profile[Key]\n\n\t\tif type(Value) == \"number\" then\n\t\t\treturn Value\n\t\tend\n\n\t\treturn Default\n\tend\n\n\t-- The producer is on a remote hook, while the consumer is the UI heartbeat.\n\t-- Keep the hand-off bounded and coalesce updates for the same remote.  A noisy\n\t-- remote therefore costs one small notification per frame, not one table per\n\t-- packet.  The caps come from the device tier preset, captured once at module\n\t-- load.\n\tlocal MaxPendingNotifications = ProfileValue(\"MaxPendingNotifications\", 256)\n\tlocal MaxNotificationsPerHeartbeat = ProfileValue(\"MaxNotificationsPerHeartbeat\", 96)\n\twax.shared.LogNotificationQueue = {\n\t\tItems = {},\n\t\tHead = 1,\n\t\tTail = 0,\n\t\tPendingByLog = setmetatable({}, { __mode = \"k\" }),\n\t\tDropped = 0,\n\t}\n\n\tlocal function QueueNotification(LogObject, CallIndex: number, Call)\n\t\tlocal Queue = wax.shared.LogNotificationQueue\n\t\tlocal Existing = Queue.PendingByLog[LogObject]\n\t\tif Existing then\n\t\t\tExisting.CallIndex = CallIndex\n\t\t\tExisting.Call = Call or LogObject.Calls[CallIndex]\n\t\t\tExisting.Suppressed = (Existing.Suppressed or 0) + 1\n\t\t\treturn\n\t\tend\n\n\t\tlocal Pending = Queue.Tail - Queue.Head + 1\n\t\twhile Pending >= MaxPendingNotifications do\n\t\t\tlocal Oldest = Queue.Items[Queue.Head]\n\t\t\tQueue.Items[Queue.Head] = nil\n\t\t\tQueue.Head += 1\n\t\t\tPending -= 1\n\t\t\tQueue.Dropped += 1\n\t\t\tif Oldest and Oldest.Log then\n\t\t\t\tQueue.PendingByLog[Oldest.Log] = nil\n\t\t\tend\n\t\tend\n\n\t\tif Queue.Head > Queue.Tail then\n\t\t\ttable.clear(Queue.Items)\n\t\t\tQueue.Head = 1\n\t\t\tQueue.Tail = 0\n\t\tend\n\n\t\tlocal Notification = {\n\t\t\tInstance = LogObject.Instance,\n\t\t\tType = LogObject.Type,\n\t\t\tLogIndex = LogObject.Index,\n\t\t\tCallIndex = CallIndex,\n\t\t\t-- Direct references avoid another DebugId lookup on the UI thread.\n\t\t\tLog = LogObject,\n\t\t\tCall = Call or LogObject.Calls[CallIndex],\n\t\t\tSuppressed = 0,\n\t\t}\n\t\tQueue.Tail += 1\n\t\tQueue.Items[Queue.Tail] = Notification\n\t\tQueue.PendingByLog[LogObject] = Notification\n\tend\n\n\tlocal SpamCallCountThreshold = 120\n\tlocal SpamTimeWindowSeconds = 1\n\n\t--[[\n\t\tHard capture valves.\n\n\t\tThese are pure frame-time / memory protection: when they trip the capture\n\t\tis dropped, nothing else.  An earlier revision also called `Log:Ignore()`\n\t\there, and because the *global* valve is shared by every remote, one spammy\n\t\tevent marked every other remote as ignored for the whole session - the\n\t\tinspector then showed an empty list while the game kept running.  Dropping\n\t\tcaptures keeps the UI truthful; ignoring remotes is an explicit, opt-in\n\t\tbehaviour (Settings -> Auto-ignore High-frequency Calls) that only engages\n\t\tafter a remote overflows its *own* budget for several consecutive windows.\n\t]]\n\tlocal HardCaptureLimitPerRemote = 500\n\tlocal HardCaptureLimitGlobal = 2500\n\tlocal GlobalCaptureWindowStart = 0\n\tlocal GlobalCaptureCount = 0\n\tlocal AutoIgnoreSpammyEvents = false\n\n\t-- Windows in a row a remote must overflow its own budget before the opt-in\n\t-- auto-ignore engages.  A single busy frame never marks a remote as ignored.\n\tlocal SustainedOverflowWindows = 2\n\n\tdo\n\t\tlocal Success, Value = pcall(function()\n\t\t\treturn wax.shared.SaveManager:GetState(\"AutoIgnoreSpammyEvents\", false)\n\t\tend)\n\t\tif Success then\n\t\t\tAutoIgnoreSpammyEvents = Value == true\n\t\tend\n\tend\n\n\tlocal function ShouldAutoIgnore(): boolean\n\t\tlocal Control = wax.shared.Settings and wax.shared.Settings.AutoIgnoreSpammyEvents\n\t\tif Control and Control.Value ~= nil then\n\t\t\treturn Control.Value == true\n\t\tend\n\t\treturn AutoIgnoreSpammyEvents\n\tend\n\n\tlocal function RejectCapture(LogObject, Now: number): boolean\n\t\tif Now - LogObject.SpamWindowStart >= SpamTimeWindowSeconds then\n\t\t\t-- Roll the overflow streak over: a window that ended in overflow keeps\n\t\t\t-- the streak alive, a quiet one resets it.\n\t\t\tLogObject.OverflowStreak = LogObject.OverflowedThisWindow and (LogObject.OverflowStreak or 0) + 1 or 0\n\t\t\tLogObject.OverflowedThisWindow = false\n\t\t\tLogObject.SpamWindowStart = Now\n\t\t\tLogObject.SpamCallCount = 0\n\t\tend\n\n\t\tif Now - GlobalCaptureWindowStart >= SpamTimeWindowSeconds then\n\t\t\tGlobalCaptureWindowStart = Now\n\t\t\tGlobalCaptureCount = 0\n\t\tend\n\n\t\t-- Global valve: protect the frame budget only.  The capture is dropped and\n\t\t-- the remote stays visible; ignoring an unrelated remote here is what used\n\t\t-- to empty the whole list.\n\t\tif GlobalCaptureCount >= HardCaptureLimitGlobal then\n\t\t\tLogObject.SuppressedCalls += 1\n\t\t\treturn true\n\t\tend\n\n\t\tif LogObject.SpamCallCount >= HardCaptureLimitPerRemote then\n\t\t\tLogObject.SuppressedCalls += 1\n\t\t\tLogObject.OverflowedThisWindow = true\n\n\t\t\t-- Opt-in auto-ignore: only this remote, only after it sustained the\n\t\t\t-- overflow across consecutive windows.\n\t\t\tif\n\t\t\t\tShouldAutoIgnore()\n\t\t\t\tand not LogObject.Ignored\n\t\t\t\tand (LogObject.OverflowStreak or 0) + 1 >= SustainedOverflowWindows\n\t\t\tthen\n\t\t\t\tLogObject:Ignore()\n\t\t\t\tlocal Sonner = wax.shared.Sonner\n\t\t\t\tif Sonner then\n\t\t\t\t\tlocal InstanceName = LogObject.Instance and LogObject.Instance.Name or \"remote\"\n\t\t\t\t\tpcall(Sonner.info, Sonner, `Ignored {InstanceName} ({LogObject.Type}) after sustained event spam.`)\n\t\t\t\tend\n\t\t\tend\n\t\t\treturn true\n\t\tend\n\n\t\tLogObject.SpamCallCount += 1\n\t\tGlobalCaptureCount += 1\n\t\treturn false\n\tend\n\n\tif not wax.shared.IS_ACTOR then\n\t\twax.shared.Connect(wax.shared.RunService.Heartbeat:Connect(function()\n\t\t\tlocal Queue = wax.shared.LogNotificationQueue\n\t\t\tif Queue.Head > Queue.Tail then\n\t\t\t\treturn\n\t\t\tend\n\n\t\t\tlocal Batch = table.create(math.min(MaxNotificationsPerHeartbeat, Queue.Tail - Queue.Head + 1))\n\t\t\tlocal BatchSize = 0\n\t\t\twhile Queue.Head <= Queue.Tail and BatchSize < MaxNotificationsPerHeartbeat do\n\t\t\t\tlocal Notification = Queue.Items[Queue.Head]\n\t\t\t\tQueue.Items[Queue.Head] = nil\n\t\t\t\tQueue.Head += 1\n\t\t\t\tif Notification then\n\t\t\t\t\tQueue.PendingByLog[Notification.Log] = nil\n\t\t\t\t\tBatchSize += 1\n\t\t\t\t\tBatch[BatchSize] = Notification\n\t\t\t\tend\n\t\t\tend\n\n\t\t\tif Queue.Head > Queue.Tail then\n\t\t\t\ttable.clear(Queue.Items)\n\t\t\t\tQueue.Head = 1\n\t\t\t\tQueue.Tail = 0\n\t\t\tend\n\n\t\t\tif BatchSize > 0 then\n\t\t\t\tlocal Communicator = wax.shared.Communicator\n\t\t\t\tif Communicator then\n\t\t\t\t\tCommunicator:Fire(Batch)\n\t\t\t\tend\n\t\t\t\ttable.clear(Batch)\n\t\t\tend\n\t\tend))\n\tend\n\n\n\tlocal FunctionToMetatadata, FixTable\n\tdo\n\t\tif wax.shared.IS_ACTOR then\n\t\t\tlocal FunctionMetadataCache = setmetatable({}, { __mode = \"k\" })\n\n\t\t\tlocal function CreateTraversalState(Refs)\n\t\t\t\treturn {\n\t\t\t\t\tCyclicRefs = Refs or {},\n\t\t\t\t\tTableIds = setmetatable({}, { __mode = \"k\" }),\n\t\t\t\t\tFunctions = setmetatable({}, { __mode = \"k\" }),\n\t\t\t\t\tNextId = 0,\n\t\t\t\t}\n\t\t\tend\n\n\t\t\tlocal function GenerateId(State)\n\t\t\t\tState.NextId += 1\n\t\t\t\treturn State.NextId\n\t\t\tend\n\n\t\t\tFixTable = function(Table, State)\n\t\t\t\tif not Table then\n\t\t\t\t\treturn nil\n\t\t\t\tend\n\n\t\t\t\tif not State or not State.CyclicRefs then\n\t\t\t\t\tState = CreateTraversalState(State)\n\t\t\t\tend\n\n\t\t\t\tlocal CyclicRefs = State.CyclicRefs\n\t\t\t\tlocal TableId = State.TableIds[Table]\n\t\t\t\tif not TableId then\n\t\t\t\t\tTableId = GenerateId(State)\n\t\t\t\t\tState.TableIds[Table] = TableId\n\t\t\t\tend\n\n\t\t\t\tlocal OutputTable = {}\n\t\t\t\tCyclicRefs[TableId] = OutputTable\n\n\t\t\t\tlocal ContainsCyclicRef = false\n\n\t\t\t\tfor Key, Value in next, Table do\n\t\t\t\t\tif type(Value) == \"table\" then\n\t\t\t\t\t\tlocal ExistingId = State.TableIds[Value]\n\t\t\t\t\t\tif ExistingId then\n\t\t\t\t\t\t\tContainsCyclicRef = true\n\n\t\t\t\t\t\t\tOutputTable[Key] = {\n\t\t\t\t\t\t\t\t__CyclicRef = true,\n\t\t\t\t\t\t\t\t__Id = ExistingId,\n\t\t\t\t\t\t\t}\n\t\t\t\t\t\t\tcontinue\n\t\t\t\t\t\tend\n\n\t\t\t\t\t\tif getmetatable(Value) then\n\t\t\t\t\t\t\tOutputTable[Key] =\n\t\t\t\t\t\t\t\t\"Cobalt: Impossible to bridge table with metatable from actor Environment to main Environment\"\n\t\t\t\t\t\t\tcontinue\n\t\t\t\t\t\tend\n\n\t\t\t\t\t\tlocal Result, _, ContainsCyclic = FixTable(Value, State)\n\t\t\t\t\t\tif not Result then\n\t\t\t\t\t\t\tcontinue\n\t\t\t\t\t\tend\n\n\t\t\t\t\t\tOutputTable[Key] = Result\n\t\t\t\t\t\tContainsCyclicRef = ContainsCyclicRef or ContainsCyclic\n\t\t\t\t\telseif type(Value) == \"function\" then\n\t\t\t\t\t\tOutputTable[Key] = FunctionToMetatadata(Value, State)\n\t\t\t\t\telse\n\t\t\t\t\t\tOutputTable[Key] = Value\n\t\t\t\t\tend\n\t\t\t\tend\n\n\t\t\t\treturn OutputTable, CyclicRefs, ContainsCyclicRef\n\t\t\tend\n\n\t\t\tFunctionToMetatadata = function(Function, State)\n\t\t\t\tif not Function then\n\t\t\t\t\treturn nil\n\t\t\t\tend\n\n\t\t\t\tif not State or not State.CyclicRefs then\n\t\t\t\t\tState = CreateTraversalState()\n\t\t\t\tend\n\n\t\t\t\tlocal CachedMetadata = FunctionMetadataCache[Function]\n\t\t\t\tif CachedMetadata then\n\t\t\t\t\treturn CachedMetadata\n\t\t\t\tend\n\n\t\t\t\tlocal Metadata = {\n\t\t\t\t\tAddress = tostring(Function),\n\t\t\t\t\tName = debug.info(Function, \"n\"),\n\t\t\t\t\tSource = debug.info(Function, \"s\"),\n\t\t\t\t\tIsC = iscclosure(Function),\n\t\t\t\t}\n\n\t\t\t\tif State.Functions[Function] then\n\t\t\t\t\tMetadata[\"Recursive\"] = true\n\t\t\t\t\tMetadata[\"Validation\"] = Data.Token\n\t\t\t\t\tMetadata[\"__Function\"] = true\n\n\t\t\t\t\treturn Metadata\n\t\t\t\tend\n\n\t\t\t\tState.Functions[Function] = true\n\n\t\t\t\tif not iscclosure(Function) then\n\t\t\t\t\tMetadata[\"Upvalues\"] = debug.getupvalues and #debug.getupvalues(Function) or 0\n\t\t\t\t\tMetadata[\"Constants\"] = debug.getconstants and #debug.getconstants(Function) or 0\n\t\t\t\t\tMetadata[\"Protos\"] = debug.getprotos and #debug.getprotos(Function) or 0\n\n\t\t\t\t\tif getfunctionhash then\n\t\t\t\t\t\tMetadata[\"FunctionHash\"] = getfunctionhash(Function)\n\t\t\t\t\tend\n\t\t\t\tend\n\n\t\t\t\t\n\t\t\t\tMetadata[\"Validation\"] = Data.Token\n\t\t\t\tMetadata[\"__Function\"] = true\n\n\t\t\t\tFunctionMetadataCache[Function] = Metadata\n\n\t\t\t\treturn Metadata\n\t\t\tend\n\t\tend\n\tend\n\n\n\t--[[\n\t\tClone bounds.\n\n\t\tA game can hand a remote arbitrarily deep or wide tables, and an unbounded\n\t\trecursive clone of one runs inside the hook that intercepted the call -\n\t\tmulti-second frame hitches on the game being inspected.  The clone\n\t\ttherefore stops descending once a capture has copied MaxCloneFields fields\n\t\tor nested MaxCloneDepth tables deep, and keeps the original reference for\n\t\tanything past the bound instead.\n\n\t\tBounded nodes stay visible (the argument preview/session serializer sees a\n\t\treal table and renders it) and replay codegen still receives a table; the\n\t\ttrade-off is that a huge payload's contents can keep mutating after\n\t\tcapture, which is already the semantics for Instances and is a far better\n\t\tdeal than freezing the game.  Both bounds are far above genuine argument\n\t\tsizes, so normal captures clone exactly as before.\n\t]]\n\tlocal MaxCloneDepth = 8\n\tlocal MaxCloneFields = 4000\n\n\tlocal function CloneTable(OriginalValue: { [any]: any }, ValueCopies: { [any]: any }, CloneState: { Fields: number }, Depth: number)\n\t\tlocal ShallowCopy = {}\n\t\tValueCopies[OriginalValue] = ShallowCopy\n\n\t\tfor Key, Value in next, OriginalValue do\n\t\t\t-- Every visited field is work paid inside the hook, regardless of type.\n\t\t\tCloneState.Fields += 1\n\t\t\tlocal ValueType = type(Value)\n\n\t\t\tif ValueType == \"table\" then\n\t\t\t\tif Depth >= MaxCloneDepth or CloneState.Fields > MaxCloneFields then\n\t\t\t\t\t-- Beyond the bound the capture shares the game's table (see the\n\t\t\t\t\t-- \"Clone bounds\" note above); cloning resumes nowhere below.\n\t\t\t\t\tShallowCopy[Key] = Value\n\t\t\t\telse\n\t\t\t\t\tlocal CachedValue = ValueCopies[Value]\n\t\t\t\t\tif CachedValue then\n\t\t\t\t\t\tShallowCopy[Key] = CachedValue\n\t\t\t\t\telse\n\t\t\t\t\t\tShallowCopy[Key] = CloneTable(Value, ValueCopies, CloneState, Depth + 1)\n\t\t\t\t\tend\n\t\t\t\tend\n\n\t\t\telseif ValueType == \"userdata\" then\n\t\t\t\tlocal ValueRobloxType = typeof(Value)\n\n\t\t\t\tif ValueRobloxType == \"Instance\" then\n\t\t\t\t\tShallowCopy[Key] = cloneref(Value)\n\n\t\t\t\telseif ValueRobloxType == \"userdata\" then\n\t\t\t\t\tif getmetatable(Value) then\n\t\t\t\t\t\tShallowCopy[Key] = newproxy(true)\n\t\t\t\t\telse\n\t\t\t\t\t\tShallowCopy[Key] = newproxy()\n\t\t\t\t\tend\n\n\t\t\t\telse\n\t\t\t\t\tShallowCopy[Key] = Value\n\t\t\t\tend\n\n\t\t\telseif ValueType == \"function\" then\n\t\t\t\tShallowCopy[Key] = CloneFunction(Value)\n\n\t\t\telse\n\t\t\t\tShallowCopy[Key] = Value\n\t\t\tend\n\t\tend\n\n\t\treturn ShallowCopy\n\tend\n\n\tfunction DeepClone(OriginalValue, ValueCopies)\n\t\tif wax.shared.IS_ACTOR then\n\t\t\treturn OriginalValue\n\t\tend\n\n\t\tlocal OriginalType = type(OriginalValue)\n\t\tif OriginalType ~= \"table\" then\n\t\t\tif OriginalType == \"string\" or OriginalType == \"number\" or OriginalType == \"boolean\" or OriginalValue == nil then\n\t\t\t\treturn OriginalValue\n\t\t\tend\n\n\t\t\tlocal RobloxType = typeof(OriginalValue)\n\t\t\tif RobloxType == \"Instance\" then\n\t\t\t\treturn cloneref(OriginalValue)\n\n\t\t\telseif RobloxType == \"userdata\" then\n\t\t\t\tif getmetatable(OriginalValue) then\n\t\t\t\t\treturn newproxy(true)\n\t\t\t\telse\n\t\t\t\t\treturn newproxy()\n\t\t\t\tend\n\n\t\t\telseif RobloxType == \"function\" then\n\t\t\t\treturn CloneFunction(OriginalValue)\n\t\t\tend\n\n\t\t\treturn OriginalValue\n\t\tend\n\n\t\tValueCopies = ValueCopies or {}\n\t\tlocal CachedValue = ValueCopies[OriginalValue]\n\t\tif CachedValue then\n\t\t\treturn CachedValue\n\t\tend\n\n\t\treturn CloneTable(OriginalValue, ValueCopies, { Fields = 0 }, 0)\n\tend\n\n\tif wax.shared.IS_ACTOR then\n\t\twax.shared.SerializeActorInfo = function(Info)\n\t\t\treturn FixTable(DeepClone(Info))\n\t\tend\n\tend\n\n\tfunction Log.new(Instance, Type, Index, CallingScript)\n\t\tlocal NewLog = setmetatable({\n\t\t\tInstance = Instance,\n\t\t\tType = Type,\n\t\t\tIndex = Index,\n\t\t\tCalls = {},\n\t\t\tGameCalls = {},\n\t\t\tSpamWindowStart = 0,\n\t\t\tSpamCallCount = 0,\n\t\t\tSuppressedCalls = 0,\n\t\t\tOverflowStreak = 0,\n\t\t\tOverflowedThisWindow = false,\n\t\t\tIgnored = false,\n\t\t\tBlocked = false,\n\t\t\tButton = nil,\n\t\t}, Log)\n\n\t\treturn NewLog\n\tend\n\n\tfunction Log:IsOverSpamThreshold()\n\t\t-- Kept for plugins that query the old API.  Capture admission is enforced\n\t\t-- centrally in `Log:Call`, even when the optional auto-ignore setting is off.\n\t\treturn self.SpamCallCount >= SpamCallCountThreshold\n\tend\n\n\tlocal function RunInterceptors(Interceptors: { (...any) -> ...any }, Info: any, Log): boolean\n\t\tfor _, Callback in Interceptors do\n\t\t\tlocal Ok, Result = pcall(Callback, Info, Log.Instance, Log.Type)\n\t\t\tif not Ok then\n\t\t\t\twarn(`[Cobalt Plugin Interceptor] Error: {Result}`)\n\t\t\telseif Result == false then\n\t\t\t\treturn true\n\t\t\tend\n\t\tend\n\n\t\treturn false\n\tend\n\n\tfunction Log:ShouldBlock(RawInfo, PendingCallDecisionsKey): boolean\n\t\tPendingCallDecisionsKey = PendingCallDecisionsKey or GetDecisionKey(RawInfo)\n\n\t\tlocal Decision = PendingCallDecisions[PendingCallDecisionsKey]\n\t\tif Decision then\n\t\t\treturn Decision.ShouldBlock\n\t\tend\n\n\t\tlocal FilterAction\n\t\tlocal CallFilters = wax.shared.CallFilters\n\t\tdo\n\t\t\tif CallFilters then\n\t\t\t\tFilterAction = CallFilters:Resolve(self.Instance, self.Type, RawInfo)\n\t\t\tend\n\t\tend\n\n\t\tlocal ShouldBlock = RawInfo.Blocked == true or self.Blocked or FilterAction == \"Block\"\n\t\tif ShouldBlock then\n\t\t\tRawInfo.Blocked = true\n\t\tend\n\n\t\tPendingCallDecisions[PendingCallDecisionsKey] = {\n\t\t\tFilterAction = FilterAction,\n\t\t\tShouldBlock = ShouldBlock,\n\t\t}\n\t\treturn ShouldBlock\n\tend\n\n\t--[[\n\t\tKeeps at most `MaxCalls` entries by dropping the oldest ones.\n\n\t\tCall indices are the log's public currency (call lists, notifications, the\n\t\tfile logger), so both the call array and the executor-call index list are\n\t\trebuilt together and stay consistent.\n\t]]\n\tfunction Log:TrimCalls(MaxCalls: number)\n\t\tlocal Calls = self.Calls\n\t\tlocal Total = #Calls\n\t\tlocal RemoveCount = Total - MaxCalls\n\t\tif RemoveCount <= 0 then\n\t\t\treturn 0\n\t\tend\n\n\t\tlocal Trimmed = table.create(Total - RemoveCount)\n\t\tfor Index = RemoveCount + 1, Total do\n\t\t\tTrimmed[Index - RemoveCount] = Calls[Index]\n\t\tend\n\t\tself.Calls = Trimmed\n\n\t\tlocal GameCalls = self.GameCalls\n\t\tlocal WriteIndex = 1\n\t\tfor ReadIndex = 1, #GameCalls do\n\t\t\tlocal Shifted = GameCalls[ReadIndex] - RemoveCount\n\t\t\tif Shifted >= 1 then\n\t\t\t\tGameCalls[WriteIndex] = Shifted\n\t\t\t\tWriteIndex += 1\n\t\t\tend\n\t\tend\n\n\t\tfor Index = WriteIndex, #GameCalls do\n\t\t\tGameCalls[Index] = nil\n\t\tend\n\n\t\treturn RemoveCount\n\tend\n\n\tfunction Log:Call(RawInfo): number?\n\t\tlocal PendingCallDecisionsKey = GetDecisionKey(RawInfo)\n\n\t\tlocal ShouldBlock = self:ShouldBlock(RawInfo, PendingCallDecisionsKey)\n\t\tlocal Decision = PendingCallDecisions[PendingCallDecisionsKey]\n\t\tPendingCallDecisions[PendingCallDecisionsKey] = nil\n\n\t\tlocal ShouldCapture = not self.Ignored and Decision.FilterAction ~= \"Ignore\"\n\t\tdo\n\t\t\tif ShouldBlock then\n\t\t\t\tShouldCapture = GetSettingBoolean(\"LogBlockedRemotes\", false)\n\t\t\tend\n\n\t\t\tif RawInfo.Omit then\n\t\t\t\tShouldCapture = false\n\t\t\tend\n\t\tend\n\n\t\tif not ShouldCapture then\n\t\t\treturn nil\n\t\tend\n\n\t\t-- Do this before DeepClone.  Cloning arguments is the expensive part of a\n\t\t-- capture, and a hard per-remote/global budget prevents one spammy event\n\t\t-- from consuming the frame and memory budgets of the whole game.\n\t\tif RejectCapture(self, os.clock()) then\n\t\t\treturn nil\n\t\tend\n\n\t\tlocal Info = DeepClone(RawInfo)\n\t\tInfo.CreationTime = tick()\n\n\t\t\n\t\tif wax.shared.IS_ACTOR then\n\t\t\tif self.Instance == wax.shared.Communicator then\n\t\t\t\treturn nil\n\t\t\tend\n\n\t\t\tInfo[\"Actor\"] = CurrentActor\n\n\t\t\t\n\t\t\tlocal OldArguments = Info.Arguments\n\t\t\tInfo.Arguments = {\n\t\t\t\tData = OldArguments,\n\t\t\t\tn = OldArguments.n,\n\t\t\t}\n\n\t\t\tif Info.InvokeResult then\n\t\t\t\tlocal OldInvokeResult = Info.InvokeResult\n\t\t\t\tInfo.InvokeResult = {\n\t\t\t\t\tData = OldInvokeResult,\n\t\t\t\t\tn = OldInvokeResult.n,\n\t\t\t\t}\n\t\t\tend\n\n\t\t\tlocal FixedInfo, CyclicRefs, ContainsCyclicRef = FixTable(Info)\n\n\t\t\t\n\t\t\tlocal identity = getthreadidentity()\n\t\t\tsetthreadidentity(8)\n\t\t\twax.shared.Communicator.Fire(\n\t\t\t\twax.shared.Communicator,\n\t\t\t\t\"ActorCall\",\n\t\t\t\tself.Instance,\n\t\t\t\tself.Type,\n\t\t\t\tFixedInfo,\n\t\t\t\tCyclicRefs,\n\t\t\t\tContainsCyclicRef\n\t\t\t)\n\t\t\tsetthreadidentity(identity)\n\t\t\treturn nil\n\t\tend\n\n\t\t\n\t\tlocal PluginManager = wax.shared.CobaltPluginManager\n\t\tif PluginManager and PluginManager.HasInterceptors then\n\t\t\t\n\t\t\tlocal InstanceIntercept = PluginManager.Registry.Interceptors.Instance[self.Instance]\n\t\t\tif InstanceIntercept then\n\t\t\t\tif InstanceIntercept[self.Type] and RunInterceptors(InstanceIntercept[self.Type], Info, self) then\n\t\t\t\t\treturn nil\n\t\t\t\tend\n\t\t\t\tif InstanceIntercept[\"All\"] and RunInterceptors(InstanceIntercept[\"All\"], Info, self) then\n\t\t\t\t\treturn nil\n\t\t\t\tend\n\t\t\tend\n\n\t\t\t\n\t\t\tlocal GlobalByType = PluginManager.Registry.Interceptors.Global[self.Type]\n\t\t\tif GlobalByType and RunInterceptors(GlobalByType, Info, self) then\n\t\t\t\treturn nil\n\t\t\tend\n\n\t\t\tlocal GlobalAll = PluginManager.Registry.Interceptors.Global[\"All\"]\n\t\t\tif GlobalAll and RunInterceptors(GlobalAll, Info, self) then\n\t\t\t\treturn nil\n\t\t\tend\n\t\tend\n\n\t\t\n\t\tlocal Index = #self.Calls + 1\n\t\tself.Calls[Index] = Info\n\t\tif not Info.IsExecutor then\n\t\t\ttable.insert(self.GameCalls, Index)\n\t\tend\n\n\t\t-- Trim with a little slack so the rebuild cost is amortised over many calls\n\t\t-- instead of running on every single one at the cap.\n\t\tlocal CallCap = GetMaxCallsPerRemote()\n\t\tif Index > CallCap + CallCapSlack then\n\t\t\tself:TrimCalls(CallCap)\n\t\t\tIndex = #self.Calls\n\t\tend\n\n\t\tQueueNotification(self, Index, Info)\n\t\treturn Index\n\tend\n\n\tfunction Log:ClearCalls()\n\t\ttable.clear(self.Calls)\n\t\ttable.clear(self.GameCalls)\n\t\tlocal Pending = wax.shared.LogNotificationQueue.PendingByLog[self]\n\t\tif Pending then\n\t\t\tPending.Call = nil\n\t\t\tPending.CallIndex = nil\n\t\t\twax.shared.LogNotificationQueue.PendingByLog[self] = nil\n\t\tend\n\t\tself.SpamWindowStart = os.clock()\n\t\tself.SpamCallCount = 0\n\t\tself.SuppressedCalls = 0\n\t\tself.OverflowStreak = 0\n\t\tself.OverflowedThisWindow = false\n\tend\n\n\tfunction Log:Ignore()\n\t\tself.Ignored = not self.Ignored\n\n\t\tif not wax.shared.IS_ACTOR then\n\t\t\tif wax.shared.ActorCommunicator then\n\t\t\t\tpcall(wax.shared.ActorCommunicator.Fire, wax.shared.ActorCommunicator, \"MainIgnore\", self.Instance, self.Type)\n\t\t\tend\n\n\t\t\tlocal IgnoredRemoteList = wax.shared.Settings[\"IgnoredRemotes\"]\n\t\t\tif IgnoredRemoteList then\n\t\t\t\tif self.Ignored then\n\t\t\t\t\tIgnoredRemoteList:AddToList(self)\n\t\t\t\telse\n\t\t\t\t\tIgnoredRemoteList:RemoveFromList(self)\n\t\t\t\tend\n\t\t\tend\n\t\tend\n\tend\n\n\tlocal ClassesConnectionsToggle = {\n\t\tRemoteEvent = \"OnClientEvent\",\n\t\tUnreliableRemoteEvent = \"OnClientEvent\",\n\t\tBindableEvent = \"Event\",\n\t}\n\n\tfunction Log:SetConnectionsEnabled(enabled: boolean)\n\t\tif not self.Instance or not ClassesConnectionsToggle[self.Instance.ClassName] then\n\t\t\treturn\n\t\tend\n\n\t\tlocal ConnectionName = ClassesConnectionsToggle[self.Instance.ClassName]\n\t\tif self.Type ~= \"Incoming\" or not ConnectionName then\n\t\t\treturn\n\t\tend\n\n\t\tlocal LoggingFunctions = wax.shared.IncomingLogConnectionFunctions\n\t\tfor _, Connection in pairs(getconnections(self.Instance[ConnectionName])) do\n\t\t\tif LoggingFunctions and LoggingFunctions[Connection.Function] then\n\t\t\t\tcontinue\n\t\t\tend\n\n\t\t\tif enabled then\n\t\t\t\tConnection:Enable()\n\t\t\telse\n\t\t\t\tConnection:Disable()\n\t\t\tend\n\t\tend\n\tend\n\n\tfunction Log:Block()\n\t\tif not wax.shared.IS_ACTOR and wax.shared.ActorCommunicator then\n\t\t\tpcall(wax.shared.ActorCommunicator.Fire, wax.shared.ActorCommunicator, \"MainBlock\", self.Instance, self.Type)\n\t\tend\n\n\t\tself.Blocked = not self.Blocked\n\t\tself:SetConnectionsEnabled(not self.Blocked)\n\tend\n\n\tfunction Log:SetButton(Instance, Name, Calls)\n\t\tself.Button = {\n\t\t\tInstance = Instance,\n\t\t\tName = Name,\n\t\t\tCalls = Calls,\n\t\t}\n\tend\n\n\twax.shared.Log = Log\nend\n--#endregion\n\n\n\ndo\n\t\n\tlocal function CreateLookupTable(table)\n\t\tlocal LookupTable = {}\n\t\tfor _, Method in next, table do\n\t\t\tLookupTable[Method] = true\n\t\tend\n\t\treturn LookupTable\n\tend\n\n\t\n\tlocal setfenv = setfenv\n\tlocal getconnections = wax.shared.ExecutorSupport[\"getconnections\"].IsWorking and getconnections or function() return {} end\n\n\tlocal ClassesToHook = {\n\t\tRemoteEvent = \"OnClientEvent\",\n\t\tRemoteFunction = \"OnClientInvoke\",\n\t\tUnreliableRemoteEvent = \"OnClientEvent\",\n\t\tBindableEvent = \"Event\",\n\t\tBindableFunction = \"OnInvoke\",\n\t}\n\n\tlocal ConnectionKeys = CreateLookupTable({\n\t\t\"Connect\",\n\t\t\"ConnectParallel\",\n\t\t\"connect\",\n\t\t\"connectParallel\",\n\t\t\"Once\",\n\t})\n\n\t\n\tlocal ConnectionsEnabled = false\n\tlocal CallbacksEnabled = false\n\tlocal ConnectionHookEnabled = false\n\n\t\n\tlocal LogConnectionFunctions = {}\n\tlocal CallbackOwners = setmetatable({}, { __mode = \"k\" })\n\tlocal SignalMapping = setmetatable({}, { __mode = \"kv\" })\n\tlocal ObservedConnectionInstances = setmetatable({}, { __mode = \"k\" })\n\twax.shared.IncomingLogConnectionFunctions = LogConnectionFunctions\n\n\tlocal CobaltObserverEnvironmentKey = \"__CobaltIncomingObserver\"\n\n\t\n\ttype InstancesToHook = RemoteEvent | UnreliableRemoteEvent | RemoteFunction | BindableEvent | BindableFunction\n\ttype MethodsToHook = \"OnClientEvent\" | \"OnClientInvoke\" | \"Event\" | \"OnInvoke\"\n\texport type Options = {\n\t\tConnections: boolean?,\n\t\tCallbacks: boolean?,\n\t\tHookConnections: boolean?,\n\t}\n\n\t\n\t-- Mirrors the main-state interceptor: `DebugId` and `Origin` are resolved\n\t-- once per invocation instead of once per connection entry, and `Origin`\n\t-- may be a resolver function so a getcallingscript() only runs when\n\t-- ShouldIgnore's player-module check or a first-time log creation asks\n\t-- for it.\n\tlocal function GetLog(\n\t\tInstance: InstancesToHook,\n\t\tFunction: (...any) -> ...any,\n\t\tDebugId: number?,\n\t\tOrigin: Instance? | (() -> Instance?)\n\t)\n\t\tDebugId = DebugId or wax.shared.GetDebugId(Instance)\n\n\t\tlocal OriginResolved = false\n\t\tlocal ResolvedOrigin = nil\n\t\tlocal function ResolveOrigin()\n\t\t\tif not OriginResolved then\n\t\t\t\tif type(Origin) == \"function\" then\n\t\t\t\t\tResolvedOrigin = Origin()\n\t\t\t\telseif Origin ~= nil then\n\t\t\t\t\tResolvedOrigin = Origin\n\t\t\t\telse\n\t\t\t\t\tResolvedOrigin = getcallingscript()\n\t\t\t\tend\n\t\t\t\tOriginResolved = true\n\t\t\tend\n\n\t\t\treturn ResolvedOrigin\n\t\tend\n\n\t\tif wax.shared.ShouldIgnore(Instance, ResolveOrigin) or LogConnectionFunctions[Function] then\n\t\t\treturn nil\n\t\tend\n\n\t\tlocal IncomingLogs = wax.shared.Logs.Incoming\n\t\tif not IncomingLogs then\n\t\t\treturn nil\n\t\tend\n\n\t\tlocal Log = IncomingLogs[DebugId]\n\t\tif not Log then\n\t\t\tLog = wax.shared.NewLog(Instance, \"Incoming\", ResolveOrigin(), DebugId)\n\t\tend\n\n\t\treturn Log\n\tend\n\n\tlocal function ResolveCallableFunction(Value: any): ((...any) -> ...any)?\n\t\tif typeof(Value) == \"function\" then\n\t\t\treturn Value\n\t\tend\n\n\t\tlocal Success, Metatable = pcall(wax.shared.getrawmetatable, Value)\n\t\tif not Success or not Metatable then\n\t\t\treturn nil\n\t\tend\n\n\t\tlocal HasCall, Call = pcall(rawget, Metatable, \"__call\")\n\t\treturn if HasCall and typeof(Call) == \"function\" then Call else nil\n\tend\n\n\t\n\tlocal function LogRemote(\n\t\tInstance: InstancesToHook,\n\t\tFunction: (...any) -> ...any,\n\t\tInfo: {\n\t\t\tDebugId: number?,\n\t\t\tIgnoreOrigin: Instance? | (() -> Instance?),\n\t\t\tArguments: { [number]: any, n: number },\n\t\t\tOrigin: Instance,\n\t\t\tFunction: (...any) -> ...any,\n\t\t\tLine: number,\n\t\t\tIsExecutor: boolean,\n\t\t\tBlocked: boolean?,\n\t\t}\n\t)\n\t\tlocal Log = GetLog(Instance, Function, Info.DebugId, Info.IgnoreOrigin)\n\t\tif not Log then\n\t\t\treturn false, nil\n\t\tend\n\n\t\tlocal ShouldBlock = Log:ShouldBlock(Info)\n\t\tlocal CallIndex = Log:Call(Info)\n\t\treturn ShouldBlock, Log, CallIndex\n\tend\n\n\t\n\tlocal SupportsFilters = wax.shared.ExecutorSupport[\"FilterBase\"].IsWorking\n\n\t\n\tlocal function CreateBaseFilter()\n\t\tlocal Filters = {}\n\t\tif not SupportsFilters then\n\t\t\treturn Filters\n\t\tend\n\n\t\t\n\t\tfor ClassName in ClassesToHook do\n\t\t\ttable.insert(Filters, InstanceTypeFilter.new(1, ClassName))\n\t\tend\n\n\t\treturn Filters\n\tend\n\t\n\n\t\n\tlocal function IsCobaltConnectionFunction(Function): boolean\n\t\tif not Function then\n\t\t\treturn false\n\t\tend\n\n\t\tif LogConnectionFunctions[Function] then\n\t\t\treturn true\n\t\tend\n\n\t\tlocal Success, Environment = pcall(getfenv, Function)\n\t\tlocal VerificationToken = wax.shared.CobaltVerificationToken\n\t\treturn (\n\t\t\tSuccess\n\t\t\tand VerificationToken ~= nil\n\t\t\tand typeof(Environment) == \"table\"\n\t\t\tand rawequal(rawget(Environment, CobaltObserverEnvironmentKey), VerificationToken)\n\t\t)\n\tend\n\n\t\n\tlocal function CreateConnectionFunction(Instance: InstancesToHook, Method: MethodsToHook)\n\t\tlocal CachedConnectionInfo = nil\n\t\tlocal CachedConnectionCount = -1\n\n\t\t-- getconnections() is the single most expensive executor call on the\n\t\t-- incoming path, and a remote's connection set rarely changes mid-burst,\n\t\t-- so it is refreshed at most twice a second per remote while the remote\n\t\t-- actually fires.  Between refreshes the cached entries are reused\n\t\t-- as-is; a connection added inside the window is picked up by the next\n\t\t-- refresh, and an idle remote pays nothing at all.  (Same window as the\n\t\t-- main-state interceptor.)\n\t\tlocal ConnectionCacheExpiry = 0.5\n\t\tlocal CachedConnections = nil\n\t\tlocal CachedConnectionsAt = 0\n\n\t\tlocal DebugId = wax.shared.GetDebugId(Instance)\n\n\t\tlocal function BuildConnectionInformation(Connections)\n\t\t\tlocal Information = {\n\t\t\t\tHasValidConnections = false,\n\t\t\t\tHasForeignLuaConnections = false,\n\t\t\t\tEntries = {},\n\t\t\t}\n\n\t\t\tfor _, Connection in Connections do\n\t\t\t\t-- Skip connections that are in a foreign state\n\t\t\t\tif Connection.ForeignState then\n\t\t\t\t\t-- Check if the connection is a LuaConnection\n\t\t\t\t\tif Connection.LuaConnection then\n\t\t\t\t\t\tInformation.HasForeignLuaConnections = true\n\t\t\t\t\tend\n\n\t\t\t\t\tcontinue\n\t\t\t\tend\n\n\t\t\t\t-- Skip Cobalt's own connection functions\n\t\t\t\tlocal Function = typeof(Connection.Function) == \"function\" and (Connection.Function) or (nil)\n\t\t\t\tif IsCobaltConnectionFunction(Function) then\n\t\t\t\t\tcontinue\n\t\t\t\tend\n\n\t\t\t\tInformation.HasValidConnections = true\n\n\t\t\t\t-- Resolve the originating script from the thread or environment\n\t\t\t\tlocal Thread = Connection.Thread\n\t\t\t\tlocal Origin = nil\n\n\t\t\t\tif Thread and getscriptfromthread then\n\t\t\t\t\tOrigin = getscriptfromthread(Thread)\n\t\t\t\tend\n\n\t\t\t\tif not Origin and Function then\n\t\t\t\t\t-- The environment script fallback: getcallingscript is not\n\t\t\t\t\t-- usable here (this runs inside our own observer).\n\n\t\t\t\t\tlocal Script = rawget(getfenv(Function), \"script\")\n\t\t\t\t\tif typeof(Script) == \"Instance\" then\n\t\t\t\t\t\tOrigin = Script\n\t\t\t\t\tend\n\t\t\t\tend\n\n\t\t\t\ttable.insert(Information.Entries, {\n\t\t\t\t\tFunction = Function,\n\t\t\t\t\tOrigin = Origin,\n\t\t\t\t\tIsExecutor = Function and isexecutorclosure(Function) or false,\n\t\t\t\t})\n\t\t\tend\n\n\t\t\treturn Information\n\t\tend\n\n\t\tlocal ConnectionFunction = function(...)\n\t\t\t-- If this log is ignored, don't process the event\n\t\t\tlocal ExistingLog = wax.shared.Logs.Incoming[DebugId]\n\t\t\tif ExistingLog and ExistingLog.Ignored then\n\t\t\t\treturn\n\t\t\tend\n\n\t\t\t-- Refresh the connection listing at most once per expiry window;\n\t\t\t-- every other fire of this remote reuses the cached entries without\n\t\t\t-- paying for a getconnections() round-trip.\n\t\t\tlocal Now = os.clock()\n\t\t\tif not CachedConnections or Now - CachedConnectionsAt >= ConnectionCacheExpiry then\n\t\t\t\tlocal Signal = (Instance :: any)[Method]\n\t\t\t\tCachedConnections = getconnections(Signal)\n\t\t\t\tCachedConnectionsAt = Now\n\n\t\t\t\t-- Rebuild the connection info if the count changed\n\t\t\t\tlocal ConnectionCount = #CachedConnections\n\t\t\t\tif ConnectionCount ~= CachedConnectionCount then\n\t\t\t\t\tCachedConnectionCount = ConnectionCount\n\t\t\t\t\tCachedConnectionInfo = BuildConnectionInformation(CachedConnections)\n\t\t\t\tend\n\t\t\tend\n\n\t\t\tlocal Arguments = wax.shared.SafePack.Pack(...)\n\t\t\tlocal TargetLog, TargetCallIndex\n\n\t\t\t-- The calling script resolves at most once per invocation, and only\n\t\t\t-- when ShouldIgnore's player-module check or a first-time log\n\t\t\t-- creation actually needs it (same contract as the main state).\n\t\t\tlocal CallingScript = nil\n\t\t\tlocal CallingScriptResolved = false\n\t\t\tlocal function ResolveCallingScript()\n\t\t\t\tif not CallingScriptResolved then\n\t\t\t\t\tCallingScript = getcallingscript()\n\t\t\t\t\tCallingScriptResolved = true\n\t\t\t\tend\n\n\t\t\t\treturn CallingScript\n\t\t\tend\n\n\t\t\tif CachedConnectionInfo.HasValidConnections then\n\t\t\t\tfor _, Entry in CachedConnectionInfo.Entries do\n\t\t\t\t\tTargetLog, TargetCallIndex = select(2, LogRemote(Instance, Entry.Function, {\n\t\t\t\t\t\tArguments = Arguments,\n\t\t\t\t\t\tOrigin = Entry.Origin,\n\t\t\t\t\t\tFunction = Entry.Function,\n\t\t\t\t\t\tLine = nil,\n\t\t\t\t\t\tIsExecutor = Entry.IsExecutor,\n\t\t\t\t\t\tDebugId = DebugId,\n\t\t\t\t\t\tIgnoreOrigin = ResolveCallingScript,\n\t\t\t\t\t}))\n\t\t\t\tend\n\n\t\t\telseif not wax.shared.IS_ACTOR then\n\t\t\t\tTargetLog, TargetCallIndex = select(2, LogRemote(Instance, nil, {\n\t\t\t\t\tArguments = Arguments,\n\t\t\t\t\tOrigin = nil,\n\t\t\t\t\tFunction = nil,\n\t\t\t\t\tLine = nil,\n\t\t\t\t\tIsExecutor = false,\n\t\t\t\t\tDebugId = DebugId,\n\t\t\t\t\tIgnoreOrigin = ResolveCallingScript,\n\t\t\t\t}))\n\t\t\tend\n\n\t\t\tlocal Communicator = wax.shared.ActorCommunicator\n\t\t\tif Communicator then\n\t\t\t\tif\n\t\t\t\t\tnot wax.shared.IS_ACTOR\n\t\t\t\t\tand CachedConnectionInfo.HasForeignLuaConnections\n\t\t\t\t\tand TargetLog\n\t\t\t\t\tand TargetCallIndex\n\t\t\t\tthen\n\t\t\t\t\tCommunicator:Fire(\n\t\t\t\t\t\t\"InspectIncomingConnections\",\n\t\t\t\t\t\tInstance,\n\t\t\t\t\t\tMethod,\n\t\t\t\t\t\tTargetLog.Index,\n\t\t\t\t\t\tTargetCallIndex\n\t\t\t\t\t)\n\t\t\t\tend\n\t\t\tend\n\t\tend\n\n\t\tlocal OriginalEnvironment = getfenv(ConnectionFunction)\n\t\tsetfenv(ConnectionFunction, setmetatable({\n\t\t\t[CobaltObserverEnvironmentKey] = wax.shared.CobaltVerificationToken,\n\t\t}, {\n\t\t\t__index = OriginalEnvironment,\n\t\t\t__newindex = OriginalEnvironment,\n\t\t}))\n\n\t\tLogConnectionFunctions[ConnectionFunction] = true\n\t\treturn ConnectionFunction\n\tend\n\t\n\n\t\n\t\n\tlocal function HandleCallbackLogging(Log, Info, InitialEnv, InitialIdentity, ...)\n\t\tsetfenv(0, InitialEnv)\n\t\tsetthreadidentity(InitialIdentity)\n\n\t\tif Log then\n\t\t\tInfo.InvokeResult = wax.shared.SafePack.Pack(...)\n\t\t\tLog:Call(Info)\n\t\tend\n\n\t\treturn ...\n\tend\n\n\t\n\tlocal function CreateCallbackDetour(Instance: InstancesToHook, Callback: any)\n\t\tlocal CallbackFunction = assert(ResolveCallableFunction(Callback), \"Callback is not callable\")\n\t\tlocal Detour = function(...)\n\t\t\tlocal Origin = nil\n\n\t\t\t\n\t\t\tif getscriptfromthread then\n\t\t\t\tOrigin = getscriptfromthread(coroutine.running())\n\t\t\tend\n\n\t\t\t\n\t\t\tif not Origin then\n\t\t\t\tlocal Script = rawget(getfenv(CallbackFunction), \"script\")\n\t\t\t\tif typeof(Script) == \"Instance\" then\n\t\t\t\t\tOrigin = Script\n\t\t\t\tend\n\t\t\tend\n\n\t\t\tlocal FunctionCaller = debug.info(2, \"f\")\n\t\t\tlocal IsExecutor = if typeof(FunctionCaller) == \"function\"\n\t\t\t\tthen isexecutorclosure(FunctionCaller)\n\t\t\t\telse isexecutorclosure(CallbackFunction)\n\n\t\t\tlocal Arguments = wax.shared.SafePack.Pack(...)\n\t\t\tlocal Log = GetLog(Instance, CallbackFunction)\n\t\t\tlocal Info = {\n\t\t\t\tArguments = Arguments,\n\t\t\t\tOrigin = Origin,\n\t\t\t\tFunction = CallbackFunction,\n\t\t\t\tLine = nil,\n\t\t\t\tIsExecutor = IsExecutor,\n\t\t\t\tInvokeKind = \"Callback\",\n\t\t\t}\n\t\t\tif Log and Log:ShouldBlock(Info) then\n\t\t\t\tLog:Call(Info)\n\t\t\t\treturn\n\t\t\tend\n\n\t\t\tlocal InitialEnv, InitialIdentity = getfenv(CreateCallbackDetour), getthreadidentity()\n\t\t\tlocal IsDirectFunction = rawequal(Callback, CallbackFunction)\n\n\t\t\tsetthreadidentity(2)\n\t\t\tsetfenv(0, getfenv(CallbackFunction))\n\t\t\tif IsDirectFunction then\n\t\t\t\treturn HandleCallbackLogging(\n\t\t\t\t\tLog,\n\t\t\t\t\tInfo,\n\t\t\t\t\tInitialEnv,\n\t\t\t\t\tInitialIdentity,\n\t\t\t\t\tCallbackFunction(...)\n\t\t\t\t)\n\t\t\tend\n\n\t\t\treturn HandleCallbackLogging(\n\t\t\t\tLog,\n\t\t\t\tInfo,\n\t\t\t\tInitialEnv,\n\t\t\t\tInitialIdentity,\n\t\t\t\tCallbackFunction(Callback, ...)\n\t\t\t)\n\t\tend\n\n\t\tif wax.shared.ExecutorSupport[\"setstackhidden\"].IsWorking then\n\t\t\tsetstackhidden(Detour, true)\n\t\tend\n\n\t\tCallbackOwners[Detour] = {\n\t\t\tOriginal = Callback,\n\t\t\tMethod = ClassesToHook[Instance.ClassName],\n\t\t\tInstance = Instance\n\t\t}\n\t\treturn Detour\n\tend\n\n\tlocal function GetOriginalScript(OriginalEnv: { [string]: any}): Instance?\n\t\tlocal OriginalScript = rawget(OriginalEnv, \"script\")\n\t\tif typeof(OriginalScript) ~= \"Instance\" then\n\t\t\treturn nil\n\t\tend\n\n\t\treturn OriginalScript\n\tend\n\n\t\n\twax.shared.RestoreCallbackDetours = function()\n\t\tfor Detour, Owner in CallbackOwners do\n\t\t\tlocal Success, CurrentCallback = pcall(getcallbackvalue, Owner.Instance, Owner.Method)\n\t\t\tif not (Success and rawequal(CurrentCallback, Detour)) then\n\t\t\t\tcontinue\n\t\t\tend\n\n\t\t\tpcall(function()\n\t\t\t\tif wax.shared.trampoline_call then\n\t\t\t\t\tlocal OriginalEnv = getfenv(Owner.Original)\n\t\t\t\t\tlocal OriginalScript = GetOriginalScript(OriginalEnv)\n\n\t\t\t\t\twax.shared.trampoline_call(function()\n\t\t\t\t\t\tOwner.Instance[Owner.Method] = Owner.Original\n\t\t\t\t\tend, {}, {\n\t\t\t\t\t\tenv = OriginalEnv,\n\t\t\t\t\t\tscript = OriginalScript,\n\t\t\t\t\t\tidentity = 2\n\t\t\t\t\t})\n\t\t\t\telse\n\t\t\t\t\ttask.spawn(function()\n\t\t\t\t\t\tlocal OriginalEnv = getfenv(Owner.Original)\n\n\t\t\t\t\t\tsetthreadidentity(2)\n\t\t\t\t\t\tsetfenv(0, OriginalEnv)\n\t\t\t\t\t\tOwner.Instance[Owner.Method] = Owner.Original\n\t\t\t\t\tend)\n\t\t\t\tend\n\t\t\tend)\n\t\tend\n\n\t\ttable.clear(CallbackOwners)\n\tend\n\n\t\n\n\t\n\tlocal function HandleInstance(Instance: any)\n\t\tif\n\t\t\tnot ClassesToHook[Instance.ClassName]\n\t\t\tor Instance == wax.shared.Communicator\n\t\t\tor Instance == wax.shared.ActorCommunicator\n\t\tthen\n\t\t\treturn\n\t\tend\n\n\t\tlocal Method = ClassesToHook[Instance.ClassName]\n\n\t\tif ConnectionsEnabled and not ObservedConnectionInstances[Instance] then\n\t\t\tif Instance.ClassName == \"RemoteEvent\" or Instance.ClassName == \"UnreliableRemoteEvent\" then\n\t\t\t\twax.shared.Connect(Instance.OnClientEvent:Connect(CreateConnectionFunction(Instance, Method)))\n\n\t\t\t\tSignalMapping[Instance.OnClientEvent] = Instance\n\t\t\t\tObservedConnectionInstances[Instance] = true\n\t\t\telseif Instance.ClassName == \"BindableEvent\" then\n\t\t\t\twax.shared.Connect(Instance.Event:Connect(CreateConnectionFunction(Instance, Method)))\n\n\t\t\t\tSignalMapping[Instance.Event] = Instance\n\t\t\t\tObservedConnectionInstances[Instance] = true\n\t\t\tend\n\t\tend\n\n\t\tif CallbacksEnabled then\n\t\t\tif Instance.ClassName == \"RemoteFunction\" or Instance.ClassName == \"BindableFunction\" then\n\t\t\t\tlocal IsCoreRemote = Instance:IsDescendantOf(wax.shared.RobloxReplicatedStorage)\n\t\t\t\tif IsCoreRemote then return end\n\n\t\t\t\tlocal Success, Callback = pcall(getcallbackvalue, Instance, Method)\n\t\t\t\tlocal IsCallable = ResolveCallableFunction(Callback) ~= nil\n\n\t\t\t\tif not Success or not IsCallable or CallbackOwners[Callback] then\n\t\t\t\t\treturn\n\t\t\t\tend\n\n\t\t\t\t\n\t\t\t\tif wax.shared.trampoline_call then\n\t\t\t\t\tlocal OriginalEnv = getfenv(Callback)\n\t\t\t\t\tlocal OriginalScript = GetOriginalScript(OriginalEnv)\n\n\t\t\t\t\twax.shared.trampoline_call(function()\n\t\t\t\t\t\tInstance[Method] = CreateCallbackDetour(Instance, Callback)\n\t\t\t\t\tend, {}, {\n\t\t\t\t\t\tenv = OriginalEnv,\n\t\t\t\t\t\tscript = OriginalScript,\n\t\t\t\t\t\tidentity = 2\n\t\t\t\t\t})\n\t\t\t\telse\n\t\t\t\t\tInstance[Method] = CreateCallbackDetour(Instance, Callback)\n\t\t\t\tend\n\t\t\tend\n\t\tend\n\tend\n\n\t\n\tlocal function SetupCallbackAssignmentHook()\n\t\tlocal NewIndexHookFilter = SupportsFilters and AnyFilter.new(CreateBaseFilter())\n\t\t\n\t\twax.shared.NewIndexHook = wax.shared.Hooking.HookMetaMethod(game, \"__newindex\", function(...)\n\t\t\tlocal self, key, value = ...\n\n\t\t\tif typeof(self) ~= \"Instance\" or not ClassesToHook[self.ClassName] then\n\t\t\t\treturn wax.shared.NewIndexHook(...)\n\t\t\tend\n\n\t\t\tif self.ClassName == \"RemoteFunction\" or self.ClassName == \"BindableFunction\" then\n\t\t\t\tlocal Method = ClassesToHook[self.ClassName]\n\n\t\t\t\tlocal IsCallable = ResolveCallableFunction(value) ~= nil\n\n\t\t\t\tif key == Method and IsCallable then\n\t\t\t\t\tif CallbackOwners[value] then\n\t\t\t\t\t\treturn wax.shared.NewIndexHook(...)\n\t\t\t\t\tend\n\n\t\t\t\t\treturn wax.shared.NewIndexHook(self, key, CreateCallbackDetour(self :: InstancesToHook, value))\n\t\t\t\tend\n\t\t\tend\n\n\t\t\treturn wax.shared.NewIndexHook(...)\n\t\tend, NewIndexHookFilter)\n\tend\n\n\t\n\tlocal function HandleConnectionLogging(Instance, Method, callback, ...)\n\t\tlocal Log = wax.shared.Logs.Incoming[wax.shared.GetDebugId(Instance)]\n\n\t\tif Log and Log.Blocked then\n\t\t\tfor _, Connection in getconnections(Instance[Method]) do\n\t\t\t\tif not Connection.ForeignState and Connection.Function ~= callback then\n\t\t\t\t\tcontinue\n\t\t\t\tend\n\n\t\t\t\tConnection:Disable()\n\t\t\tend\n\t\tend\n\n\t\treturn ...\n\tend\n\n\t\n\tlocal function SetupConnectionAssignmentHook()\n\t\tlocal SignalMetatable = wax.shared.getrawmetatable(Instance.new(\"Part\").Touched)\n\t\twax.shared.Hooks[SignalMetatable.__index] = wax.shared.Hooking.HookFunction(SignalMetatable.__index, function(...)\n\t\t\tlocal self, key = ...\n\n\t\t\tif not wax.shared.Unloaded and ConnectionKeys[key] then\n\t\t\t\tlocal Instance = SignalMapping[self]\n\t\t\t\tlocal Connect = wax.shared.Hooks[SignalMetatable.__index](...)\n\n\t\t\t\tif not Instance then\n\t\t\t\t\treturn Connect\n\t\t\t\tend\n\n\t\t\t\tlocal Method = ClassesToHook[Instance.ClassName]\n\t\t\t\treturn wax.shared.newcclosure(function(...)\n\t\t\t\t\tlocal _self, callback = ...\n\t\t\t\t\treturn HandleConnectionLogging(Instance, Method, callback, Connect(...))\n\t\t\t\tend, debug.info(Connect, \"n\"))\n\t\t\tend\n\n\t\t\treturn wax.shared.Hooks[SignalMetatable.__index](...)\n\t\tend)\n\tend\n\n\tlocal Started = false\n\twax.shared.IncomingInterceptor = function(Options: Options?)\n\t\tif Started then\n\t\t\treturn\n\t\tend\n\n\t\t\n\t\tOptions = Options or {}\n\t\tdo\n\t\t\tConnectionsEnabled = Options.Connections ~= false\n\t\t\tCallbacksEnabled = Options.Callbacks ~= false\n\t\t\tConnectionHookEnabled = Options.HookConnections ~= false\n\t\tend\n\n\t\tif not ConnectionsEnabled and not CallbacksEnabled then\n\t\t\treturn\n\t\tend\n\n\t\tStarted = true\n\n\t\t\n\t\tif CallbacksEnabled then\n\t\t\tif wax.shared.ExecutorSupport[\"setstackhidden\"].IsWorking then\n\t\t\t\tsetstackhidden(HandleCallbackLogging, true)\n\t\t\tend\n\n\t\t\tSetupCallbackAssignmentHook()\n\t\tend\n\n\t\tif ConnectionsEnabled and ConnectionHookEnabled then\n\t\t\tSetupConnectionAssignmentHook()\n\t\tend\n\n\t\twax.shared.Connect(game.DescendantAdded:Connect(function(instance)\n\t\t\tHandleInstance(cloneref(instance))\n\t\tend))\n\n\t\t\n\t\tlocal ClassesToSearch = {}\n\t\tdo\n\t\t\tif ConnectionsEnabled then\n\t\t\t\ttable.insert(ClassesToSearch, \"RemoteEvent\")\n\t\t\t\ttable.insert(ClassesToSearch, \"UnreliableRemoteEvent\")\n\t\t\t\ttable.insert(ClassesToSearch, \"BindableEvent\")\n\t\t\tend\n\t\t\tif CallbacksEnabled then\n\t\t\t\ttable.insert(ClassesToSearch, \"RemoteFunction\")\n\t\t\t\ttable.insert(ClassesToSearch, \"BindableFunction\")\n\t\t\tend\n\t\tend\n\n\t\t-- Native `QueryDescendants` handles the whole class list in one engine\n\t\t-- call; the Lua scan only runs on executors that lack it.\n\t\tlocal function GetDescendantsByClassNames(Root, ClassNames)\n\t\t\tlocal QueryDescendants = (Root :: any).QueryDescendants\n\t\t\tif typeof(QueryDescendants) == \"function\" then\n\t\t\t\tlocal Success, Matches = pcall(function()\n\t\t\t\t\treturn Root:QueryDescendants(table.concat(ClassNames, \", \"))\n\t\t\t\tend)\n\n\t\t\t\tif Success and typeof(Matches) == \"table\" then\n\t\t\t\t\treturn Matches\n\t\t\t\tend\n\t\t\tend\n\n\t\t\tlocal Matches = {}\n\t\t\tfor _, Descendant in Root:GetDescendants() do\n\t\t\t\tfor _, ClassName in ClassNames do\n\t\t\t\t\tif Descendant:IsA(ClassName) then\n\t\t\t\t\t\ttable.insert(Matches, Descendant)\n\t\t\t\t\t\tbreak\n\t\t\t\t\tend\n\t\t\t\tend\n\t\t\tend\n\n\t\t\treturn Matches\n\t\tend\n\n\t\tlocal Categories = {\n\t\t\tGetDescendantsByClassNames(game, ClassesToSearch),\n\t\t}\n\t\tif wax.shared.ExecutorSupport[\"getnilinstances\"].IsWorking then\n\t\t\ttable.insert(Categories, getnilinstances())\n\t\tend\n\n\t\tfor _, Category in Categories do\n\t\t\tfor _, TargetInstance in next, Category do\n\t\t\t\tHandleInstance(cloneref(TargetInstance))\n\t\t\tend\n\t\tend\n\tend\nend\n\n\ntask.spawn(wax.shared.IncomingInterceptor, {\n\tConnections = false,\n\tCallbacks = Data.IncomingCallbacks,\n\tHookConnections = false,\n})\n\nif Data.Outgoing then\n\ttask.spawn(function()\n\t\tlocal function CreateLookupTable(table)\n\t\t\tlocal LookupTable = {}\n\t\t\tfor _, Method in next, table do\n\t\t\t\tLookupTable[Method] = true\n\t\t\tend\n\t\t\treturn LookupTable\n\t\tend\n\n\t\tlocal NamecallMethods = {\n\t\t\t[\"FireServer\"] = CreateLookupTable({\"RemoteEvent\", \"UnreliableRemoteEvent\"}),\n\t\t\t[\"fireServer\"] = CreateLookupTable({\"RemoteEvent\", \"UnreliableRemoteEvent\"}),\n\t\t\t\n\t\t\t[\"InvokeServer\"] = CreateLookupTable({\"RemoteFunction\"}),\n\t\t\t[\"invokeServer\"] = CreateLookupTable({\"RemoteFunction\"}),\n\n\t\t\t[\"Fire\"] = CreateLookupTable({\"BindableEvent\"}),\n\t\t\t[\"fire\"] = CreateLookupTable({\"BindableEvent\"}),\n\t\t\t\n\t\t\t[\"Invoke\"] = CreateLookupTable({\"BindableFunction\"}),\n\t\t\t[\"invoke\"] = CreateLookupTable({\"BindableFunction\"}),\n\t\t}\n\t\tlocal AllowedClassNames =\n\t\t\tCreateLookupTable({ \"RemoteEvent\", \"RemoteFunction\", \"UnreliableRemoteEvent\", \"BindableEvent\", \"BindableFunction\" })\n\n\t\t\n\t\t-- Caller resolution: one stack pass returns function, source and line\n\t\t-- (this path used to walk the same levels three times), and the\n\t\t-- fallback stays a single combined debug.info call.  Mirrors the\n\t\t-- main-state interceptor.\n\t\tlocal function GetCallerInfo()\n\t\t\tlocal BaseLevel = if wax.shared.IsUsingOthHooks then 3 else 5\n\n\t\t\tfor i = BaseLevel, 10 do\n\t\t\t\tlocal Function, Source, Line = debug.info(i, \"fsl\")\n\t\t\t\tif not Function or not Source then\n\t\t\t\t\tbreak\n\t\t\t\tend\n\n\t\t\t\tif Source == \"[C]\" then\n\t\t\t\t\tcontinue\n\t\t\t\tend\n\n\t\t\t\treturn Function, Source, Line\n\t\t\tend\n\n\t\t\treturn debug.info(BaseLevel, \"fsl\")\n\t\tend\n\n\n\t\t-- Lazy calling-script resolution for the hook guards: ShouldIgnore\n\t\t-- only asks for the calling script when its verdict depends on it, so\n\t\t-- the guarded fires stop paying a getcallingscript() up front.\n\t\tlocal function CreateCallingScriptResolver()\n\t\t\tlocal Resolved = false\n\t\t\tlocal CallingScript = nil\n\n\t\t\treturn function()\n\t\t\t\tif not Resolved then\n\t\t\t\t\tCallingScript = getcallingscript()\n\t\t\t\t\tResolved = true\n\t\t\t\tend\n\n\t\t\t\treturn CallingScript\n\t\t\tend\n\t\tend\n\n\n\t\t-- `DebugId` and `Origin` are resolved once per invocation by the\n\t\t-- caller instead of again per GetLog (a RemoteFunction invoke asks\n\t\t-- twice: once for the Outgoing log, once for the Incoming one).\n\t\tlocal function GetLog(Instance: Instance, Direction: \"Outgoing\" | \"Incoming\", DebugId: number?, Origin: Instance?)\n\t\t\tDebugId = DebugId or wax.shared.GetDebugId(Instance)\n\n\t\t\tlocal LogsInDirection = wax.shared.Logs[Direction]\n\t\t\tif not LogsInDirection then\n\t\t\t\treturn nil\n\t\t\tend\n\n\t\t\tlocal Log = LogsInDirection[DebugId]\n\t\t\tif not Log then\n\t\t\t\tif Origin == nil then\n\t\t\t\t\t-- Only a first-time log creation needs the calling script.\n\t\t\t\t\tOrigin = getcallingscript()\n\t\t\t\tend\n\t\t\t\tLog = wax.shared.NewLog(Instance, Direction, Origin, DebugId)\n\t\t\tend\n\n\t\t\treturn Log\n\t\tend\n\n\t\t\n\t\tlocal function HandleLoggingResult(Log, Info, ResultKey, ...)\n\t\t\tlocal Result = wax.shared.SafePack.Pack(...)\n\t\t\tInfo[ResultKey] = Result\n\t\t\tLog:Call(Info)\n\n\t\t\treturn ...\n\t\tend\n\n\t\t\n\t\tlocal function HandleLogging(TargetInstance: Instance, Method: string, OldFunction: (...any) -> ...any, ...)\n\t\t\t-- Resolve everything the log entries need exactly once (used to be\n\t\t\t-- a getcallingscript, three stack walks and two checkcaller calls\n\t\t\t-- per invoke; the RemoteFunction flow now reuses all of it).\n\t\t\tlocal DebugId = wax.shared.GetDebugId(TargetInstance)\n\t\t\tlocal Log = GetLog(TargetInstance, \"Outgoing\", DebugId)\n\t\t\tif not Log then\n\t\t\t\treturn OldFunction(...)\n\t\t\tend\n\t\t\tlocal Arguments = wax.shared.SafePack.Pack(select(2, ...))\n\n\t\t\tlocal CallingScript = getcallingscript()\n\t\t\tlocal CallingFunction, CallingSource, CallingLine = GetCallerInfo()\n\t\t\tlocal IsExecutor = checkcaller()\n\n\t\t\tlocal Info = {\n\t\t\t\tArguments = Arguments,\n\t\t\t\tOrigin = CallingScript,\n\t\t\t\tFunction = CallingFunction,\n\t\t\t\tLine = CallingLine,\n\t\t\t\tSource = CallingSource,\n\t\t\t\tIsExecutor = IsExecutor,\n\t\t\t}\n\t\t\tlocal ShouldBlock = Log:ShouldBlock(Info)\n\t\t\tLog:Call(Info)\n\t\t\tif ShouldBlock then\n\t\t\t\treturn\n\t\t\tend\n\n\t\t\tlocal IsRemoteFunctionInvoke = (\n\t\t\t\tTargetInstance.ClassName == \"RemoteFunction\" and (Method == \"InvokeServer\" or Method == \"invokeServer\")\n\t\t\t)\n\n\t\t\tlocal IsBindableFunctionInvoke = (\n\t\t\t\tTargetInstance.ClassName == \"BindableFunction\" and (Method == \"Invoke\" or Method == \"invoke\")\n\t\t\t)\n\n\t\t\tif IsRemoteFunctionInvoke or IsBindableFunctionInvoke then\n\n\t\t\t\tLog = GetLog(TargetInstance, \"Incoming\", DebugId)\n\t\t\t\tlocal RFResultInfo = {\n\t\t\t\t\tArguments = Arguments,\n\t\t\t\t\tInvokeResult = nil,\n\t\t\t\t\tOrigin = CallingScript,\n\t\t\t\t\tFunction = CallingFunction,\n\t\t\t\t\tLine = CallingLine,\n\t\t\t\t\tSource = CallingSource,\n\t\t\t\t\tIsExecutor = IsExecutor,\n\t\t\t\t\tInvokeKind = \"Request\",\n\t\t\t\t}\n\n\t\t\t\tif Log:ShouldBlock(RFResultInfo) then\n\t\t\t\t\tLog:Call(RFResultInfo)\n\t\t\t\t\treturn\n\t\t\t\tend\n\n\t\t\t\treturn HandleLoggingResult(Log, RFResultInfo, \"InvokeResult\", OldFunction(...))\n\t\t\tend\n\n\t\t\treturn OldFunction(...)\n\t\tend\n\n\t\t\n\t\tlocal SupportsFilters = wax.shared.ExecutorSupport[\"FilterBase\"].IsWorking\n\n\t\t\n\t\tlocal function CreateBaseFilter()\n\t\t\tlocal Filters = {}\n\t\t\tif not SupportsFilters then\n\t\t\t\treturn Filters\n\t\t\tend\n\n\t\t\t\n\t\t\ttable.insert(Filters, NotFilter.new(ArgumentFilter.new(1, wax.shared.Communicator)))\n\t\t\ttable.insert(Filters, NotFilter.new(ArgumentFilter.new(1, wax.shared.ActorCommunicator)))\n\n\t\t\treturn Filters\n\t\tend\n\n\t\tlocal NamecallHookFilter = SupportsFilters and AllFilter.new((function()\n\t\t\tlocal Filters = CreateBaseFilter()\n\n\t\t\t\n\n\t\t\t\n\t\t\tlocal AnyClassNameFilters = {}\n\t\t\tfor ClassName in AllowedClassNames do\n\t\t\t\ttable.insert(AnyClassNameFilters, InstanceTypeFilter.new(1, ClassName))\n\t\t\tend\n\t\t\t\n\t\t\t\n\t\t\tlocal AnyNamecallMethoFilters = {}\n\t\t    for Method in NamecallMethods do\n\t\t        table.insert(AnyNamecallMethoFilters, NamecallFilter.new(Method))\n\t\t    end\n\n\t\t\ttable.insert(Filters, AnyFilter.new(AnyClassNameFilters))\n\t\t\ttable.insert(Filters, AnyFilter.new(AnyNamecallMethoFilters))\n\t\t    return Filters\n\t\tend)())\n\t\t\n\n\t\t\n\t\twax.shared.NamecallHook = wax.shared.Hooking.HookMetaMethod(game, \"__namecall\", function(...)\n\t\t\tlocal self = ...\n\t\t\tlocal Method = getnamecallmethod()\n\n\t\t\tif\n\t\t\t\ttypeof(self) == \"Instance\"\n\t\t\t\tand AllowedClassNames[self.ClassName]\n\t\t\t\tand not rawequal(self, wax.shared.Communicator)\n\t\t\t\tand not rawequal(self, wax.shared.ActorCommunicator)\n\t\t\t\tand (NamecallMethods[Method] and NamecallMethods[Method][self.ClassName])\n\t\t\t\tand not wax.shared.ShouldIgnore(self, CreateCallingScriptResolver())\n\t\t\tthen\n\t\t\t\treturn HandleLogging(cloneref(self), Method, wax.shared.NamecallHook, ...)\n\t\t\tend\n\n\t\t\treturn wax.shared.NamecallHook(...)\n\t\tend, NamecallHookFilter)\n\n\t\t\n\t\tlocal FunctionsToHook\n\t\tdo\n\t\t\tlocal BindableFunction = Instance.new(\"BindableFunction\")\n\t\t\tlocal BindableEvent = Instance.new(\"BindableEvent\")\n\n\t\t\tlocal RemoteFunction = Instance.new(\"RemoteFunction\")\n\t\t\tlocal RemoteEvent = Instance.new(\"RemoteEvent\")\n\t\t\tlocal UnreliableRemoteEvent = Instance.new(\"UnreliableRemoteEvent\")\n\n\t\t\tFunctionsToHook = {\n\t\t\t\tBindableFunction.Invoke,\n\t\t\t\tBindableEvent.Fire,\n\n\t\t\t\tRemoteFunction.InvokeServer,\n\t\t\t\tRemoteEvent.FireServer,\n\t\t\t\tUnreliableRemoteEvent.FireServer,\n\t\t\t}\n\n\t\t\tBindableFunction:Destroy()\n\t\t\tBindableEvent:Destroy()\n\n\t\t\tRemoteFunction:Destroy()\n\t\t\tRemoteEvent:Destroy()\n\t\t\tUnreliableRemoteEvent:Destroy()\n\t\tend\n\n\t\tlocal FunctionHookFilter = SupportsFilters and AllFilter.new((function()\n\t\t\tlocal Filters = CreateBaseFilter()\n\n\t\t\t\n\n\t\t\tlocal ClassFilters = {}\n\t\t\tfor ClassName in AllowedClassNames do\n\t\t\t\ttable.insert(ClassFilters, InstanceTypeFilter.new(1, ClassName))\n\t\t\tend\n\n\t\t\ttable.insert(Filters, AnyFilter.new(ClassFilters))\n\t\t\treturn Filters\n\t\tend)())\n\n\t\tfor _, Function in next, FunctionsToHook do\n\t\t\tlocal Method = debug.info(Function, \"n\")\n\n\t\t\twax.shared.Hooks[Function] = wax.shared.Hooking.HookFunction(Function, function(...)\n\t\t\t\tlocal self = ...\n\n\t\t\t\tif\n\t\t\t\t\ttypeof(self) == \"Instance\"\n\t\t\t\t\tand AllowedClassNames[self.ClassName]\n\t\t\t\t\tand not rawequal(self, wax.shared.Communicator)\n\t\t\t\t\tand not wax.shared.ShouldIgnore(self, CreateCallingScriptResolver())\n\t\t\t\tthen\n\t\t\t\t\treturn HandleLogging(cloneref(self), Method, wax.shared.Hooks[Function], ...)\n\t\t\t\tend\n\n\t\t\t\treturn wax.shared.Hooks[Function](...)\n\t\t\tend, FunctionHookFilter)\n\t\tend\n\tend)\nend\n\ntask.spawn(function()\n\tlocal getrawmetatable = getrawmetatable or debug.getmetatable\n\n\twax.shared.Communicator.Event:Connect(function(Type, ...)\n\t\tif Type ~= \"Unload\" then\n\t\t\treturn\n\t\tend\n\n\t\tlocal gameMetatable = getrawmetatable(game)\n\n\t\tif wax.shared.ExecutorSupport[\"oth\"].IsWorking then\n\t\t\tif Data.Outgoing then\n\t\t\t\tpcall(oth.unhook, gameMetatable.__namecall)\n\t\t\tend\n\t\t\tif Data.IncomingCallbacks then\n\t\t\t\tpcall(oth.unhook, gameMetatable.__newindex)\n\t\t\tend\n\t\telse\n\t\t\tif wax.shared.ExecutorSupport[\"restorefunction\"].IsWorking and wax.shared.ExecutorSupport[\"hookmetamethod\"].IsWorking then\n\t\t\t\tif Data.Outgoing then\n\t\t\t\t\tpcall(restorefunction, gameMetatable.__namecall)\n\t\t\t\tend\n\t\t\t\tif Data.IncomingCallbacks then\n\t\t\t\t\tpcall(restorefunction, gameMetatable.__newindex)\n\t\t\t\tend\n\t\t\telse\n\t\t\t\tif Data.Outgoing then\n\t\t\t\t\twax.shared.Hooking.HookMetaMethod(game, \"__namecall\", wax.shared.NamecallHook)\n\t\t\t\tend\n\t\t\t\tif Data.IncomingCallbacks then\n\t\t\t\t\twax.shared.Hooking.HookMetaMethod(game, \"__newindex\", wax.shared.NewIndexHook)\n\t\t\t\tend\n\t\t\t\tend\n\t\t\tend\n\n\t\t\tif Data.IncomingCallbacks and wax.shared.RestoreCallbackDetours then\n\t\t\t\twax.shared.RestoreCallbackDetours()\n\t\t\tend\n\n\t\t\tfor Function, Original in pairs(wax.shared.Hooks) do\n\t\t\tif wax.shared.ExecutorSupport[\"oth\"].IsWorking then\n\t\t\t\ttask.spawn(pcall, oth.unhook, Function)\n\t\t\telseif wax.shared.ExecutorSupport[\"restorefunction\"].IsWorking then\n\t\t\t\ttask.spawn(pcall, wax.shared.restorefunction, Function)\n\t\t\telse\n\t\t\t\tpcall(wax.shared.Hooking.HookFunction, Function, Original)\n\t\t\tend\n\t\tend\n\n\t\ttask.defer(function()\n\t\t\tgetgenv().CobaltInitialized = false\n\t\tend)\n\tend)\nend)"
                                                 }
                                             }
                                         }
@@ -30093,157 +29521,157 @@ local ObjectTree = {
 
 local LineOffsets = {
     [1] = 12,
-    [2] = 665,
-    [3] = 1305,
-    [5] = 1333,
-    [7] = 1712,
-    [9] = 5343,
-    [10] = 6024,
-    [11] = 6312,
-    [12] = 6341,
-    [14] = 6364,
-    [15] = 6480,
-    [16] = 6591,
-    [17] = 6723,
-    [20] = 6993,
-    [22] = 7058,
-    [24] = 7137,
-    [25] = 7333,
-    [26] = 7775,
-    [27] = 7897,
-    [29] = 7994,
-    [30] = 8111,
-    [31] = 8186,
-    [32] = 8491,
-    [34] = 8790,
-    [35] = 9063,
-    [36] = 10056,
-    [38] = 10285,
-    [39] = 10307,
-    [40] = 10333,
-    [41] = 10476,
-    [43] = 10528,
-    [44] = 10578,
-    [45] = 10603,
-    [46] = 10798,
-    [48] = 10907,
-    [50] = 10993,
-    [51] = 11213,
-    [52] = 11860,
-    [55] = 11946,
-    [56] = 12017,
-    [57] = 12046,
-    [58] = 12062,
-    [59] = 12079,
-    [60] = 12104,
-    [61] = 12126,
-    [62] = 12165,
-    [63] = 12225,
-    [64] = 12329,
-    [65] = 12347,
-    [66] = 12394,
-    [67] = 12451,
-    [68] = 12483,
-    [69] = 12569,
-    [70] = 12602,
-    [71] = 12621,
-    [72] = 12682,
-    [73] = 12700,
-    [74] = 12758,
-    [75] = 12795,
-    [76] = 12817,
-    [77] = 12852,
-    [78] = 12902,
-    [79] = 12924,
-    [80] = 12944,
-    [81] = 12989,
-    [82] = 13048,
-    [83] = 13145,
-    [84] = 13161,
-    [85] = 13183,
-    [86] = 13222,
-    [87] = 13240,
-    [88] = 13260,
-    [89] = 13276,
-    [90] = 13295,
-    [91] = 13354,
-    [92] = 13534,
-    [93] = 13602,
-    [94] = 14436,
-    [95] = 14473,
-    [98] = 14639,
-    [99] = 14683,
-    [100] = 14784,
-    [101] = 15194,
-    [102] = 15218,
-    [103] = 15306,
-    [104] = 15350,
-    [105] = 15391,
-    [106] = 15415,
-    [107] = 15462,
-    [108] = 15492,
-    [109] = 15683,
-    [110] = 15806,
-    [111] = 15928,
-    [112] = 15937,
-    [113] = 16214,
-    [114] = 16282,
-    [117] = 16373,
-    [118] = 16605,
-    [119] = 16758,
-    [120] = 16846,
-    [121] = 16974,
-    [122] = 17002,
-    [123] = 17323,
-    [125] = 17554,
-    [126] = 17914,
-    [127] = 18556,
-    [128] = 18565,
-    [129] = 18686,
-    [130] = 18716,
-    [131] = 18742,
-    [132] = 18768,
-    [133] = 18801,
-    [134] = 18829,
-    [135] = 18876,
-    [136] = 18919,
-    [139] = 19147,
-    [140] = 19435,
-    [141] = 19562,
-    [142] = 19844,
-    [143] = 20077,
-    [144] = 20114,
-    [145] = 20282,
-    [146] = 20433,
-    [147] = 20491,
-    [148] = 20511,
-    [149] = 21734,
-    [150] = 22156,
-    [151] = 22387,
-    [153] = 22404,
-    [155] = 22590,
-    [156] = 22848,
-    [157] = 22928,
-    [158] = 23224,
-    [159] = 23265,
-    [160] = 23714,
-    [161] = 24030,
-    [162] = 24511,
-    [163] = 24973,
-    [165] = 25233,
-    [166] = 25824,
-    [168] = 25856,
-    [169] = 25942,
-    [170] = 25971,
-    [171] = 26287,
-    [173] = 26362,
-    [174] = 26610,
-    [175] = 26664,
-    [177] = 26715,
-    [179] = 26934,
-    [180] = 27953,
-    [181] = 28031,
-    [182] = 28390,
+    [2] = 675,
+    [3] = 1315,
+    [5] = 1343,
+    [7] = 1722,
+    [9] = 4669,
+    [10] = 5384,
+    [11] = 5682,
+    [12] = 5711,
+    [14] = 5734,
+    [15] = 5850,
+    [16] = 5961,
+    [17] = 6093,
+    [20] = 6363,
+    [22] = 6428,
+    [24] = 6507,
+    [25] = 6703,
+    [26] = 7145,
+    [27] = 7267,
+    [29] = 7364,
+    [30] = 7481,
+    [31] = 7556,
+    [32] = 7861,
+    [34] = 8160,
+    [35] = 8433,
+    [36] = 9426,
+    [38] = 9655,
+    [39] = 9677,
+    [40] = 9703,
+    [41] = 9846,
+    [43] = 9898,
+    [44] = 9948,
+    [45] = 9973,
+    [46] = 10168,
+    [48] = 10277,
+    [50] = 10363,
+    [51] = 10583,
+    [52] = 11230,
+    [55] = 11316,
+    [56] = 11387,
+    [57] = 11416,
+    [58] = 11432,
+    [59] = 11449,
+    [60] = 11474,
+    [61] = 11496,
+    [62] = 11535,
+    [63] = 11595,
+    [64] = 11699,
+    [65] = 11717,
+    [66] = 11764,
+    [67] = 11821,
+    [68] = 11853,
+    [69] = 11939,
+    [70] = 11972,
+    [71] = 11991,
+    [72] = 12052,
+    [73] = 12070,
+    [74] = 12128,
+    [75] = 12165,
+    [76] = 12187,
+    [77] = 12222,
+    [78] = 12272,
+    [79] = 12294,
+    [80] = 12314,
+    [81] = 12359,
+    [82] = 12418,
+    [83] = 12515,
+    [84] = 12531,
+    [85] = 12553,
+    [86] = 12592,
+    [87] = 12610,
+    [88] = 12630,
+    [89] = 12646,
+    [90] = 12665,
+    [91] = 12724,
+    [92] = 12904,
+    [93] = 12972,
+    [94] = 13838,
+    [95] = 13875,
+    [98] = 14041,
+    [99] = 14085,
+    [100] = 14186,
+    [101] = 14596,
+    [102] = 14620,
+    [103] = 14708,
+    [104] = 14752,
+    [105] = 14793,
+    [106] = 14817,
+    [107] = 14864,
+    [108] = 14894,
+    [109] = 15085,
+    [110] = 15208,
+    [111] = 15330,
+    [112] = 15339,
+    [113] = 15616,
+    [114] = 15684,
+    [117] = 15775,
+    [118] = 16007,
+    [119] = 16160,
+    [120] = 16248,
+    [121] = 16376,
+    [122] = 16404,
+    [123] = 16725,
+    [125] = 16956,
+    [126] = 17316,
+    [127] = 17958,
+    [128] = 17967,
+    [129] = 18088,
+    [130] = 18118,
+    [131] = 18144,
+    [132] = 18170,
+    [133] = 18203,
+    [134] = 18231,
+    [135] = 18278,
+    [136] = 18321,
+    [139] = 18549,
+    [140] = 18837,
+    [141] = 18964,
+    [142] = 19246,
+    [143] = 19479,
+    [144] = 19516,
+    [145] = 19684,
+    [146] = 19835,
+    [147] = 19893,
+    [148] = 19913,
+    [149] = 21136,
+    [150] = 21558,
+    [151] = 21789,
+    [153] = 21806,
+    [155] = 21992,
+    [156] = 22250,
+    [157] = 22330,
+    [158] = 22626,
+    [159] = 22667,
+    [160] = 23116,
+    [161] = 23432,
+    [162] = 23913,
+    [163] = 24375,
+    [165] = 24635,
+    [166] = 25226,
+    [168] = 25258,
+    [169] = 25344,
+    [170] = 25373,
+    [171] = 25689,
+    [173] = 25764,
+    [174] = 26012,
+    [175] = 26066,
+    [177] = 26117,
+    [179] = 26339,
+    [180] = 27381,
+    [181] = 27459,
+    [182] = 27818,
 }
 
 

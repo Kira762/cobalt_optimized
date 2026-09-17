@@ -30,6 +30,7 @@ lib/                 # bundle inputs and the virtual module tree
 tools/bundle.py      # regenerates closures and serialized actor/HTML values
 tools/modulecheck.py # emits the Luau module-load harness
 tools/logpolicy.py   # emits/runs the Log capture-policy unit test
+tools/hotpath_bench.py# emits/runs the hot-path micro-benchmark (bounded clone)
 tools/build_assets.py# regenerates assets/ artwork from the lucide sheets
 tools/gen_icons.py   # regenerates Icons.luau from the generated atlas
 verify.sh            # structural + execution + policy verification
@@ -69,7 +70,18 @@ rejection policy is pinned by `tools/logpolicy.py`:
 - per-remote call retention remains configurable (Settings -> Capture) and
   defaults to a finite cap.
 
-`./verify.sh` runs the policy test whenever `LUAU` points at a Luau CLI.
+`./verify.sh` runs both the policy test and the hot-path micro-benchmark
+whenever `LUAU` points at a Luau CLI.
+
+The argument clone itself is budgeted too: DeepClone stops descending past a
+depth/field budget and shares the game's tables beyond it, so one hostile
+payload can no longer stall the hook (and the frame) for seconds - ordinary
+argument packs still clone field-for-field, and the bound is pinned by
+`tools/hotpath_bench.py`. On the hook side, `getcallingscript()` is resolved
+lazily (only when a verdict or a first-time log entry actually needs the
+caller), the incoming connection listing is cached for half a second per
+remote, and caller info is resolved in a single `debug.info` pass - in the
+main state and in the actor environment alike.
 
 ## Interface
 
@@ -98,7 +110,10 @@ python3 tools/bundle.py --check
 the serialized session template and actor environment in sync, and re-inlines
 `lib/config.luau` + `lib/wax_runtime.luau` as the bundle tail, so the runtime
 (`LoadScript`, `FormatError`, the virtual instance tree) cannot drift from
-`lib/`.
+`lib/`.  The actor environment chunk is synced wholesale from
+`src/Spy/Hooks/Luau/Actors/Environment.luau` (its Log include comes from
+`src/Utils/Log.luau`), which makes that file the single source of truth for
+the actor state instead of a hint the build used to patch around.
 
 If a Luau CLI is available, set `LUAU` before running `verify.sh` to execute the
 bundle's module-load harness as well. The harness intentionally stubs Roblox

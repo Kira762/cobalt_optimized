@@ -441,54 +441,48 @@ do
 end
 
 
-function DeepClone(OriginalValue, ValueCopies)
-	if wax.shared.IS_ACTOR then
-		return OriginalValue
-	end
+--[[
+	Clone bounds.
 
-	local OriginalType = type(OriginalValue)
-	if OriginalType ~= "table" then
-		if OriginalType == "string" or OriginalType == "number" or OriginalType == "boolean" or OriginalValue == nil then
-			return OriginalValue
-		end
+	A game can hand a remote arbitrarily deep or wide tables, and an unbounded
+	recursive clone of one runs inside the hook that intercepted the call -
+	multi-second frame hitches on the game being inspected.  The clone
+	therefore stops descending once a capture has copied MaxCloneFields fields
+	or nested MaxCloneDepth tables deep, and keeps the original reference for
+	anything past the bound instead.
 
-		local RobloxType = typeof(OriginalValue)
-		if RobloxType == "Instance" then
-			return cloneref(OriginalValue)
-	
-		elseif RobloxType == "userdata" then
-			if getmetatable(OriginalValue) then
-				return newproxy(true)
-			else
-				return newproxy()
-			end
+	Bounded nodes stay visible (the argument preview/session serializer sees a
+	real table and renders it) and replay codegen still receives a table; the
+	trade-off is that a huge payload's contents can keep mutating after
+	capture, which is already the semantics for Instances and is a far better
+	deal than freezing the game.  Both bounds are far above genuine argument
+	sizes, so normal captures clone exactly as before.
+]]
+local MaxCloneDepth = 8
+local MaxCloneFields = 4000
 
-		elseif RobloxType == "function" then
-			return CloneFunction(OriginalValue)
-		end
-
-		return OriginalValue
-	end
-
-	
-	if ValueCopies then
-		local CachedValue = ValueCopies[OriginalValue]
-		if CachedValue then
-			return CachedValue
-		end
-	else
-		ValueCopies = {}
-	end
-
-	
+local function CloneTable(OriginalValue: { [any]: any }, ValueCopies: { [any]: any }, CloneState: { Fields: number }, Depth: number)
 	local ShallowCopy = {}
 	ValueCopies[OriginalValue] = ShallowCopy
 
 	for Key, Value in next, OriginalValue do
+		-- Every visited field is work paid inside the hook, regardless of type.
+		CloneState.Fields += 1
 		local ValueType = type(Value)
 
 		if ValueType == "table" then
-			ShallowCopy[Key] = DeepClone(Value, ValueCopies)
+			if Depth >= MaxCloneDepth or CloneState.Fields > MaxCloneFields then
+				-- Beyond the bound the capture shares the game's table (see the
+				-- "Clone bounds" note above); cloning resumes nowhere below.
+				ShallowCopy[Key] = Value
+			else
+				local CachedValue = ValueCopies[Value]
+				if CachedValue then
+					ShallowCopy[Key] = CachedValue
+				else
+					ShallowCopy[Key] = CloneTable(Value, ValueCopies, CloneState, Depth + 1)
+				end
+			end
 
 		elseif ValueType == "userdata" then
 			local ValueRobloxType = typeof(Value)
@@ -509,13 +503,51 @@ function DeepClone(OriginalValue, ValueCopies)
 
 		elseif ValueType == "function" then
 			ShallowCopy[Key] = CloneFunction(Value)
-	
+
 		else
 			ShallowCopy[Key] = Value
 		end
 	end
 
 	return ShallowCopy
+end
+
+function DeepClone(OriginalValue, ValueCopies)
+	if wax.shared.IS_ACTOR then
+		return OriginalValue
+	end
+
+	local OriginalType = type(OriginalValue)
+	if OriginalType ~= "table" then
+		if OriginalType == "string" or OriginalType == "number" or OriginalType == "boolean" or OriginalValue == nil then
+			return OriginalValue
+		end
+
+		local RobloxType = typeof(OriginalValue)
+		if RobloxType == "Instance" then
+			return cloneref(OriginalValue)
+
+		elseif RobloxType == "userdata" then
+			if getmetatable(OriginalValue) then
+				return newproxy(true)
+			else
+				return newproxy()
+			end
+
+		elseif RobloxType == "function" then
+			return CloneFunction(OriginalValue)
+		end
+
+		return OriginalValue
+	end
+
+	ValueCopies = ValueCopies or {}
+	local CachedValue = ValueCopies[OriginalValue]
+	if CachedValue then
+		return CachedValue
+	end
+
+	return CloneTable(OriginalValue, ValueCopies, { Fields = 0 }, 0)
 end
 
 if wax.shared.IS_ACTOR then

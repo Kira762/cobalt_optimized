@@ -266,6 +266,10 @@ end
 	depends on the calling script, so those results are recomputed per call.
 	The cache is dropped through `InvalidateShouldIgnoreCache`, which
 	SettingSync.Save invokes whenever a setting is written.
+
+	`Origin` may be an Instance, nil, or a resolver function returning the
+	calling script.  Hooks pass resolvers so the (executor-crossing)
+	getcallingscript() is only spent when a verdict truly depends on it.
 ]]
 local IgnoredInstanceCache = setmetatable({}, { __mode = "k" })
 local NotIgnoredInstanceCache = setmetatable({}, { __mode = "k" })
@@ -299,6 +303,12 @@ wax.shared.ShouldIgnore = function(Instance, Origin)
 
 	if not Ignored and wax.shared.Settings.IgnorePlayerModule.Value then
 		OriginDependent = true
+		-- Hooks pass a resolver instead of a script so getcallingscript() only
+		-- runs when the verdict actually needs the caller (see "Lazy
+		-- calling-script resolution" in the interceptors).
+		if type(Origin) == "function" then
+			Origin = Origin()
+		end
 		Ignored = wax.shared.IsPlayerModule(Origin, Instance)
 	end
 

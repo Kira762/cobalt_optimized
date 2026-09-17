@@ -22,8 +22,9 @@ an absolute line number in the bundle back to a line inside the offending module
 
 The bundle tail (everything from `local Aliases = {` on) is likewise rebuilt
 from lib/config.luau + lib/wax_runtime.luau, and the serialized session template
-and actor environment are re-synced from their sources, so no part of the bundle
-can drift from the files you edit.
+and actor environment are re-synced from their sources (the actor chunk is
+carried wholesale, with only its Log include regenerated), so no part of the
+bundle can drift from the files you edit.
 
 Usage:  python3 tools/bundle.py [--check]
   --check   regenerate in memory and fail if cobalt.luau on disk is stale
@@ -41,6 +42,7 @@ REF_MAP = ROOT / "lib" / "ref_map.luau"
 SESSION_TEMPLATE = ROOT / "src" / "Utils" / "CodeGen" / "Templates" / "SessionHTMLView.html"
 SESSION_MARKER = '"SessionHTMLView",\n'
 ACTOR_LOG_SOURCE = ROOT / "src" / "Utils" / "Log.luau"
+ACTOR_ENVIRONMENT_SOURCE = ROOT / "src" / "Spy" / "Hooks" / "Luau" / "Actors" / "Environment.luau"
 ACTOR_ENVIRONMENT_MARKER = '"Environment",\n'
 CONFIG_SOURCE = ROOT / "lib" / "config.luau"
 WAX_RUNTIME_SOURCE = ROOT / "lib" / "wax_runtime.luau"
@@ -160,34 +162,6 @@ def find_value_span(object_tree: str, marker: str) -> tuple[int, int]:
     raise AssertionError(f"serialized Value field is unterminated after {marker!r}")
 
 
-def decode_lua_string(raw: str) -> str:
-    """Decode the small Lua escape subset emitted by the object-tree builder."""
-    out: list[str] = []
-    index = 0
-    escapes = {"n": "\n", "r": "\r", "t": "\t", '"': '"', "\\": "\\"}
-    while index < len(raw):
-        char = raw[index]
-        index += 1
-        if char != "\\":
-            out.append(char)
-            continue
-        if index >= len(raw):
-            raise AssertionError("dangling escape in serialized Value")
-        char = raw[index]
-        index += 1
-        if char in escapes:
-            out.append(escapes[char])
-        elif char.isdigit():
-            digits = char
-            while len(digits) < 3 and index < len(raw) and raw[index].isdigit():
-                digits += raw[index]
-                index += 1
-            out.append(chr(int(digits)))
-        else:
-            out.append(char)
-    return "".join(out)
-
-
 def replace_serialized_value(object_tree: str, marker: str, value: str, *, chunk_size: int = 12000) -> str:
     marker_index = object_tree.rfind(marker)
     if marker_index < 0:
@@ -232,103 +206,36 @@ def sync_session_template(object_tree: str) -> str:
 
 
 def sync_actor_environment(object_tree: str) -> str:
-    """Propagate hot-path actor changes into the virtual actor source.
+    """Rebuild the serialized actor environment from its editable source.
 
-    Actors execute the `Environment.Value` stored in ObjectTree, not the
-    ModuleScript closure alone. The build system normally expands include
-    regions into that value, so replace only the generated Log region and the
-    small actor-data declarations while preserving its generated scaffolding.
+    Actors execute the `Environment.Value` stored in ObjectTree, never the
+    ModuleScript closure, so src/Spy/Hooks/Luau/Actors/Environment.luau must
+    reach that string as a whole.  The old build only carried a few surgical
+    patches over the previously embedded copy, which let the source file and
+    the shipped actor chunk drift apart (the file kept a stale Log module
+    copy and different descendant scans).  Syncing wholesale makes the
+    source file the truth again: every edit propagates, and `--check` fails
+    if the two ever diverge.
+
+    The one generated region inside the chunk is the Log module: the `do
+    local Log = {} ... wax.shared.Log = Log end` block in the source (a
+    placeholder there) is replaced with src/Utils/Log.luau, indented one
+    level and with its trailing `return Log` rewritten to publish the module
+    on `wax.shared` - the same text the main state loads as a module.
     """
-    start, end = find_value_span(object_tree, ACTOR_ENVIRONMENT_MARKER)
-    embedded = decode_lua_string(object_tree[start:end])
-    source = ACTOR_LOG_SOURCE.read_text().replace("\r\n", "\n").strip("\n")
+    embedded = ACTOR_ENVIRONMENT_SOURCE.read_text().replace("\r\n", "\n").strip("\n")
 
-    actor_data_old = (
-        "\tLogBlockedRemotes: boolean,\n"
-        "\tIgnoredRemotesDropdown: { [string]: boolean },"
-    )
-    actor_data_new = (
-        "\tLogBlockedRemotes: boolean,\n"
-        "\tAutoIgnoreSpammyEvents: boolean,\n"
-        "\tIgnoredRemotesDropdown: { [string]: boolean },"
-    )
-    if actor_data_old in embedded and "AutoIgnoreSpammyEvents: boolean" not in embedded:
-        embedded = embedded.replace(actor_data_old, actor_data_new, 1)
-
-    settings_old = (
-        "\t\tLogBlockedRemotes = { Value = Data.LogBlockedRemotes },\n"
-        "\t\tIgnoredRemotesDropdown = { Value = Data.IgnoredRemotesDropdown },"
-    )
-    settings_new = (
-        "\t\tLogBlockedRemotes = { Value = Data.LogBlockedRemotes },\n"
-        "\t\tAutoIgnoreSpammyEvents = { Value = Data.AutoIgnoreSpammyEvents },\n"
-        "\t\tIgnoredRemotesDropdown = { Value = Data.IgnoredRemotesDropdown },"
-    )
-    if settings_old in embedded and "AutoIgnoreSpammyEvents = { Value = Data.AutoIgnoreSpammyEvents }" not in embedded:
-        embedded = embedded.replace(settings_old, settings_new, 1)
-
-    # Keep the generated actor script compatible with standard Roblox Instances.
-    # The actor script is stored as a serialized StringValue in ObjectTree, so
-    # changing src/Spy/Hooks/Luau/Actors/Environment.luau does not update this
-    # runtime value unless we patch the generated text here.
-    player_scripts_old = (
-        "wax.shared.LocalPlayer = wax.shared.Players.LocalPlayer\n"
-        "local ContendingPlayerScripts =\n"
-        "\tcloneref(wax.shared.LocalPlayer:QueryDescendants(\"PlayerScripts\")[1] or wax.shared.LocalPlayer)\n"
-        "if ContendingPlayerScripts:IsA(\"PlayerScripts\") then"
-    )
-    player_scripts_new = (
-        "wax.shared.LocalPlayer = wax.shared.Players.LocalPlayer\n\n"
-        "local function FindFirstDescendantOfClass(Root, ClassName)\n"
-        "\tfor _, Descendant in Root:GetDescendants() do\n"
-        "\t\tif Descendant:IsA(ClassName) then\n"
-        "\t\t\treturn Descendant\n"
-        "\t\tend\n"
-        "\tend\n\n"
-        "\treturn nil\n"
-        "end\n\n"
-        "local ContendingPlayerScripts =\n"
-        "\tcloneref(FindFirstDescendantOfClass(wax.shared.LocalPlayer, \"PlayerScripts\") or wax.shared.LocalPlayer)\n"
-        "if ContendingPlayerScripts:IsA(\"PlayerScripts\") then"
-    )
-    if player_scripts_old in embedded:
-        embedded = embedded.replace(player_scripts_old, player_scripts_new, 1)
-
-    categories_old = (
-        "\t\tlocal Categories = {\n"
-        "\t\t\tgame:QueryDescendants(table.concat(ClassesToSearch, \", \")),\n"
-        "\t\t}\n"
-    )
-    categories_new = (
-        "\t\tlocal function GetDescendantsByClassNames(Root, ClassNames)\n"
-        "\t\t\tlocal Matches = {}\n"
-        "\t\t\tfor _, Descendant in Root:GetDescendants() do\n"
-        "\t\t\t\tfor _, ClassName in ClassNames do\n"
-        "\t\t\t\t\tif Descendant:IsA(ClassName) then\n"
-        "\t\t\t\t\t\ttable.insert(Matches, Descendant)\n"
-        "\t\t\t\t\t\tbreak\n"
-        "\t\t\t\t\tend\n"
-        "\t\t\t\tend\n"
-        "\t\t\tend\n\n"
-        "\t\t\treturn Matches\n"
-        "\t\tend\n\n"
-        "\t\tlocal Categories = {\n"
-        "\t\t\tGetDescendantsByClassNames(game, ClassesToSearch),\n"
-        "\t\t}\n"
-    )
-    if categories_old in embedded:
-        embedded = embedded.replace(categories_old, categories_new, 1)
-
-    log_start = embedded.find("do\n\tlocal Log = {}\n")
-    log_end = embedded.find("\nend\n--#endregion", log_start)
-    if log_start < 0 or log_end < 0:
-        raise AssertionError("generated actor Log region is missing")
-    log_end += len("\nend")
-
-    log_source = source
+    log_source = ACTOR_LOG_SOURCE.read_text().replace("\r\n", "\n").strip("\n")
     if not log_source.endswith("return Log"):
         raise AssertionError("actor Log source must end with `return Log`")
     log_source = log_source[: -len("return Log")] + "wax.shared.Log = Log"
+
+    log_start = embedded.find("do\n\tlocal Log = {}")
+    log_end = embedded.find("\n\twax.shared.Log = Log\nend", log_start)
+    if log_start < 0 or log_end < 0:
+        raise AssertionError("actor environment Log region markers are missing")
+    log_end += len("\n\twax.shared.Log = Log\nend")
+
     indented_log = "\n".join("\t" + line if line else "" for line in log_source.split("\n"))
     embedded = embedded[:log_start] + "do\n" + indented_log + "\nend" + embedded[log_end:]
 

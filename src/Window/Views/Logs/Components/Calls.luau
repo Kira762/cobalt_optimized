@@ -23,6 +23,22 @@ local RowStaggerMax = 0.18
 -- How much work one call frame may do before yielding the frame back.
 local ArgumentBuildSliceSeconds = (DeviceProfile.ArgumentBuildSliceMs or 4) / 1000
 
+-- Bounding box for live row renders (tiered: 40/24/12).
+local MaxCallFrameQueue = DeviceProfile.MaxCallFrameQueue or 40
+
+--[[
+	Adaptive motion cutoff for live rows.
+
+	A full page render gets the staggered entrance (the user actually watches
+	that one), but rows pushed by a live remote stop animating long before
+	their queue could saturate: once the renderer backs up past a quarter of
+	its budget, entrance tweens become invisible cost, so the row simply
+	appears.  Coalesced notifications (several fires folded into one row
+	push) skip the animation outright - nobody can read motion that is
+	already a burst behind.
+]]
+local MaxAnimatedRowBacklog = math.max(math.floor(MaxCallFrameQueue / 4), 4)
+
 
 return function(props: {
 	MainFrame: GuiObject,
@@ -712,8 +728,9 @@ return function(props: {
 			Max = 2,
 		},
 		-- Rendering is best-effort.  Never let a spammy remote build an
-		-- unbounded backlog of GUI jobs behind the current page.
-		MaxQueue = 40,
+		-- unbounded backlog of GUI jobs behind the current page; the cap
+		-- follows the device tier instead of being a fixed constant.
+		MaxQueue = MaxCallFrameQueue,
 		DropOldest = true,
 		ShouldProcess = IsCallFrameJobCurrent,
 		MainCallback = function(Data)
@@ -973,7 +990,7 @@ return function(props: {
 		self:ShowCalls(Log, Page)
 	end
 
-	function Calls:HandleCallAdded(Log, CallIndex: number, CallRef)
+	function Calls:HandleCallAdded(Log, CallIndex: number, CallRef, Suppressed: number?)
 		if LogsPage.State.CurrentLog ~= Log then
 			return
 		end
@@ -1000,13 +1017,19 @@ return function(props: {
 			return
 		end
 
+		-- Adaptive motion: a bursting remote (fires coalesced into this
+		-- notification) or a renderer that is already behind gets the row
+		-- instantly, because its entrance tween would never be readable.
+		local PendingRows = CreateCallFrameLimiter.QueueTail - CreateCallFrameLimiter.QueueHead + 1
+		local AnimateRow = (Suppressed or 0) == 0 and PendingRows <= MaxAnimatedRowBacklog
+
 		local Data = setmetatable({
 			Instance = Log.Instance,
 			Type = Log.Type,
 			Order = VisibleIndex,
 			RenderGeneration = self.CurrentCallFrameRenderGeneration,
 			PreviewCache = GetPreviewCache(Call),
-			Animate = true,
+			Animate = AnimateRow,
 		}, {
 			__index = Call,
 		})
